@@ -735,7 +735,10 @@ impl ItemKey {
 }
 
 pub fn relocate(doc: &Document, key: &ItemKey) -> Option<usize> {
-    doc.nodes.iter().enumerate().find_map(|(i, n)| match n {
+    // A miss OR an ambiguous match (two active items sharing title+state —
+    // legal, nothing enforces unique titles) drops the action; never guess
+    // which item the user meant (review-caught wrong-item-mutation hazard).
+    let mut matches = doc.nodes.iter().enumerate().filter_map(|(i, n)| match n {
         Node::Item(it)
             if ops::zone_of(doc, i) != Zone::Archive
                 && it.title == key.title
@@ -744,7 +747,11 @@ pub fn relocate(doc: &Document, key: &ItemKey) -> Option<usize> {
             Some(i)
         }
         _ => None,
-    })
+    });
+    match (matches.next(), matches.next()) {
+        (Some(i), None) => Some(i),
+        _ => None,
+    }
 }
 
 /// One display row of the sidebar list.

@@ -3,7 +3,23 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::time::Duration;
+
+/// Per-request timeout: `request()` runs on the TUI main thread, so a
+/// stalled herdr must not freeze the app — it surfaces as an `Err` through
+/// the existing error paths instead.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Process-wide counter for request ids, so each `request()` call can
+/// verify the response it reads back is actually the one it sent (and not,
+/// say, a stale reply left over on a reused/misbehaving connection).
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
+
+fn next_request_id() -> String {
+    format!("feedr-{}", NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -176,11 +192,22 @@ impl UnixSocketClient {
 fn request(path: &Path, method: &str, params: serde_json::Value) -> anyhow::Result<Value> {
     let mut stream = UnixStream::connect(path)
         .with_context(|| format!("herdr socket unavailable at {}", path.display()))?;
-    let req = serde_json::json!({"id": "feedr", "method": method, "params": params});
+    // Runs on the TUI main thread — never let a stalled herdr hang forever.
+    stream
+        .set_read_timeout(Some(REQUEST_TIMEOUT))
+        .context("failed to set socket read timeout")?;
+    stream
+        .set_write_timeout(Some(REQUEST_TIMEOUT))
+        .context("failed to set socket write timeout")?;
+    let id = next_request_id();
+    let req = serde_json::json!({"id": id, "method": method, "params": params});
     stream.write_all(format!("{req}\n").as_bytes())?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
     let resp: Value = serde_json::from_str(&line).context("bad NDJSON from herdr")?;
+    if resp.get("id").and_then(|v| v.as_str()) != Some(id.as_str()) {
+        anyhow::bail!("response id mismatch");
+    }
     if let Some(err) = resp.get("error") {
         anyhow::bail!(
             "herdr: {}",
@@ -267,13 +294,42 @@ pub fn spawn_event_thread(socket_path: PathBuf, tx: mpsc::Sender<crate::tui::App
     });
 }
 
+/// Read timeout on the event-stream connection. On a genuine stall (herdr
+/// stops responding but doesn't close the socket) this fires and we resync
+/// instead of blocking the reconnect loop forever; it also serves as a
+/// periodic self-heal for any event dropped between resync and subscribe.
+const SUBSCRIBE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Blocks streaming events until the connection drops (or the app goes away).
 /// Subscription types per the research doc's recommended wiring.
 pub fn subscribe_loop(path: &Path, tx: &mpsc::Sender<crate::tui::AppEvent>) -> Result<()> {
+    subscribe_loop_with_timeout(path, tx, SUBSCRIBE_READ_TIMEOUT)
+}
+
+fn resync(path: &Path, tx: &mpsc::Sender<crate::tui::AppEvent>) -> Result<()> {
     let agents = parse_agent_list(&request(path, "agent.list", serde_json::json!({}))?);
     tx.send(crate::tui::AppEvent::Agents(agents))
-        .map_err(|_| anyhow::anyhow!("app gone"))?;
+        .map_err(|_| anyhow::anyhow!("app gone"))
+}
+
+/// `true` for the two platform-dependent error kinds a blocking read can
+/// surface once its `set_read_timeout` deadline elapses (`WouldBlock` on
+/// some platforms, `TimedOut` on others — handle both).
+fn is_read_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+fn subscribe_loop_with_timeout(
+    path: &Path,
+    tx: &mpsc::Sender<crate::tui::AppEvent>,
+    read_timeout: Duration,
+) -> Result<()> {
+    resync(path, tx)?;
     let mut stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(read_timeout))?;
     let sub = serde_json::json!({"id": "sub", "method": "events.subscribe", "params": {"subscriptions": [
         {"type": "pane.agent_status_changed"},
         {"type": "pane.created"},
@@ -281,19 +337,29 @@ pub fn subscribe_loop(path: &Path, tx: &mpsc::Sender<crate::tui::AppEvent>) -> R
         {"type": "pane.agent_detected"}
     ]}});
     stream.write_all(format!("{sub}\n").as_bytes())?;
-    for line in BufReader::new(stream).lines() {
-        let line = line?;
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        // Pushed events carry "type"; the subscribe ack carries "id" — skip it.
-        if v.get("type").is_some() {
-            let agents = parse_agent_list(&request(path, "agent.list", serde_json::json!({}))?);
-            tx.send(crate::tui::AppEvent::Agents(agents))
-                .map_err(|_| anyhow::anyhow!("app gone"))?;
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            // EOF: a genuine disconnect. Return so the caller's backoff
+            // loop reconnects.
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                // Pushed events carry "type"; the subscribe ack carries "id" — skip it.
+                if v.get("type").is_some() {
+                    resync(path, tx)?;
+                }
+            }
+            // Stalled-but-open connection: self-heal by resyncing, then
+            // keep reading on this SAME stream — don't wedge the reconnect
+            // loop, and don't tear down a connection that may recover.
+            Err(e) if is_read_timeout(&e) => resync(path, tx)?,
+            Err(e) => return Err(e.into()),
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -433,11 +499,13 @@ mod tests {
         assert_eq!(fake.log.borrow().len(), 2);
     }
 
-    use std::io::{BufRead as _, BufReader, Write as _};
     use std::os::unix::net::UnixListener;
 
     /// Sequential fake herdr: for each accepted connection, read one request
     /// line (recorded for assertions), write the scripted response lines, close.
+    /// Any `{id}` placeholder in a script line is replaced with the id the
+    /// client actually sent, so scripts don't need to know the process-wide
+    /// request counter's current value.
     fn fake_server(
         scripts: Vec<Vec<String>>,
     ) -> (
@@ -458,9 +526,14 @@ mod tests {
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut line = String::new();
                 let _ = reader.read_line(&mut line);
+                let sent_id = serde_json::from_str::<Value>(line.trim())
+                    .ok()
+                    .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                    .unwrap_or_default();
                 seen2.lock().unwrap().push(line.trim().to_string());
                 let mut w = stream;
                 for l in script {
+                    let l = l.replace("{id}", &sent_id);
                     let _ = writeln!(w, "{l}");
                 }
             }
@@ -470,12 +543,12 @@ mod tests {
 
     #[test]
     fn live_client_lists_agents_and_surfaces_errors() {
-        let ok = serde_json::json!({"id": "feedr", "result": {"agents": [
+        let ok = serde_json::json!({"id": "{id}", "result": {"agents": [
             {"pane_id": "w1:p7", "agent": "claude", "agent_status": "blocked",
              "agent_session": {"value": "abc"}}]}})
         .to_string();
         let err =
-            r#"{"id":"feedr","error":{"code":"not_found","message":"pane not found"}}"#.to_string();
+            r#"{"id":"{id}","error":{"code":"not_found","message":"pane not found"}}"#.to_string();
         let (_dir, path, _seen) = fake_server(vec![vec![ok], vec![err]]);
         let mut c = UnixSocketClient { socket_path: path };
         let agents = c.list_agents().unwrap();
@@ -501,8 +574,8 @@ mod tests {
 
     #[test]
     fn live_resume_flow_creates_tab_then_starts_agent() {
-        let tab = r#"{"id":"feedr","result":{"tab_id":"w1:t9","pane_id":"w1:p9"}}"#.to_string();
-        let ok = r#"{"id":"feedr","result":{}}"#.to_string();
+        let tab = r#"{"id":"{id}","result":{"tab_id":"w1:t9","pane_id":"w1:p9"}}"#.to_string();
+        let ok = r#"{"id":"{id}","result":{}}"#.to_string();
         let (_dir, path, seen) = fake_server(vec![vec![tab], vec![ok]]);
         let mut c = UnixSocketClient { socket_path: path };
         c.open_resume_tab("claude", "abc-123").unwrap();
@@ -528,12 +601,12 @@ mod tests {
     fn create_tab_falls_back_to_pane_list_for_pane_id() {
         // A tab.create response that names only the tab: resolve the pane
         // via pane.list filtered to the new tab_id.
-        let tab = r#"{"id":"feedr","result":{"tab_id":"w1:t9"}}"#.to_string();
+        let tab = r#"{"id":"{id}","result":{"tab_id":"w1:t9"}}"#.to_string();
         // Kept on one line deliberately: the client reads one NDJSON line per
         // response (`request`'s `read_line`), so a literal newline embedded
         // in this fixture (as a pretty-printed multi-line raw string would
         // have) would truncate the parse mid-array.
-        let panes = r#"{"id":"feedr","result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t1"},{"pane_id":"w1:p9","tab_id":"w1:t9"}]}}"#.to_string();
+        let panes = r#"{"id":"{id}","result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t1"},{"pane_id":"w1:p9","tab_id":"w1:t9"}]}}"#.to_string();
         let (_dir, path, _seen) = fake_server(vec![vec![tab], vec![panes]]);
         let mut c = UnixSocketClient { socket_path: path };
         assert_eq!(c.create_tab("resume claude").unwrap(), "w1:p9");
@@ -541,7 +614,7 @@ mod tests {
 
     #[test]
     fn subscribe_loop_resyncs_on_events() {
-        let list = serde_json::json!({"id": "feedr", "result": {"agents": [
+        let list = serde_json::json!({"id": "{id}", "result": {"agents": [
             {"pane_id": "w1:p7", "agent": "claude", "agent_status": "working",
              "agent_session": {"value": "abc"}}]}})
         .to_string();
@@ -563,5 +636,121 @@ mod tests {
             }
         }
         assert_eq!(agent_batches, 2);
+    }
+
+    #[test]
+    fn request_times_out_on_stalled_connection() {
+        // Accepts the connection but never reads or responds — simulates a
+        // stalled herdr. `request()` (via focus_agent) must not hang the
+        // caller (the TUI main thread) forever.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                drop(stream);
+            }
+        });
+
+        let mut c = UnixSocketClient { socket_path: path };
+        let start = std::time::Instant::now();
+        let err = c.focus_agent("w1:p1").unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "request took {elapsed:?}, expected it to time out well under 5s"
+        );
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn mismatched_response_id_is_rejected() {
+        // The fake server deliberately ignores the sent id and replies with
+        // a different one — `request()` must reject it rather than trust
+        // whatever comes back first.
+        let bad = r#"{"id":"not-the-request-id","result":{}}"#.to_string();
+        let (_dir, path, _seen) = fake_server(vec![vec![bad]]);
+        let mut c = UnixSocketClient { socket_path: path };
+        let e = c.focus_agent("w1:p1").unwrap_err();
+        assert!(e.to_string().contains("response id mismatch"), "got: {e}");
+    }
+
+    #[test]
+    fn classifies_would_block_and_timed_out_as_read_timeouts() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_read_timeout(&Error::from(ErrorKind::WouldBlock)));
+        assert!(is_read_timeout(&Error::from(ErrorKind::TimedOut)));
+        assert!(!is_read_timeout(&Error::from(ErrorKind::ConnectionReset)));
+        assert!(!is_read_timeout(&Error::from(ErrorKind::UnexpectedEof)));
+    }
+
+    #[test]
+    fn subscribe_loop_self_heals_on_stalled_read_then_exits_on_eof() {
+        // A subscribe connection that goes silent (open but stalled) must
+        // not wedge the loop: the read times out, we resync, and keep
+        // reading on the SAME connection rather than erroring out.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+
+        fn respond_agent_list(stream: &mut UnixStream) {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let id = serde_json::from_str::<Value>(line.trim())
+                .ok()
+                .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                .unwrap_or_default();
+            let resp = serde_json::json!({"id": id, "result": {"agents": [
+                {"pane_id": "w1:p7", "agent": "claude", "agent_status": "working",
+                 "agent_session": {"value": "abc"}}]}})
+            .to_string();
+            writeln!(stream, "{resp}").unwrap();
+        }
+
+        std::thread::spawn(move || {
+            // Initial resync.
+            let (mut a, _) = listener.accept().unwrap();
+            respond_agent_list(&mut a);
+            drop(a);
+
+            // Subscribe connection: read the request, then go silent —
+            // holding it open (not dropped yet) simulates a stall.
+            let (b, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(b.try_clone().unwrap());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+
+            // The client's read times out and it resyncs on a fresh
+            // connection — respond to that here.
+            let (mut c, _) = listener.accept().unwrap();
+            respond_agent_list(&mut c);
+            drop(c);
+
+            // Now end the stalled connection: the client's next read on it
+            // sees EOF and returns cleanly (existing backoff path).
+            drop(b);
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let start = std::time::Instant::now();
+        subscribe_loop_with_timeout(&path, &tx, std::time::Duration::from_millis(150)).unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?}"
+        );
+
+        let mut agent_batches = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, crate::tui::AppEvent::Agents(_)) {
+                agent_batches += 1;
+            }
+        }
+        assert_eq!(
+            agent_batches, 2,
+            "expected the initial resync plus one stall self-heal resync"
+        );
     }
 }

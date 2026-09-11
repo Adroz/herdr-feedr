@@ -1,3 +1,5 @@
+pub mod socket;
+
 use crate::config::SidebarConfig;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode};

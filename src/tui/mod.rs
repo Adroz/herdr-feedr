@@ -5,6 +5,7 @@ pub mod modal;
 pub mod socket;
 #[cfg(test)]
 pub mod test_util;
+pub mod theme;
 pub mod view;
 pub mod watch;
 
@@ -145,13 +146,11 @@ fn event_loop(
         }
         if event::poll(Duration::from_millis(100))? {
             let ev = event::read()?;
+            let size = terminal.size()?;
             if app.modal_active() {
-                app.handle_modal_event(ev);
-            } else {
-                let size = terminal.size()?;
-                if let Some(action) = input::translate(&ev, app, (size.width, size.height)) {
-                    app.apply(action);
-                }
+                app.handle_modal_event(ev, (size.width, size.height));
+            } else if let Some(action) = input::translate(&ev, app, (size.width, size.height)) {
+                app.apply(action);
             }
         }
     }

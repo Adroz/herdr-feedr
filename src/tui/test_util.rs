@@ -1,4 +1,5 @@
-use ratatui::backend::TestBackend;
+use ratatui::backend::{Backend, TestBackend};
+use ratatui::layout::Position;
 use ratatui::Terminal;
 
 /// Draw the app into an in-memory buffer and return each row as a
@@ -16,4 +17,21 @@ pub fn render_to_strings(app: &crate::tui::app::App, w: u16, h: u16) -> Vec<Stri
                 .to_string()
         })
         .collect()
+}
+
+/// Draw the app into an in-memory buffer and report where (if anywhere) the
+/// real terminal cursor landed — `None` when the frame left it hidden (the
+/// non-modal case, and any modal frame where no textarea has focus).
+///
+/// `TestBackend` doesn't expose a public "is the cursor visible" getter
+/// (only `get_cursor_position`, which returns a position regardless of
+/// visibility), so this reads its derived `Debug` output for `cursor:
+/// true`/`false` — a fresh `TestBackend` per call, so a stale position from
+/// a prior draw can never be mistaken for a currently-visible one.
+pub fn render_cursor(app: &crate::tui::app::App, w: u16, h: u16) -> Option<Position> {
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    terminal.draw(|f| crate::tui::view::draw(f, app)).unwrap();
+    let backend = terminal.backend_mut();
+    let visible = format!("{backend:?}").contains("cursor: true");
+    visible.then(|| backend.get_cursor_position().unwrap())
 }

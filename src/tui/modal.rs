@@ -11,7 +11,8 @@
 
 use crate::feed::{Document, Item};
 use crate::tui::app::{section_choices, ItemKey, SectionChoice};
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::Block;
 use tui_textarea::{CursorMove, TextArea};
 
@@ -34,7 +35,16 @@ pub enum EditFocus {
     Section,
     Title,
     Body,
+    Save,
+    Cancel,
+    /// Edit mode only — create mode has no item to delete.
+    Delete,
 }
+
+pub const SAVE_LABEL: &str = "[ Save ]";
+pub const CANCEL_LABEL: &str = "[ Cancel ]";
+pub const DELETE_LABEL: &str = "[ Delete ]";
+const BUTTON_GAP: u16 = 2;
 
 pub struct EditModal {
     /// `Some(key)` = editing an existing item; `None` = creating.
@@ -86,12 +96,19 @@ impl EditModal {
         }
     }
 
+    /// Tab order: (Section →) Title → Body → Save → Cancel → (Delete →)
+    /// back to the start. Create mode has no item to delete; edit mode has
+    /// no section field to move to (moving sections is $EDITOR territory).
     pub fn cycle_focus(&mut self) {
-        self.focus = match (self.focus, self.original.is_some()) {
+        let is_edit = self.original.is_some();
+        self.focus = match (self.focus, is_edit) {
             (EditFocus::Section, _) => EditFocus::Title,
             (EditFocus::Title, _) => EditFocus::Body,
-            (EditFocus::Body, true) => EditFocus::Title, // no section field on edit
-            (EditFocus::Body, false) => EditFocus::Section,
+            (EditFocus::Body, _) => EditFocus::Save,
+            (EditFocus::Save, _) => EditFocus::Cancel,
+            (EditFocus::Cancel, true) => EditFocus::Delete,
+            (EditFocus::Cancel, false) => EditFocus::Section,
+            (EditFocus::Delete, _) => EditFocus::Title,
         };
         self.sync_blocks();
     }
@@ -126,6 +143,119 @@ impl EditModal {
     }
 }
 
+/// Drawn geometry of the edit/create modal — the single source of truth for
+/// both where things are rendered (`view::draw_modal`) and where a click
+/// lands (`edit_step`'s mouse handling), so the two can never drift apart.
+/// Mirrors the main list's `view::draw` / `input::translate` split, except
+/// here the geometry itself is a shared pure function rather than a
+/// duplicated formula, since the modal's layout is nested (centered rect →
+/// bordered inner → vertical stack → button spans).
+#[derive(Debug, Clone, Copy)]
+pub struct EditLayout {
+    pub outer: Rect,
+    pub section: Rect,
+    pub title: Rect,
+    pub body: Rect,
+    pub hints: Rect,
+    pub save: Rect,
+    pub cancel: Rect,
+    /// `None` in create mode — nothing to delete yet.
+    pub delete: Option<Rect>,
+}
+
+/// Percentage-centered rect within `area` (shared by the edit modal, the
+/// confirm-delete modal, and the read-only viewers).
+pub(crate) fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
+    let [_, mid_v, _] = Layout::vertical([
+        Constraint::Percentage((100 - pct_y) / 2),
+        Constraint::Percentage(pct_y),
+        Constraint::Percentage((100 - pct_y) / 2),
+    ])
+    .areas(area);
+    let [_, mid, _] = Layout::horizontal([
+        Constraint::Percentage((100 - pct_x) / 2),
+        Constraint::Percentage(pct_x),
+        Constraint::Percentage((100 - pct_x) / 2),
+    ])
+    .areas(mid_v);
+    mid
+}
+
+/// Pure geometry for the edit/create modal, given the full terminal area.
+pub fn edit_layout(term_area: Rect, is_edit: bool) -> EditLayout {
+    let outer = centered(term_area, 90, 80);
+    let inner = Block::bordered().inner(outer);
+    let [section, title, body, buttons, hints] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Min(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let mut x = buttons.x;
+    let save = Rect::new(x, buttons.y, SAVE_LABEL.len() as u16, 1);
+    x += SAVE_LABEL.len() as u16 + BUTTON_GAP;
+    let cancel = Rect::new(x, buttons.y, CANCEL_LABEL.len() as u16, 1);
+    x += CANCEL_LABEL.len() as u16 + BUTTON_GAP;
+    let delete = is_edit.then(|| Rect::new(x, buttons.y, DELETE_LABEL.len() as u16, 1));
+
+    EditLayout {
+        outer,
+        section,
+        title,
+        body,
+        hints,
+        save,
+        cancel,
+        delete,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditClickTarget {
+    Section,
+    Title,
+    Body,
+    Save,
+    Cancel,
+    Delete,
+}
+
+fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+/// Hit-test a click against the modal's drawn geometry. Pure — no
+/// filesystem or `App` access, mirrors `input::translate`'s hit-testing for
+/// the main list.
+pub fn edit_click(layout: &EditLayout, is_edit: bool, x: u16, y: u16) -> Option<EditClickTarget> {
+    if !is_edit && rect_contains(layout.section, x, y) {
+        return Some(EditClickTarget::Section);
+    }
+    if rect_contains(layout.title, x, y) {
+        return Some(EditClickTarget::Title);
+    }
+    if rect_contains(layout.body, x, y) {
+        return Some(EditClickTarget::Body);
+    }
+    if rect_contains(layout.save, x, y) {
+        return Some(EditClickTarget::Save);
+    }
+    if rect_contains(layout.cancel, x, y) {
+        return Some(EditClickTarget::Cancel);
+    }
+    if is_edit {
+        if let Some(d) = layout.delete {
+            if rect_contains(d, x, y) {
+                return Some(EditClickTarget::Delete);
+            }
+        }
+    }
+    None
+}
+
 /// Result of feeding one terminal event to the active modal. `Continue`
 /// covers every transition that stays purely in-memory (including
 /// cancelling to `Modal::None`); `Save` and `Delete` are the two points
@@ -140,9 +270,11 @@ pub enum ModalStep {
     OpenEditor,
 }
 
-/// Pure modal transition: `(modal, event) -> ModalStep`. Never touches the
-/// filesystem — mirrors `input::translate`.
-pub fn step(modal: Modal, ev: Event) -> ModalStep {
+/// Pure modal transition: `(modal, event, terminal area) -> ModalStep`.
+/// Never touches the filesystem — mirrors `input::translate`. `area` is the
+/// full terminal area (as drawn by `view::draw`); only `Modal::Edit`'s mouse
+/// handling needs it, to re-derive `edit_layout` for hit-testing.
+pub fn step(modal: Modal, ev: Event, area: Rect) -> ModalStep {
     // Ignore key releases (Windows terminals emit them).
     if let Event::Key(k) = &ev {
         if k.kind == KeyEventKind::Release {
@@ -151,7 +283,7 @@ pub fn step(modal: Modal, ev: Event) -> ModalStep {
     }
     match modal {
         Modal::None => ModalStep::Continue(Modal::None),
-        Modal::Edit(m) => edit_step(m, ev),
+        Modal::Edit(m) => edit_step(m, ev, area),
         Modal::ConfirmDelete(m) => match ev {
             Event::Key(k) if k.code == KeyCode::Char('y') => {
                 let key = m
@@ -193,7 +325,7 @@ pub fn step(modal: Modal, ev: Event) -> ModalStep {
     }
 }
 
-fn edit_step(mut m: EditModal, ev: Event) -> ModalStep {
+fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
     if let Event::Key(k) = &ev {
         match (k.code, k.modifiers) {
             (KeyCode::Esc, _) => return ModalStep::Continue(Modal::None),
@@ -214,7 +346,44 @@ fn edit_step(mut m: EditModal, ev: Event) -> ModalStep {
                 m.sync_blocks();
                 return ModalStep::Continue(Modal::Edit(m));
             }
+            // Cheap keyboard reachability for the button row (mouse click
+            // is the primary requirement; Enter activates whichever button
+            // Tab last landed on).
+            (KeyCode::Enter, _) if m.focus == EditFocus::Save => return ModalStep::Save(m),
+            (KeyCode::Enter, _) if m.focus == EditFocus::Cancel => {
+                return ModalStep::Continue(Modal::None)
+            }
+            (KeyCode::Enter, _) if m.focus == EditFocus::Delete => {
+                return ModalStep::Continue(Modal::ConfirmDelete(m))
+            }
             _ => {}
+        }
+    }
+    if let Event::Mouse(mev) = &ev {
+        if mev.kind == MouseEventKind::Down(MouseButton::Left) {
+            let is_edit = m.original.is_some();
+            let layout = edit_layout(area, is_edit);
+            return match edit_click(&layout, is_edit, mev.column, mev.row) {
+                Some(EditClickTarget::Section) => {
+                    m.focus = EditFocus::Section;
+                    m.sync_blocks();
+                    ModalStep::Continue(Modal::Edit(m))
+                }
+                Some(EditClickTarget::Title) => {
+                    m.focus = EditFocus::Title;
+                    m.sync_blocks();
+                    ModalStep::Continue(Modal::Edit(m))
+                }
+                Some(EditClickTarget::Body) => {
+                    m.focus = EditFocus::Body;
+                    m.sync_blocks();
+                    ModalStep::Continue(Modal::Edit(m))
+                }
+                Some(EditClickTarget::Save) => ModalStep::Save(m),
+                Some(EditClickTarget::Cancel) => ModalStep::Continue(Modal::None),
+                Some(EditClickTarget::Delete) => ModalStep::Continue(Modal::ConfirmDelete(m)),
+                None => ModalStep::Continue(Modal::Edit(m)),
+            };
         }
     }
     match m.focus {
@@ -237,6 +406,7 @@ fn edit_step(mut m: EditModal, ev: Event) -> ModalStep {
         EditFocus::Body => {
             m.body.input(ev);
         }
+        EditFocus::Save | EditFocus::Cancel | EditFocus::Delete => {}
     }
     ModalStep::Continue(Modal::Edit(m))
 }
@@ -244,10 +414,53 @@ fn edit_step(mut m: EditModal, ev: Event) -> ModalStep {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEvent, KeyModifiers};
+    use crate::feed::State;
+    use crossterm::event::{KeyEvent, KeyModifiers, MouseEvent};
+
+    const TEST_AREA: Rect = Rect::new(0, 0, 80, 24);
 
     fn down() -> Event {
         Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+    }
+
+    fn click(x: u16, y: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    fn enter() -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    fn create_modal() -> EditModal {
+        EditModal::create(&Document::default())
+    }
+
+    fn edit_modal() -> EditModal {
+        EditModal::edit(
+            ItemKey {
+                title: "A".into(),
+                state: State::Open,
+            },
+            &Item {
+                state: State::Open,
+                title: "A".into(),
+                agent: None,
+                done_date: None,
+                body: vec![],
+            },
+        )
+    }
+
+    fn as_edit(step_result: ModalStep) -> EditModal {
+        match step_result {
+            ModalStep::Continue(Modal::Edit(m)) => m,
+            _ => panic!("expected Continue(Modal::Edit(_))"),
+        }
     }
 
     /// Rider from Task 10's review: the viewer scroll `Down` arms used plain
@@ -260,7 +473,7 @@ mod tests {
             scroll: u16::MAX - 5,
         };
         for _ in 0..70_000 {
-            modal = match step(modal, down()) {
+            modal = match step(modal, down(), TEST_AREA) {
                 ModalStep::Continue(m) => m,
                 _ => panic!("DoneView Down must stay in Continue"),
             };
@@ -274,11 +487,131 @@ mod tests {
             scroll: u16::MAX - 5,
         };
         for _ in 0..70_000 {
-            modal = match step(modal, down()) {
+            modal = match step(modal, down(), TEST_AREA) {
                 ModalStep::Continue(m) => m,
                 _ => panic!("FileView Down must stay in Continue"),
             };
         }
         assert!(matches!(modal, Modal::FileView { scroll } if scroll == u16::MAX));
+    }
+
+    #[test]
+    fn edit_layout_has_no_delete_button_in_create_mode_and_one_in_edit_mode() {
+        assert!(edit_layout(TEST_AREA, false).delete.is_none());
+        assert!(edit_layout(TEST_AREA, true).delete.is_some());
+    }
+
+    #[test]
+    fn clicking_section_title_or_body_moves_focus_there() {
+        let layout = edit_layout(TEST_AREA, false);
+        let m = create_modal();
+        assert_eq!(m.focus, EditFocus::Section);
+
+        let m = as_edit(step(
+            Modal::Edit(m),
+            click(layout.title.x, layout.title.y),
+            TEST_AREA,
+        ));
+        assert_eq!(m.focus, EditFocus::Title);
+
+        let m = as_edit(step(
+            Modal::Edit(m),
+            click(layout.body.x, layout.body.y),
+            TEST_AREA,
+        ));
+        assert_eq!(m.focus, EditFocus::Body);
+
+        let m = as_edit(step(
+            Modal::Edit(m),
+            click(layout.section.x, layout.section.y),
+            TEST_AREA,
+        ));
+        assert_eq!(m.focus, EditFocus::Section);
+    }
+
+    /// Edit mode has no section field (moving sections is $EDITOR
+    /// territory) — a click on the reserved-but-blank row must be a no-op.
+    #[test]
+    fn clicking_reserved_section_row_is_noop_in_edit_mode() {
+        let layout = edit_layout(TEST_AREA, true);
+        let m = edit_modal();
+        let before = m.focus;
+        let m = as_edit(step(
+            Modal::Edit(m),
+            click(layout.section.x, layout.section.y),
+            TEST_AREA,
+        ));
+        assert_eq!(m.focus, before);
+    }
+
+    #[test]
+    fn clicking_save_button_saves() {
+        let layout = edit_layout(TEST_AREA, false);
+        let m = create_modal();
+        let result = step(
+            Modal::Edit(m),
+            click(layout.save.x, layout.save.y),
+            TEST_AREA,
+        );
+        assert!(matches!(result, ModalStep::Save(_)));
+    }
+
+    #[test]
+    fn clicking_cancel_button_closes_modal() {
+        let layout = edit_layout(TEST_AREA, false);
+        let m = create_modal();
+        let result = step(
+            Modal::Edit(m),
+            click(layout.cancel.x, layout.cancel.y),
+            TEST_AREA,
+        );
+        assert!(matches!(result, ModalStep::Continue(Modal::None)));
+    }
+
+    #[test]
+    fn clicking_delete_button_opens_confirm_delete() {
+        let layout = edit_layout(TEST_AREA, true);
+        let m = edit_modal();
+        let delete = layout.delete.expect("edit mode has a delete button");
+        let result = step(Modal::Edit(m), click(delete.x, delete.y), TEST_AREA);
+        assert!(matches!(
+            result,
+            ModalStep::Continue(Modal::ConfirmDelete(_))
+        ));
+    }
+
+    #[test]
+    fn tab_reaches_save_cancel_and_delete_and_enter_activates_them() {
+        // Create mode: Section -> Title -> Body -> Save -> Cancel -> Section.
+        let mut m = create_modal();
+        for _ in 0..3 {
+            m.cycle_focus();
+        }
+        assert_eq!(m.focus, EditFocus::Save);
+        assert!(matches!(
+            step(Modal::Edit(m), enter(), TEST_AREA),
+            ModalStep::Save(_)
+        ));
+
+        let mut m = create_modal();
+        for _ in 0..4 {
+            m.cycle_focus();
+        }
+        assert_eq!(m.focus, EditFocus::Cancel);
+        assert!(matches!(
+            step(Modal::Edit(m), enter(), TEST_AREA),
+            ModalStep::Continue(Modal::None)
+        ));
+
+        // Edit mode: Title -> Body -> Save -> Cancel -> Delete.
+        let mut m = edit_modal();
+        for _ in 0..4 {
+            m.cycle_focus();
+        }
+        assert_eq!(m.focus, EditFocus::Delete);
+        assert!(matches!(
+            step(Modal::Edit(m), enter(), TEST_AREA),
+            ModalStep::Continue(Modal::ConfirmDelete(_))
+        ));
     }
 }

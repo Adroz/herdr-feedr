@@ -362,10 +362,14 @@ impl App {
     /// bypassed while a modal is open). The pure transition logic lives in
     /// `modal::step`; this is just the glue for the two outcomes that need
     /// filesystem access (`Save`, `Delete`), which only `App` can provide
-    /// (`with_feed` is private to this module).
-    pub fn handle_modal_event(&mut self, ev: Event) {
+    /// (`with_feed` is private to this module). `size` is the terminal
+    /// (width, height) — needed so `modal::step` can re-derive the edit
+    /// modal's drawn geometry for mouse hit-testing, same as
+    /// `input::translate` does for the main list.
+    pub fn handle_modal_event(&mut self, ev: Event, size: (u16, u16)) {
         let modal = std::mem::replace(&mut self.modal, Modal::None);
-        self.modal = match crate::tui::modal::step(modal, ev) {
+        let area = ratatui::layout::Rect::new(0, 0, size.0, size.1);
+        self.modal = match crate::tui::modal::step(modal, ev, area) {
             ModalStep::Continue(m) => m,
             ModalStep::Save(m) => self.save_modal(m),
             ModalStep::Delete(key) => {
@@ -926,15 +930,23 @@ mod tests {
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
+    /// Arbitrary but realistic terminal size for driving modal events in
+    /// tests that don't care about exact click geometry (those compute
+    /// their own coordinates via `modal::edit_layout`).
+    const TEST_SIZE: (u16, u16) = (80, 24);
+
     fn press(app: &mut App, code: KeyCode) {
-        app.handle_modal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        app.handle_modal_event(
+            Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+            TEST_SIZE,
+        );
     }
 
     fn press_ctrl(app: &mut App, c: char) {
-        app.handle_modal_event(Event::Key(KeyEvent::new(
-            KeyCode::Char(c),
-            KeyModifiers::CONTROL,
-        )));
+        app.handle_modal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)),
+            TEST_SIZE,
+        );
     }
 
     fn type_str(app: &mut App, s: &str) {

@@ -11,6 +11,7 @@ pub fn translate(ev: &Event, app: &App, size: (u16, u16)) -> Option<Action> {
             KeyCode::Char('q') => Some(Action::Quit),
             KeyCode::Char('a') => Some(Action::OpenCreate),
             KeyCode::Char('e') => Some(Action::OpenEditor),
+            KeyCode::Char('f') => Some(Action::OpenFileView),
             KeyCode::Up => Some(Action::ScrollUp),
             KeyCode::Down => Some(Action::ScrollDown),
             _ => None,
@@ -36,10 +37,12 @@ fn click(app: &App, x: u16, y: u16, w: u16, h: u16) -> Option<Action> {
         return Some(Action::ToggleCollapse);
     }
     if y == 0 {
-        // Toolbar columns must match view::TOOLBAR ("clear completed  file").
+        // Toolbar columns must match view::TOOLBAR ("clear completed").
+        // Round-4 item 1: "file" is gone from the toolbar — the file
+        // viewer is reachable via the `f` key instead — so everything
+        // right of "clear completed" is a dead zone.
         return match x {
             0..=14 => Some(Action::Sweep),
-            17..=20 => Some(Action::OpenFileView),
             _ => None,
         };
     }
@@ -131,7 +134,7 @@ mod tests {
         Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
     }
 
-    const SIZE: (u16, u16) = (22, 10); // list rows y=1..=7, Done row y=8, status y=9; w=22 so the full round-3 toolbar ("clear completed  file", 21 cols) and the bottom-right chevron zone both fit
+    const SIZE: (u16, u16) = (22, 10); // list rows y=1..=7, Done row y=8, status y=9; w=22 so the toolbar ("clear completed") and the bottom-right chevron zone both fit
 
     #[test]
     fn keys_quit_add_editor_scroll() {
@@ -149,26 +152,28 @@ mod tests {
         );
     }
 
-    /// Round-3 item 3: toolbar is now "clear completed  file" — no leading
-    /// chevron (that moved to the status row, round-3 item 2). "clear
-    /// completed" spans 0..=14, a two-space gap at 15..=16, "file" at
-    /// 17..=20.
+    /// Round-3 item 3: toolbar is now "clear completed" — no leading
+    /// chevron (that moved to the status row, round-3 item 2). Round-4
+    /// item 1: "file" is gone from the toolbar entirely — "clear completed"
+    /// still spans 0..=14, and everything right of it is a dead zone. The
+    /// file viewer moved to the `f` key (see `f_key_opens_file_view`).
     #[test]
     fn toolbar_clicks() {
         let app = app_with(SAMPLE);
         assert_eq!(translate(&click(0, 0), &app, SIZE), Some(Action::Sweep));
         assert_eq!(translate(&click(14, 0), &app, SIZE), Some(Action::Sweep));
-        assert_eq!(translate(&click(15, 0), &app, SIZE), None); // gap
-        assert_eq!(translate(&click(16, 0), &app, SIZE), None); // gap
-        assert_eq!(
-            translate(&click(17, 0), &app, SIZE),
-            Some(Action::OpenFileView)
-        );
-        assert_eq!(
-            translate(&click(20, 0), &app, SIZE),
-            Some(Action::OpenFileView)
-        );
-        assert_eq!(translate(&click(21, 0), &app, SIZE), None); // dead zone past "file"
+        assert_eq!(translate(&click(15, 0), &app, SIZE), None); // dead zone
+        assert_eq!(translate(&click(17, 0), &app, SIZE), None); // dead zone (was "file")
+        assert_eq!(translate(&click(21, 0), &app, SIZE), None); // dead zone
+    }
+
+    /// Round-4 item 1: with "file" removed from the toolbar, the internal
+    /// file viewer stays reachable via the `f` key, alongside the existing
+    /// `e` → $EDITOR binding.
+    #[test]
+    fn f_key_opens_file_view() {
+        let app = app_with(SAMPLE);
+        assert_eq!(translate(&key('f'), &app, SIZE), Some(Action::OpenFileView));
     }
 
     /// Round-3 item 2: the collapse chevron moved off the toolbar onto the

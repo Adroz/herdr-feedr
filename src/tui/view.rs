@@ -8,11 +8,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph};
 use ratatui::Frame;
 
-/// Toolbar text; the click spans in input.rs must match these columns:
-/// "clear completed" at 0..=14, "file" at 17..=20. Round-3 item 2 moved the
-/// collapse chevron off the toolbar onto the bottom-right of the status row
-/// (`draw_status_row`) — herdr's own native position for it.
-pub const TOOLBAR: &str = "clear completed  file";
+/// Toolbar text; the click span in input.rs must match these columns:
+/// "clear completed" at 0..=14. Round-3 item 2 moved the collapse chevron
+/// off the toolbar onto the bottom-right of the status row
+/// (`draw_status_row`) — herdr's own native position for it. Round-4 item 1
+/// dropped "file" from the toolbar entirely; the internal file viewer stays
+/// reachable via the `f` key (input.rs `translate`).
+pub const TOOLBAR: &str = "clear completed";
 
 /// Collapse-chevron glyph, pinned bottom-right of the status row (round-3
 /// item 2). Same glyph the toolbar used to show at column 0.
@@ -68,8 +70,14 @@ pub fn ellipsize(s: &str, width: usize) -> String {
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
     if app.collapsed {
-        // ~3-col rail: click anywhere restores (input.rs).
-        f.render_widget(Paragraph::new("»").style(theme::muted_row()), area);
+        // ~3-col rail: click anywhere restores (input.rs). Round-4 item 2:
+        // the chevron renders on the BOTTOM row (native herdr's own
+        // position for it), not the top — the rest of the rail is blank.
+        let lines: Vec<Line> = (0..area.height.saturating_sub(1))
+            .map(|_| Line::from(""))
+            .chain(std::iter::once(Line::styled("»", theme::muted_row())))
+            .collect();
+        f.render_widget(Paragraph::new(lines).style(theme::muted_row()), area);
         return;
     }
     let [toolbar, list, done, status] = Layout::vertical([
@@ -378,7 +386,7 @@ mod tests {
         );
         app.status_msg = Some("hello".into());
         let rows = render_to_strings(&app, 20, 12);
-        assert_eq!(rows[0], "clear completed  fil"); // round-3: no leading «, renamed label (clipped at 20 cols)
+        assert_eq!(rows[0], "clear completed"); // round-4: "file" removed from toolbar
         assert_eq!(rows[1], "[ ] Fix auth redire…"); // ellipsized at 20 cols
         assert_eq!(rows[2], "[~] Migrate CI");
         assert_eq!(rows[3], "  @claude >"); // live working glyph
@@ -417,12 +425,15 @@ mod tests {
     }
 
     /// Round-3 item 3: "sweep" is renamed "clear completed" with no leading
-    /// chevron (that moved to the status row — item 2).
+    /// chevron (that moved to the status row — item 2). Round-4 item 1:
+    /// "file" is removed from the toolbar entirely — the file viewer is
+    /// still reachable via the `f` key (input.rs).
     #[test]
-    fn toolbar_text_matches_round3_spec() {
+    fn toolbar_text_matches_round4_spec() {
         assert!(!TOOLBAR.starts_with('«'));
-        assert!(TOOLBAR.contains("clear completed"));
+        assert_eq!(TOOLBAR, "clear completed");
         assert!(!TOOLBAR.contains("sweep"));
+        assert!(!TOOLBAR.contains("file"));
     }
 
     /// Round-2 item 2: the brackets are always normal text; only the
@@ -454,13 +465,17 @@ mod tests {
         assert_eq!(rows[3], "  @claude"); // sub-line still shown, no glyph
     }
 
+    /// Round-4 item 2: the collapsed rail's `»` renders on the BOTTOM row
+    /// (matching native herdr), not the top — the rest of the rail is
+    /// blank.
     #[test]
     fn collapsed_renders_rail() {
         let mut app = app_with(SAMPLE);
         app.collapsed = true;
         let rows = render_to_strings(&app, 3, 6);
-        assert_eq!(rows[0], "»");
-        assert!(rows[1..].iter().all(|r| r.is_empty()));
+        let last = rows.len() - 1;
+        assert_eq!(rows[last], "»");
+        assert!(rows[..last].iter().all(|r| r.is_empty()));
     }
 
     #[test]

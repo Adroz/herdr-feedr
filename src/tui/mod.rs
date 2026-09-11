@@ -67,15 +67,23 @@ pub fn run(feed_path: PathBuf, cfg: SidebarConfig) -> Result<()> {
     }
 
     let mut terminal = ratatui::init();
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::SetTitle(dock::PANE_TITLE_MARKER)
-    );
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    let _ = reinit_terminal_commands(&mut std::io::stdout());
     let res = event_loop(&mut terminal, &mut app, &rx);
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res
+}
+
+/// Re-assert terminal output state that an external program (e.g. $EDITOR,
+/// during the resume path in `event_loop`) is free to clobber while it holds
+/// the tty: mouse capture and the dock pane-title marker. Writes to `w` so
+/// the exact command bytes can be asserted in tests without a live terminal.
+/// Both startup (`run`) and every editor-resume go through this one helper,
+/// so the two paths can't drift out of sync again.
+fn reinit_terminal_commands<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
+    crossterm::execute!(w, EnableMouseCapture)?;
+    crossterm::execute!(w, crossterm::terminal::SetTitle(dock::PANE_TITLE_MARKER))?;
+    Ok(())
 }
 
 /// Run $EDITOR (may carry args, e.g. "code -w") on the feed file.
@@ -129,7 +137,7 @@ fn event_loop(
             ratatui::restore();
             let result = spawn_editor(&editor, &path);
             *terminal = ratatui::init();
-            let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+            let _ = reinit_terminal_commands(&mut std::io::stdout());
             if let Err(e) = result {
                 app.status_msg = Some(format!("editor: {e}"));
             }
@@ -152,6 +160,29 @@ fn event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug this guards: an editor invoked from the sidebar (the `e` key)
+    /// is free to clobber the terminal title, and `find_sidebar_pane`'s exact
+    /// match against `dock::PANE_TITLE_MARKER` then fails on the next
+    /// `--dock`, opening a duplicate pane. Both the startup path (`run`) and
+    /// the editor-resume path in `event_loop` must re-assert the same two
+    /// commands after regaining the tty, so this locks the shared helper's
+    /// exact output rather than one call site.
+    #[test]
+    fn reinit_terminal_commands_re_enables_mouse_capture_and_pane_title() {
+        let mut buf: Vec<u8> = Vec::new();
+        reinit_terminal_commands(&mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("\x1B[?1000h"),
+            "must re-enable mouse capture, got: {out:?}"
+        );
+        let want_title = format!("\x1B]0;{}\x07", dock::PANE_TITLE_MARKER);
+        assert!(
+            out.contains(&want_title),
+            "must re-assert the dock pane-title marker, got: {out:?}"
+        );
+    }
 
     #[test]
     fn check_feed_readable_treats_missing_file_as_ok() {

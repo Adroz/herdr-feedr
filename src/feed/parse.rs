@@ -44,8 +44,12 @@ fn parse_item_line(line: &str) -> Option<Item> {
         let t = title.trim_end();
         if let Some((head, tok)) = split_trailing_token(t) {
             match tok {
-                Token::Agent(a) => agent = Some(a),
-                Token::Done(d) => done_date = Some(d),
+                Token::Agent(a) if agent.is_none() => agent = Some(a),
+                Token::Done(d) if done_date.is_none() => done_date = Some(d),
+                _ => {
+                    title = t.to_string();
+                    break;
+                }
             }
             title = head.trim_end().to_string();
         } else {
@@ -67,6 +71,9 @@ enum Token {
     Done(String),
 }
 
+/// A malformed rightmost token (e.g. `@agent(nocolon)`) returns None, which
+/// deliberately shields any earlier valid tokens: the whole tail stays in the
+/// title verbatim rather than being partially consumed. Lossless over clever.
 fn split_trailing_token(s: &str) -> Option<(&str, Token)> {
     let a = s.rfind("@agent(");
     let d = s.rfind("@done(");
@@ -179,6 +186,18 @@ mod tests {
                 assert_eq!(it.title, "Foo");
                 assert_eq!(it.agent.as_ref().unwrap().to_string(), "claude:123");
                 assert_eq!(it.done_date.as_deref(), Some("2026-09-01"));
+            }
+            n => panic!("expected item, got {n:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_tokens_stay_in_title() {
+        let doc = parse("- [x] A @done(2026-01-01) @done(2026-02-02)\n");
+        match &doc.nodes[0] {
+            Node::Item(it) => {
+                assert_eq!(it.title, "A @done(2026-01-01)");
+                assert_eq!(it.done_date.as_deref(), Some("2026-02-02"));
             }
             n => panic!("expected item, got {n:?}"),
         }

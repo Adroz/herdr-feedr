@@ -37,7 +37,8 @@ pub fn parse(text: &str) -> Document {
             // line — e.g. a blank line inside a fenced code block or between
             // paragraphs. Otherwise it's a Raw line (blank lines that end a
             // body, or that sit between unrelated nodes, stay Raw).
-            let preceding_is_body_context = matches!(nodes.last(), Some(Node::Item(_)));
+            let preceding_is_body_context =
+                matches!(nodes.last(), Some(Node::Item(it)) if !it.body.is_empty());
             let next_is_body_line = lines[idx + 1..]
                 .iter()
                 .find(|l| !l.trim().is_empty())
@@ -246,5 +247,16 @@ mod tests {
             }
             n => panic!("expected item, got {n:?}"),
         }
+    }
+
+    #[test]
+    fn blank_before_any_body_line_is_raw() {
+        let doc = parse("- [ ] A\n\n  late body\n");
+        match &doc.nodes[0] {
+            Node::Item(it) => assert!(it.body.is_empty(), "body must be empty, got {:?}", it.body),
+            n => panic!("expected item, got {n:?}"),
+        }
+        assert!(matches!(&doc.nodes[1], Node::Raw(s) if s.is_empty()));
+        assert!(matches!(&doc.nodes[2], Node::Raw(_))); // "  late body" detached
     }
 }

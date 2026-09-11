@@ -100,15 +100,6 @@ pub fn build_rows(doc: &Document) -> (Vec<Row>, usize) {
     (rows, done_count)
 }
 
-/// Where a created item can go: the first human region, a named `##` human
-/// section, or the reserved `## Agent` section.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SectionChoice {
-    FirstHuman,
-    Named(String),
-    Agent,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Quit,
@@ -123,19 +114,6 @@ pub enum Action {
     AgentClick(ItemKey),
     ScrollUp,
     ScrollDown,
-}
-
-pub fn section_choices(doc: &Document) -> Vec<SectionChoice> {
-    let mut v = vec![SectionChoice::FirstHuman];
-    for (i, n) in doc.nodes.iter().enumerate() {
-        if let Node::Heading { level: 2, text } = n {
-            if ops::zone_of(doc, i) != Zone::Archive && !text.eq_ignore_ascii_case("Agent") {
-                v.push(SectionChoice::Named(text.clone()));
-            }
-        }
-    }
-    v.push(SectionChoice::Agent);
-    v
 }
 
 /// Whether a `with_feed` closure actually mutated the document — controls
@@ -307,7 +285,7 @@ impl App {
                     }
                 }
             }
-            Action::OpenCreate => self.modal = Modal::Edit(EditModal::create(&self.doc)),
+            Action::OpenCreate => self.modal = Modal::Edit(EditModal::create()),
             Action::OpenDoneView => self.modal = Modal::DoneView { scroll: 0 },
             Action::OpenFileView => self.modal = Modal::FileView { scroll: 0 },
             Action::OpenEditor => self.request_editor(),
@@ -404,13 +382,13 @@ impl App {
                 });
             }
             None => {
-                let choice = m.choices[m.choice_idx].clone();
+                // Sidebar-created items are always the human's; they land
+                // at the end of the first human section (round-2 item 5 —
+                // the section picker was dead UI: agents create their own
+                // items via the CLI into `## Agent`, and can relocate items
+                // later by editing the feed).
                 self.with_feed(move |doc| {
-                    match choice {
-                        SectionChoice::FirstHuman => ops::add(doc, &title, &body, Zone::Human),
-                        SectionChoice::Agent => ops::add(doc, &title, &body, Zone::Agent),
-                        SectionChoice::Named(s) => ops::add_in_section(doc, &title, &body, &s)?,
-                    }
+                    ops::add(doc, &title, &body, Zone::Human);
                     Ok(Outcome::Changed(None))
                 });
             }
@@ -572,20 +550,6 @@ mod tests {
     }
 
     #[test]
-    fn section_choices_list_first_then_named_then_agent() {
-        let doc = parse(SAMPLE);
-        let c = section_choices(&doc);
-        assert_eq!(
-            c,
-            vec![
-                SectionChoice::FirstHuman,
-                SectionChoice::Named("Later".into()),
-                SectionChoice::Agent,
-            ]
-        );
-    }
-
-    #[test]
     fn relocate_returns_none_on_ambiguous_key() {
         let doc = parse("# Feed\n\n- [ ] Ship it\n\n## Later\n\n- [ ] Ship it\n");
         let key = ItemKey {
@@ -596,6 +560,7 @@ mod tests {
     }
 
     use crate::config::{Side, SidebarConfig};
+    use crate::tui::modal::EditFocus;
     use crate::tui::socket::{AgentInfo, AgentStatus, FakeHerdr};
 
     fn test_cfg() -> SidebarConfig {
@@ -914,7 +879,7 @@ mod tests {
 
         app.apply(Action::OpenCreate);
         assert!(app.modal_active());
-        press(&mut app, KeyCode::Tab); // Section (only FirstHuman/Agent) → Title
+        // Round-2 item 5: no section picker — Title is focused immediately.
         type_str(&mut app, "First item");
         press_ctrl(&mut app, 's');
 
@@ -955,35 +920,38 @@ mod tests {
         }
     }
 
+    /// Scope change (round-2 feedback item 5): the create modal's section
+    /// picker is dead UI — sidebar-created items are always the human's and
+    /// always land at the end of the first human section (agents create
+    /// their own items via the CLI into `## Agent`, and can relocate items
+    /// later by editing the feed). Title is focused first on create (no
+    /// Section field to Tab through).
     #[test]
-    fn create_modal_adds_item_to_picked_section() {
+    fn create_modal_adds_to_first_human_section() {
         let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n\n## Later\n\n- [ ] L1\n");
         app.apply(Action::OpenCreate);
         assert!(app.modal_active());
-        // Section field focused first; cycle FirstHuman → Later:
-        press(&mut app, KeyCode::Right);
-        press(&mut app, KeyCode::Tab); // → Title
-        type_str(&mut app, "L2");
+        let Modal::Edit(m) = &app.modal else {
+            panic!("expected edit modal")
+        };
+        assert_eq!(m.focus, EditFocus::Title);
+        type_str(&mut app, "New item");
         press(&mut app, KeyCode::Enter); // → Body
         type_str(&mut app, "ctx");
         press_ctrl(&mut app, 's');
         assert!(!app.modal_active());
-        assert!(feed_text(&app).contains("- [ ] L1\n- [ ] L2\n  ctx\n"));
+        assert!(feed_text(&app).contains("- [ ] A\n- [ ] New item\n  ctx\n"));
+        // Never landed in the named "## Later" section.
+        assert!(!feed_text(&app).contains("- [ ] L1\n- [ ] New item"));
     }
 
     #[test]
-    fn create_modal_agent_section_and_empty_title_rejected() {
+    fn create_modal_empty_title_rejected() {
         let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n");
         app.apply(Action::OpenCreate);
         press_ctrl(&mut app, 's'); // empty title
         assert!(app.modal_active());
         assert_eq!(app.status_msg.as_deref(), Some("title required"));
-        // Choices are [FirstHuman, Agent] (no named sections): pick Agent.
-        press(&mut app, KeyCode::Right);
-        press(&mut app, KeyCode::Tab);
-        type_str(&mut app, "Agent chore");
-        press_ctrl(&mut app, 's');
-        assert!(feed_text(&app).contains("## Agent\n\n- [ ] Agent chore\n"));
     }
 
     #[test]

@@ -9,10 +9,11 @@
 //! The two outcomes that require a feed write (`Save`, `Delete`) are handed
 //! back to `App::handle_modal_event`, which alone holds `with_feed` access.
 
-use crate::feed::{Document, Item};
-use crate::tui::app::{section_choices, ItemKey, SectionChoice};
+use crate::feed::Item;
+use crate::tui::app::ItemKey;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::widgets::Block;
 use tui_textarea::{CursorMove, TextArea};
 
@@ -32,7 +33,6 @@ pub enum Modal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditFocus {
-    Section,
     Title,
     Body,
     Save,
@@ -49,22 +49,23 @@ const BUTTON_GAP: u16 = 2;
 pub struct EditModal {
     /// `Some(key)` = editing an existing item; `None` = creating.
     pub original: Option<ItemKey>,
-    pub choices: Vec<SectionChoice>,
-    pub choice_idx: usize,
     pub title: TextArea<'static>,
     pub body: TextArea<'static>,
     pub focus: EditFocus,
 }
 
 impl EditModal {
-    pub fn create(doc: &Document) -> Self {
+    /// Sidebar-created items are always the human's, and always land at the
+    /// end of the first human section (spec §3 review, round 2 item 5) —
+    /// agents create their own items via the CLI into `## Agent`, and can
+    /// relocate items later by editing the feed. So there is no section
+    /// picker to focus first; Title is focused immediately.
+    pub fn create() -> Self {
         let mut m = EditModal {
             original: None,
-            choices: section_choices(doc),
-            choice_idx: 0,
             title: TextArea::default(),
             body: TextArea::default(),
-            focus: EditFocus::Section,
+            focus: EditFocus::Title,
         };
         m.sync_blocks();
         m
@@ -73,8 +74,6 @@ impl EditModal {
     pub fn edit(key: ItemKey, item: &Item) -> Self {
         let mut m = EditModal {
             original: Some(key),
-            choices: Vec::new(), // moving sections is $EDITOR territory (spec §3)
-            choice_idx: 0,
             title: TextArea::new(vec![item.title.clone()]),
             body: TextArea::new(item.body.clone()),
             focus: EditFocus::Title,
@@ -88,32 +87,27 @@ impl EditModal {
         m
     }
 
-    pub fn choice_label(&self) -> String {
-        match &self.choices[self.choice_idx] {
-            SectionChoice::FirstHuman => "(first section)".into(),
-            SectionChoice::Named(s) => s.clone(),
-            SectionChoice::Agent => "Agent".into(),
-        }
-    }
-
-    /// Tab order: (Section →) Title → Body → Save → Cancel → (Delete →)
-    /// back to the start. Create mode has no item to delete; edit mode has
-    /// no section field to move to (moving sections is $EDITOR territory).
+    /// Tab order: Title → Body → Save → Cancel → (Delete →) back to the
+    /// start. Create mode has no item to delete.
     pub fn cycle_focus(&mut self) {
         let is_edit = self.original.is_some();
         self.focus = match (self.focus, is_edit) {
-            (EditFocus::Section, _) => EditFocus::Title,
             (EditFocus::Title, _) => EditFocus::Body,
             (EditFocus::Body, _) => EditFocus::Save,
             (EditFocus::Save, _) => EditFocus::Cancel,
             (EditFocus::Cancel, true) => EditFocus::Delete,
-            (EditFocus::Cancel, false) => EditFocus::Section,
+            (EditFocus::Cancel, false) => EditFocus::Title,
             (EditFocus::Delete, _) => EditFocus::Title,
         };
         self.sync_blocks();
     }
 
-    /// Mark the focused field's border title with `*` so focus is visible.
+    /// Mark the focused field's border title with `*` so focus is visible,
+    /// and neutralize both textareas' own cursor styling — tui-textarea
+    /// renders a reverse-video cell at its cursor position regardless of
+    /// focus, but the only cursor that should ever be visible is the real
+    /// terminal cursor the focused field gets from `frame.set_cursor_position`
+    /// (round-2 feedback item 1).
     pub fn sync_blocks(&mut self) {
         let t = if self.focus == EditFocus::Title {
             "Title*"
@@ -127,6 +121,8 @@ impl EditModal {
         };
         self.title.set_block(Block::bordered().title(t));
         self.body.set_block(Block::bordered().title(b));
+        self.title.set_cursor_style(Style::default());
+        self.body.set_cursor_style(Style::default());
     }
 
     pub fn title_text(&self) -> String {
@@ -153,7 +149,6 @@ impl EditModal {
 #[derive(Debug, Clone, Copy)]
 pub struct EditLayout {
     pub outer: Rect,
-    pub section: Rect,
     pub title: Rect,
     pub body: Rect,
     pub hints: Rect,
@@ -185,8 +180,7 @@ pub(crate) fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
 pub fn edit_layout(term_area: Rect, is_edit: bool) -> EditLayout {
     let outer = centered(term_area, 90, 80);
     let inner = Block::bordered().inner(outer);
-    let [section, title, body, buttons, hints] = Layout::vertical([
-        Constraint::Length(1),
+    let [title, body, buttons, hints] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(3),
         Constraint::Length(1),
@@ -203,7 +197,6 @@ pub fn edit_layout(term_area: Rect, is_edit: bool) -> EditLayout {
 
     EditLayout {
         outer,
-        section,
         title,
         body,
         hints,
@@ -215,7 +208,6 @@ pub fn edit_layout(term_area: Rect, is_edit: bool) -> EditLayout {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditClickTarget {
-    Section,
     Title,
     Body,
     Save,
@@ -231,9 +223,6 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 /// filesystem or `App` access, mirrors `input::translate`'s hit-testing for
 /// the main list.
 pub fn edit_click(layout: &EditLayout, is_edit: bool, x: u16, y: u16) -> Option<EditClickTarget> {
-    if !is_edit && rect_contains(layout.section, x, y) {
-        return Some(EditClickTarget::Section);
-    }
     if rect_contains(layout.title, x, y) {
         return Some(EditClickTarget::Title);
     }
@@ -364,11 +353,6 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
             let is_edit = m.original.is_some();
             let layout = edit_layout(area, is_edit);
             return match edit_click(&layout, is_edit, mev.column, mev.row) {
-                Some(EditClickTarget::Section) => {
-                    m.focus = EditFocus::Section;
-                    m.sync_blocks();
-                    ModalStep::Continue(Modal::Edit(m))
-                }
                 Some(EditClickTarget::Title) => {
                     m.focus = EditFocus::Title;
                     m.sync_blocks();
@@ -387,19 +371,6 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
         }
     }
     match m.focus {
-        EditFocus::Section => {
-            if let Event::Key(k) = &ev {
-                match k.code {
-                    KeyCode::Left => {
-                        m.choice_idx = (m.choice_idx + m.choices.len() - 1) % m.choices.len();
-                    }
-                    KeyCode::Right | KeyCode::Char(' ') => {
-                        m.choice_idx = (m.choice_idx + 1) % m.choices.len();
-                    }
-                    _ => {}
-                }
-            }
-        }
         EditFocus::Title => {
             m.title.input(ev);
         }
@@ -437,7 +408,7 @@ mod tests {
     }
 
     fn create_modal() -> EditModal {
-        EditModal::create(&Document::default())
+        EditModal::create()
     }
 
     fn edit_modal() -> EditModal {
@@ -501,17 +472,12 @@ mod tests {
         assert!(edit_layout(TEST_AREA, true).delete.is_some());
     }
 
+    /// Round-2 item 5: the section picker is gone, so create mode focuses
+    /// Title immediately (no Section field to click into or through).
     #[test]
-    fn clicking_section_title_or_body_moves_focus_there() {
+    fn clicking_title_or_body_moves_focus_there() {
         let layout = edit_layout(TEST_AREA, false);
         let m = create_modal();
-        assert_eq!(m.focus, EditFocus::Section);
-
-        let m = as_edit(step(
-            Modal::Edit(m),
-            click(layout.title.x, layout.title.y),
-            TEST_AREA,
-        ));
         assert_eq!(m.focus, EditFocus::Title);
 
         let m = as_edit(step(
@@ -523,25 +489,10 @@ mod tests {
 
         let m = as_edit(step(
             Modal::Edit(m),
-            click(layout.section.x, layout.section.y),
+            click(layout.title.x, layout.title.y),
             TEST_AREA,
         ));
-        assert_eq!(m.focus, EditFocus::Section);
-    }
-
-    /// Edit mode has no section field (moving sections is $EDITOR
-    /// territory) — a click on the reserved-but-blank row must be a no-op.
-    #[test]
-    fn clicking_reserved_section_row_is_noop_in_edit_mode() {
-        let layout = edit_layout(TEST_AREA, true);
-        let m = edit_modal();
-        let before = m.focus;
-        let m = as_edit(step(
-            Modal::Edit(m),
-            click(layout.section.x, layout.section.y),
-            TEST_AREA,
-        ));
-        assert_eq!(m.focus, before);
+        assert_eq!(m.focus, EditFocus::Title);
     }
 
     #[test]
@@ -582,9 +533,9 @@ mod tests {
 
     #[test]
     fn tab_reaches_save_cancel_and_delete_and_enter_activates_them() {
-        // Create mode: Section -> Title -> Body -> Save -> Cancel -> Section.
+        // Create mode: Title -> Body -> Save -> Cancel -> Title.
         let mut m = create_modal();
-        for _ in 0..3 {
+        for _ in 0..2 {
             m.cycle_focus();
         }
         assert_eq!(m.focus, EditFocus::Save);
@@ -594,7 +545,7 @@ mod tests {
         ));
 
         let mut m = create_modal();
-        for _ in 0..4 {
+        for _ in 0..3 {
             m.cycle_focus();
         }
         assert_eq!(m.focus, EditFocus::Cancel);
@@ -613,5 +564,25 @@ mod tests {
             step(Modal::Edit(m), enter(), TEST_AREA),
             ModalStep::Continue(Modal::ConfirmDelete(_))
         ));
+    }
+
+    /// Round-2 item 1: tui-textarea renders its own reverse-video cursor
+    /// cell regardless of focus; the only cursor that should ever be
+    /// visible is the real terminal cursor `view::draw_edit_modal` places
+    /// via `frame.set_cursor_position` on the focused field. Both
+    /// textareas' internal cursor style must be neutralized at all times —
+    /// on construction and after every focus change.
+    #[test]
+    fn textareas_never_render_their_own_cursor_style() {
+        let m = create_modal();
+        assert_eq!(m.title.cursor_style(), Style::default());
+        assert_eq!(m.body.cursor_style(), Style::default());
+
+        let mut m = edit_modal();
+        assert_eq!(m.title.cursor_style(), Style::default());
+        assert_eq!(m.body.cursor_style(), Style::default());
+        m.cycle_focus(); // Title -> Body
+        assert_eq!(m.title.cursor_style(), Style::default());
+        assert_eq!(m.body.cursor_style(), Style::default());
     }
 }

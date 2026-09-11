@@ -1,4 +1,3 @@
-use crate::feed::State;
 use crate::tui::app::{App, Row};
 use crate::tui::modal::{self, EditFocus, Modal};
 use crate::tui::socket::AgentStatus;
@@ -12,15 +11,6 @@ use ratatui::Frame;
 /// Toolbar text; the click spans in input.rs must match these columns:
 /// « at 0, "sweep" at 2..=6, "file" at 8..=11.
 pub const TOOLBAR: &str = "« sweep file";
-
-pub fn state_glyph(s: State) -> char {
-    match s {
-        State::Open => '·',
-        State::InProgress => '~',
-        State::Review => '?',
-        State::Done => 'x',
-    }
-}
 
 /// Display-only live status (spec §3: never written to the file).
 /// Unknown renders nothing — it must not look like done.
@@ -153,18 +143,6 @@ fn draw_edit_modal(f: &mut Frame, m: &modal::EditModal) {
         .title(if is_edit { "Edit item" } else { "New item" });
     f.render_widget(outer, layout.outer);
 
-    if !is_edit {
-        let marker = if m.focus == EditFocus::Section {
-            "*"
-        } else {
-            ""
-        };
-        f.render_widget(
-            Paragraph::new(format!("Add to{marker}: ‹ {} ›", m.choice_label()))
-                .style(theme::normal_text()),
-            layout.section,
-        );
-    }
     f.render_widget(&m.title, layout.title);
     f.render_widget(&m.body, layout.body);
 
@@ -238,12 +216,18 @@ fn row_line(app: &App, row: &Row, w: usize) -> Line<'static> {
     match row {
         Row::Section(t) => Line::styled(ellipsize(t, w), theme::section_header()),
         Row::Item { key, .. } => {
-            let title = ellipsize(&key.title, w.saturating_sub(2));
+            // "[<state-char>] " is a 4-cell prefix; only the char inside the
+            // brackets carries state color, the brackets themselves are
+            // normal text (round-2 item 2 — checkbox brackets, reusing
+            // `State::to_char` rather than a separate glyph mapping).
+            let title = ellipsize(&key.title, w.saturating_sub(4));
             Line::from(vec![
+                Span::styled("[", theme::normal_text()),
                 Span::styled(
-                    format!("{} ", state_glyph(key.state)),
+                    key.state.to_char().to_string(),
                     theme::item_glyph(key.state),
                 ),
+                Span::styled("] ", theme::normal_text()),
                 Span::styled(title, theme::normal_text()),
             ])
         }
@@ -258,7 +242,9 @@ fn row_line(app: &App, row: &Row, w: usize) -> Line<'static> {
             }
             Line::from(spans)
         }
-        Row::Add => Line::styled("+ add", theme::normal_text()),
+        // Round-2 item 3: de-emphasized like the toolbar/Done/status rows —
+        // it's chrome, not a task.
+        Row::Add => Line::styled("+ add", theme::muted_row()),
     }
 }
 
@@ -267,7 +253,8 @@ mod tests {
     use super::*;
     use crate::config::{Side, SidebarConfig};
     use crate::feed::parse::parse;
-    use crate::tui::app::{Action, App, ItemKey};
+    use crate::feed::State;
+    use crate::tui::app::{Action, App, ItemKey, Row};
     use crate::tui::socket::{AgentInfo, AgentStatus, FakeHerdr};
     use crate::tui::test_util::{render_cursor, render_to_strings};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -323,15 +310,37 @@ mod tests {
         app.status_msg = Some("hello".into());
         let rows = render_to_strings(&app, 20, 12);
         assert_eq!(rows[0], "« sweep file");
-        assert_eq!(rows[1], "· Fix auth redirect…"); // ellipsized at 20 cols
-        assert_eq!(rows[2], "~ Migrate CI");
+        assert_eq!(rows[1], "[ ] Fix auth redire…"); // ellipsized at 20 cols
+        assert_eq!(rows[2], "[~] Migrate CI");
         assert_eq!(rows[3], "  @claude >"); // live working glyph
         assert_eq!(rows[4], "Agent");
-        assert_eq!(rows[5], "? Add retry to depl…");
+        assert_eq!(rows[5], "[?] Add retry to de…");
         assert_eq!(rows[6], "  @claude >");
         assert_eq!(rows[7], "+ add");
         assert_eq!(rows[10], "Done (1)"); // bottom-pinned, h-2
         assert_eq!(rows[11], "hello"); // status line, h-1
+    }
+
+    /// Round-2 item 2: the brackets are always normal text; only the
+    /// state-char between them carries the state's color-coding from
+    /// `theme::item_glyph`.
+    #[test]
+    fn checkbox_char_is_colored_but_brackets_are_normal_text() {
+        let app = app_with(SAMPLE);
+        let row = Row::Item {
+            key: ItemKey {
+                title: "X".into(),
+                state: State::InProgress,
+            },
+            agent: None,
+        };
+        let line = row_line(&app, &row, 40);
+        assert_eq!(line.spans[0].content, "[");
+        assert_eq!(line.spans[0].style, theme::normal_text());
+        assert_eq!(line.spans[1].content, "~");
+        assert_eq!(line.spans[1].style, theme::item_glyph(State::InProgress));
+        assert_eq!(line.spans[2].content, "] ");
+        assert_eq!(line.spans[2].style, theme::normal_text());
     }
 
     #[test]
@@ -405,11 +414,7 @@ mod tests {
     fn cursor_visible_at_title_when_create_modal_focuses_title() {
         let mut app = app_with(SAMPLE);
         app.apply(Action::OpenCreate);
-        // Section is focused first on create; Tab moves to Title.
-        app.handle_modal_event(
-            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-            (40, 12),
-        );
+        // Round-2 item 5: no section picker — Title is focused immediately.
         let pos =
             render_cursor(&app, 40, 12).expect("cursor must be visible when Title is focused");
         let layout = modal::edit_layout(Rect::new(0, 0, 40, 12), false);
@@ -424,13 +429,39 @@ mod tests {
         );
     }
 
+    /// Round-2 item 5: the "Add to: <section>" picker row is gone entirely —
+    /// sidebar-created items always land in the first human section.
+    /// Round-2 item 1: `frame.set_cursor_position` must fire only when
+    /// focus is on a textarea (Title/Body) — never on a button.
     #[test]
-    fn create_modal_shows_add_to_label_and_save_cancel_but_no_delete() {
+    fn cursor_hidden_when_focus_on_save_button() {
+        let mut app = app_with(SAMPLE);
+        app.apply(Action::OpenCreate);
+        // Title -> Body -> Save.
+        for _ in 0..2 {
+            app.handle_modal_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                (40, 12),
+            );
+        }
+        let Modal::Edit(m) = &app.modal else {
+            panic!("expected edit modal")
+        };
+        assert_eq!(m.focus, EditFocus::Save);
+        assert_eq!(
+            render_cursor(&app, 40, 12),
+            None,
+            "no real terminal cursor when a button is focused"
+        );
+    }
+
+    #[test]
+    fn create_modal_shows_save_cancel_but_no_delete_or_section_picker() {
         let mut app = app_with(SAMPLE);
         app.apply(Action::OpenCreate);
         let rows = render_to_strings(&app, 60, 20);
         let joined = rows.join("\n");
-        assert!(joined.contains("Add to"), "got:\n{joined}");
+        assert!(!joined.contains("Add to"), "got:\n{joined}");
         assert!(joined.contains(modal::SAVE_LABEL), "got:\n{joined}");
         assert!(joined.contains(modal::CANCEL_LABEL), "got:\n{joined}");
         assert!(!joined.contains(modal::DELETE_LABEL), "got:\n{joined}");

@@ -46,12 +46,18 @@ fn click(app: &App, x: u16, y: u16, h: u16) -> Option<Action> {
         let idx = app.scroll + (y as usize - 1);
         return match app.rows.get(idx)? {
             Row::Section(_) => None,
-            Row::Item { key, .. } => Some(if x <= 1 {
-                // Checkbox click: state-advance (spec §3).
-                Action::Advance(key.clone())
-            } else {
-                Action::OpenEdit(key.clone())
-            }),
+            // Row is "[<char>] title" (round-2 item 2): checkbox zone is
+            // x 0..=2 (the bracket pair + state char), title starts at x 4;
+            // x==3 (the space after "]") is a dead zone between them.
+            Row::Item { key, .. } => {
+                if x <= 2 {
+                    Some(Action::Advance(key.clone()))
+                } else if x >= 4 {
+                    Some(Action::OpenEdit(key.clone()))
+                } else {
+                    None
+                }
+            }
             Row::AgentLine { key, .. } => Some(Action::AgentClick(key.clone())),
             Row::Add => Some(Action::OpenCreate),
         };
@@ -147,6 +153,8 @@ mod tests {
         assert_eq!(translate(&click(15, 0), &app, SIZE), None); // dead zone
     }
 
+    /// Round-2 item 2: row is "[<char>] title" — checkbox zone x 0..=2,
+    /// title starts at x 4, x==3 is a dead zone.
     #[test]
     fn checkbox_click_vs_title_click() {
         let app = app_with(SAMPLE);
@@ -154,16 +162,20 @@ mod tests {
             title: "Alpha".into(),
             state: State::Open,
         };
+        for x in 0..=2 {
+            assert_eq!(
+                translate(&click(x, 1), &app, SIZE),
+                Some(Action::Advance(alpha.clone())),
+                "x={x}"
+            );
+        }
+        assert_eq!(translate(&click(3, 1), &app, SIZE), None); // dead zone
         assert_eq!(
-            translate(&click(0, 1), &app, SIZE),
-            Some(Action::Advance(alpha.clone()))
+            translate(&click(4, 1), &app, SIZE),
+            Some(Action::OpenEdit(alpha.clone()))
         );
         assert_eq!(
-            translate(&click(1, 1), &app, SIZE),
-            Some(Action::Advance(alpha.clone()))
-        );
-        assert_eq!(
-            translate(&click(5, 1), &app, SIZE),
+            translate(&click(7, 1), &app, SIZE),
             Some(Action::OpenEdit(alpha))
         );
     }

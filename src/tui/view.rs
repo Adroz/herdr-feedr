@@ -140,7 +140,27 @@ fn draw_modal(f: &mut Frame, app: &App) {
                 inner,
             );
         }
+        Modal::DoneView { scroll } => {
+            draw_viewer(f, "Done archive — Esc closes", &app.archive_text(), *scroll)
+        }
+        Modal::FileView { scroll } => draw_viewer(
+            f,
+            "feed file — e edits in $EDITOR, Esc closes",
+            &app.file_text(),
+            *scroll,
+        ),
     }
+}
+
+fn draw_viewer(f: &mut Frame, title: &str, text: &str, scroll: u16) {
+    let area = centered(f.area(), 90, 80);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(text.to_string())
+            .block(Block::bordered().title(title.to_string()))
+            .scroll((scroll, 0)),
+        area,
+    );
 }
 
 fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {

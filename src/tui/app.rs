@@ -162,6 +162,10 @@ pub struct App {
     pub should_quit: bool,
     pub herdr: Box<dyn Herdr>,
     pub modal: Modal,
+    /// $EDITOR captured at startup; injectable in tests (avoids process-global
+    /// env mutation racing parallel tests).
+    pub editor_cmd: Option<String>,
+    editor_request: Option<PathBuf>,
 }
 
 impl App {
@@ -179,6 +183,8 @@ impl App {
             should_quit: false,
             herdr,
             modal: Modal::None,
+            editor_cmd: std::env::var("EDITOR").ok().filter(|e| !e.is_empty()),
+            editor_request: None,
         }
     }
 
@@ -273,9 +279,50 @@ impl App {
                 }
             }
             Action::OpenCreate => self.modal = Modal::Edit(EditModal::create(&self.doc)),
-            // Wired in Task 10:
-            Action::OpenDoneView | Action::OpenFileView | Action::OpenEditor => {}
+            Action::OpenDoneView => self.modal = Modal::DoneView { scroll: 0 },
+            Action::OpenFileView => self.modal = Modal::FileView { scroll: 0 },
+            Action::OpenEditor => self.request_editor(),
         }
+    }
+
+    fn request_editor(&mut self) {
+        if self.editor_cmd.is_some() {
+            self.editor_request = Some(self.feed_path.clone());
+        } else {
+            self.status_msg = Some("set $EDITOR to edit the feed externally".into());
+        }
+    }
+
+    /// One-shot: the event loop takes this, suspends the TUI, and runs $EDITOR.
+    pub fn take_editor_request(&mut self) -> Option<PathBuf> {
+        self.editor_request.take()
+    }
+
+    /// The `# Done` region as rendered markdown (read-only view), cut at the
+    /// next level-1 heading so trailing `# Notes`-style sections stay out.
+    pub fn archive_text(&self) -> String {
+        let Some(start) = self.doc.nodes.iter().position(
+            |n| matches!(n, Node::Heading { level: 1, text } if text.eq_ignore_ascii_case("Done")),
+        ) else {
+            return "No archived items yet.".into();
+        };
+        let end = self
+            .doc
+            .nodes
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .find(|(_, n)| matches!(n, Node::Heading { level: 1, .. }))
+            .map(|(j, _)| j)
+            .unwrap_or(self.doc.nodes.len());
+        crate::feed::write::render(&Document {
+            nodes: self.doc.nodes[start..end].to_vec(),
+        })
+    }
+
+    /// The feed file verbatim (read-only view).
+    pub fn file_text(&self) -> String {
+        std::fs::read_to_string(&self.feed_path).unwrap_or_default()
     }
 
     pub fn modal_active(&self) -> bool {
@@ -294,6 +341,10 @@ impl App {
             ModalStep::Save(m) => self.save_modal(m),
             ModalStep::Delete(key) => {
                 self.delete_item(key);
+                Modal::None
+            }
+            ModalStep::OpenEditor => {
+                self.request_editor();
                 Modal::None
             }
         };
@@ -885,5 +936,57 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(!app.modal_active());
         assert_eq!(feed_text(&app), "- [ ] A\n");
+    }
+
+    #[test]
+    fn done_view_shows_archive_only() {
+        let (mut app, _fake, _dir) = app_on_disk(
+            "# Feed\n\n- [ ] Active\n\n# Done\n\n## Feed\n\n- [x] Old @done(2026-09-01)\n\n# Notes\n\nprose\n",
+        );
+        app.apply(Action::OpenDoneView);
+        assert!(matches!(app.modal, Modal::DoneView { .. }));
+        let text = app.archive_text();
+        assert!(text.contains("- [x] Old @done(2026-09-01)"));
+        assert!(!text.contains("Active"));
+        assert!(!text.contains("prose")); // stops at the next level-1 heading
+    }
+
+    #[test]
+    fn done_view_without_archive_says_so() {
+        let (app, _fake, _dir) = app_on_disk("- [ ] A\n");
+        assert_eq!(app.archive_text(), "No archived items yet.");
+    }
+
+    #[test]
+    fn file_view_shows_raw_feed_and_e_requests_editor() {
+        let (mut app, _fake, _dir) = app_on_disk("- [ ] A\n");
+        app.editor_cmd = Some("true".into()); // injected — no env mutation in tests
+        app.apply(Action::OpenFileView);
+        assert!(matches!(app.modal, Modal::FileView { .. }));
+        assert_eq!(app.file_text(), "- [ ] A\n");
+        press(&mut app, KeyCode::Char('e'));
+        assert!(!app.modal_active());
+        let expected = app.feed_path.clone();
+        assert_eq!(app.take_editor_request(), Some(expected));
+        assert_eq!(app.take_editor_request(), None); // one-shot
+    }
+
+    #[test]
+    fn viewer_esc_closes_and_scrolls() {
+        let (mut app, _fake, _dir) = app_on_disk("- [ ] A\n");
+        app.apply(Action::OpenDoneView);
+        press(&mut app, KeyCode::Down);
+        assert!(matches!(app.modal, Modal::DoneView { scroll: 1 }));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.modal_active());
+    }
+
+    #[test]
+    fn open_editor_without_editor_configured_reports() {
+        let (mut app, _fake, _dir) = app_on_disk("- [ ] A\n");
+        app.editor_cmd = None; // as if $EDITOR were unset — no env mutation
+        app.apply(Action::OpenEditor);
+        assert_eq!(app.take_editor_request(), None);
+        assert!(app.status_msg.as_deref().unwrap().contains("$EDITOR"));
     }
 }

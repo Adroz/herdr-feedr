@@ -85,6 +85,22 @@ impl socket::Herdr for NoHerdr {
     }
 }
 
+/// Run $EDITOR (may carry args, e.g. "code -w") on the feed file.
+pub fn spawn_editor(editor: &str, path: &Path) -> Result<()> {
+    let mut parts = editor.split_whitespace();
+    let bin = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("$EDITOR is empty"))?;
+    let status = std::process::Command::new(bin)
+        .args(parts)
+        .arg(path)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("editor exited with {status}");
+    }
+    Ok(())
+}
+
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
@@ -97,6 +113,17 @@ fn event_loop(
         }
         while let Ok(ev) = rx.try_recv() {
             app.on_event(ev);
+        }
+        if let Some(path) = app.take_editor_request() {
+            let editor = app.editor_cmd.clone().unwrap_or_default();
+            ratatui::restore();
+            let result = spawn_editor(&editor, &path);
+            *terminal = ratatui::init();
+            let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+            if let Err(e) = result {
+                app.status_msg = Some(format!("editor: {e}"));
+            }
+            app.reload(); // editor's save wins (spec §6, accepted for v1)
         }
         if event::poll(Duration::from_millis(100))? {
             let ev = event::read()?;
@@ -140,5 +167,22 @@ mod tests {
         std::fs::write(&path, [0xFF, 0xFE, 0x00, 0x41]).unwrap();
         let err = check_feed_readable(&path).unwrap_err();
         assert!(err.to_string().contains("cannot read"), "got: {err}");
+    }
+
+    #[test]
+    fn spawn_editor_runs_the_command_with_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("feed.md");
+        std::fs::write(&target, "- [ ] A\n").unwrap();
+        let script = dir.path().join("fake-editor.sh");
+        std::fs::write(&script, "#!/bin/sh\necho \"- [ ] From editor\" >> \"$1\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // $EDITOR values may carry args ("code -w"); split on whitespace.
+        super::spawn_editor(&format!("{} ", script.display()), &target).unwrap();
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("From editor"));
+        assert!(super::spawn_editor("/nonexistent-editor-binary", &target).is_err());
     }
 }

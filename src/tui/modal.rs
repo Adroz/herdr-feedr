@@ -19,6 +19,14 @@ pub enum Modal {
     None,
     Edit(EditModal),
     ConfirmDelete(EditModal),
+    /// Read-only view of the `# Done` archive (spec §3).
+    DoneView {
+        scroll: u16,
+    },
+    /// Read-only view of the whole feed file; `e` requests `$EDITOR`.
+    FileView {
+        scroll: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +134,10 @@ pub enum ModalStep {
     Continue(Modal),
     Save(EditModal),
     Delete(ItemKey),
+    /// The `FileView`'s `e` key: only `App` can turn this into an editor
+    /// request (it needs `editor_cmd`/`status_msg`), so hand it back like
+    /// `Save`/`Delete`.
+    OpenEditor,
 }
 
 /// Pure modal transition: `(modal, event) -> ModalStep`. Never touches the
@@ -152,6 +164,31 @@ pub fn step(modal: Modal, ev: Event) -> ModalStep {
                 ModalStep::Continue(Modal::Edit(m))
             }
             _ => ModalStep::Continue(Modal::ConfirmDelete(m)),
+        },
+        Modal::DoneView { scroll } => match ev {
+            Event::Key(k) if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) => {
+                ModalStep::Continue(Modal::None)
+            }
+            Event::Key(k) if k.code == KeyCode::Down => {
+                ModalStep::Continue(Modal::DoneView { scroll: scroll + 1 })
+            }
+            Event::Key(k) if k.code == KeyCode::Up => ModalStep::Continue(Modal::DoneView {
+                scroll: scroll.saturating_sub(1),
+            }),
+            _ => ModalStep::Continue(Modal::DoneView { scroll }),
+        },
+        Modal::FileView { scroll } => match ev {
+            Event::Key(k) if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) => {
+                ModalStep::Continue(Modal::None)
+            }
+            Event::Key(k) if k.code == KeyCode::Char('e') => ModalStep::OpenEditor,
+            Event::Key(k) if k.code == KeyCode::Down => {
+                ModalStep::Continue(Modal::FileView { scroll: scroll + 1 })
+            }
+            Event::Key(k) if k.code == KeyCode::Up => ModalStep::Continue(Modal::FileView {
+                scroll: scroll.saturating_sub(1),
+            }),
+            _ => ModalStep::Continue(Modal::FileView { scroll }),
         },
     }
 }

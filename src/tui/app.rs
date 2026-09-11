@@ -23,17 +23,31 @@ impl ItemKey {
     }
 }
 
+/// Relocate a keyed item in the active zones of the document.
+/// Returns the index of the item if found and unambiguous (exactly one match).
+/// A miss OR an ambiguous match (two active items sharing title+state) drops
+/// the action — never guess which item the user meant.
 pub fn relocate(doc: &Document, key: &ItemKey) -> Option<usize> {
-    doc.nodes.iter().enumerate().find_map(|(i, n)| match n {
-        Node::Item(it)
-            if ops::zone_of(doc, i) != Zone::Archive
-                && it.title == key.title
-                && it.state == key.state =>
-        {
-            Some(i)
-        }
+    let matches: Vec<usize> = doc
+        .nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| match n {
+            Node::Item(it)
+                if ops::zone_of(doc, i) != Zone::Archive
+                    && it.title == key.title
+                    && it.state == key.state =>
+            {
+                Some(i)
+            }
+            _ => None,
+        })
+        .collect();
+
+    match matches.len() {
+        1 => Some(matches[0]),
         _ => None,
-    })
+    }
 }
 
 /// One display row of the sidebar list.
@@ -254,5 +268,15 @@ mod tests {
                 SectionChoice::Agent,
             ]
         );
+    }
+
+    #[test]
+    fn relocate_returns_none_on_ambiguous_key() {
+        let doc = parse("# Feed\n\n- [ ] Ship it\n\n## Later\n\n- [ ] Ship it\n");
+        let key = ItemKey {
+            title: "Ship it".into(),
+            state: State::Open,
+        };
+        assert_eq!(relocate(&doc, &key), None);
     }
 }

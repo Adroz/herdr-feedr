@@ -68,7 +68,12 @@ enum Token {
 }
 
 fn split_trailing_token(s: &str) -> Option<(&str, Token)> {
-    let open = s.rfind("@agent(").or(s.rfind("@done("))?;
+    let a = s.rfind("@agent(");
+    let d = s.rfind("@done(");
+    let open = match (a, d) {
+        (Some(x), Some(y)) => x.max(y),
+        (x, y) => x.or(y)?,
+    };
     let tail = &s[open..];
     let close = tail.find(')')?;
     if open + close + 1 != s.len() {
@@ -164,5 +169,18 @@ mod tests {
         let doc = parse("\n- [ ] A\n\n");
         assert!(matches!(doc.nodes[0], Node::Raw(_)));
         assert!(matches!(doc.nodes[2], Node::Raw(_)));
+    }
+
+    #[test]
+    fn strips_both_tokens_regardless_of_order() {
+        let doc = parse("- [x] Foo @agent(claude:123) @done(2026-09-01)\n");
+        match &doc.nodes[0] {
+            Node::Item(it) => {
+                assert_eq!(it.title, "Foo");
+                assert_eq!(it.agent.as_ref().unwrap().to_string(), "claude:123");
+                assert_eq!(it.done_date.as_deref(), Some("2026-09-01"));
+            }
+            n => panic!("expected item, got {n:?}"),
+        }
     }
 }

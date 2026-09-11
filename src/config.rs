@@ -23,10 +23,13 @@ pub fn resolve_feed_path(
     if let Some(p) = env_file {
         return p;
     }
-    let cfg: FileConfig = std::fs::read_to_string(config_dir.join("config.toml"))
-        .ok()
-        .and_then(|s| toml::from_str(&s).ok())
-        .unwrap_or_default();
+    let cfg: FileConfig = match std::fs::read_to_string(config_dir.join("config.toml")) {
+        Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
+            eprintln!("feedr: warning: ignoring malformed config.toml: {e}");
+            FileConfig::default()
+        }),
+        Err(_) => FileConfig::default(),
+    };
     cfg.feed_path
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| config_dir.join("feed.md"))

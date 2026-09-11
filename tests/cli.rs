@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
 fn feedr(feed: &std::path::Path) -> Command {
@@ -113,4 +114,63 @@ fn claim_requires_agent_ref() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());
     feedr(&feed).args(["claim", "auth"]).assert().failure();
+}
+
+#[test]
+fn unreadable_feed_errors_instead_of_clobbering() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("feed.md");
+    std::fs::write(&path, [0xFF, 0xFE, 0x00, 0x41]).unwrap(); // invalid UTF-8
+    feedr(&path)
+        .args(["add", "New item"])
+        .assert()
+        .failure()
+        .stderr(contains("cannot read"));
+    // Original bytes untouched:
+    assert_eq!(std::fs::read(&path).unwrap(), vec![0xFF, 0xFE, 0x00, 0x41]);
+}
+
+#[test]
+fn feedr_feed_env_selects_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    let mut cmd = Command::cargo_bin("feedr").unwrap();
+    cmd.env_remove("FEEDR_FEED");
+    cmd.env("FEEDR_FEED", &feed);
+    cmd.arg("list")
+        .assert()
+        .success()
+        .stdout(contains("Fix auth redirect loop"));
+}
+
+#[test]
+fn list_shows_sections_and_hides_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("feed.md");
+    std::fs::write(
+        &path,
+        "\
+# Feed
+
+- [ ] Top task
+
+## Later
+
+- [ ] Later task
+
+# Done
+
+## Feed
+
+- [x] Archived task @done(2026-09-01)
+",
+    )
+    .unwrap();
+    feedr(&path)
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(contains("Later:"))
+        .stdout(contains("[ ] Later task"))
+        .stdout(predicates::str::contains("Archived task").not());
 }

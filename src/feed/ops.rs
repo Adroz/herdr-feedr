@@ -76,6 +76,8 @@ pub fn find(doc: &Document, query: &str) -> Result<usize, OpError> {
     }
 }
 
+/// Claiming is last-writer-wins by design (spec: "one @agent token per item,
+/// latest claim wins") — re-claiming an item reopens it and replaces the tag.
 pub fn claim(doc: &mut Document, index: usize, agent: AgentRef) {
     debug_assert!(matches!(doc.nodes[index], Node::Item(_)));
     if let Node::Item(it) = &mut doc.nodes[index] {

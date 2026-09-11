@@ -63,7 +63,11 @@ pub fn run() -> Result<()> {
         std::env::var_os("FEEDR_FEED").map(PathBuf::from),
         &config::default_config_dir(),
     );
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => bail!("cannot read {}: {e}", path.display()),
+    };
     let mut doc = parse(&text);
 
     match cli.command {

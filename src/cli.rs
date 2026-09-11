@@ -54,6 +54,8 @@ enum Cmd {
     },
     /// Archive human [x] items under "# Done"; delete agent [x] items
     Sweep,
+    /// Launch the sidebar TUI in this terminal
+    Sidebar,
 }
 
 pub fn run() -> Result<()> {
@@ -65,6 +67,10 @@ pub fn run() -> Result<()> {
             .map(PathBuf::from),
         &config::default_config_dir(),
     );
+    if matches!(&cli.command, Cmd::Sidebar) {
+        let cfg = config::load_sidebar_config(&config::default_config_dir());
+        return crate::tui::run(path, cfg);
+    }
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -143,6 +149,9 @@ pub fn run() -> Result<()> {
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
             ops::sweep(&mut doc, &today);
             write::save_atomic(&doc, &path)?;
+        }
+        Cmd::Sidebar => {
+            unreachable!()
         }
     }
     Ok(())

@@ -174,3 +174,12 @@ fn list_shows_sections_and_hides_archive() {
         .stdout(contains("[ ] Later task"))
         .stdout(predicates::str::contains("Archived task").not());
 }
+
+#[test]
+fn sidebar_subcommand_is_wired() {
+    let mut cmd = Command::cargo_bin("feedr").unwrap();
+    cmd.args(["sidebar", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("sidebar"));
+}

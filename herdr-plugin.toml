@@ -1,0 +1,49 @@
+# herdr-plugin.toml — manifest for the herdr-feedr plugin.
+#
+# The feed rack for your herd: a markdown-backed to-do sidebar, shared between you and
+# your coding agents, docked in a herdr split pane. Conventions here follow the installed
+# herdr-file-viewer plugin (~/.config/herdr/plugins/github/herdr-file-viewer-*/); the
+# differences are v1 scope choices, noted inline below.
+#
+# v1 is linux/macos only (no Windows [[build]]/[[actions]] entries — see README).
+# v1 also has no prebuilt-binary fetch path (scripts/build.sh always builds from source
+# with cargo; see its header for a TODO referencing file-viewer's fetch-or-build.sh).
+
+id = "herdr-feedr"
+name = "herdr-feedr"
+version = "0.1.0"
+description = "The feed rack for your herd: a markdown-backed to-do sidebar for Herdr, shared between you and your coding agents."
+min_herdr_version = "0.9.0"
+platforms = ["linux", "macos"]
+
+# Build step herdr runs at `plugin link`/`plugin install` time (and again on
+# reinstall-to-update): compiles the `feedr` binary the pane and launcher scripts run.
+[[build]]
+platforms = ["linux", "macos"]
+command = ["/bin/sh", "scripts/build.sh"]
+
+# The sidebar pane. herdr performs the split placement on launch; the [[actions]] below
+# summon it (open/focus/close) and do the left-edge dock (swap-walk + resize) that herdr's
+# plugin pane system has no native support for — see scripts/open-feedr.sh.
+[[panes]]
+id = "feedr-sidebar"
+title = "feedr"
+placement = "split"
+command = ["./target/release/feedr", "sidebar"]
+
+# Open (or focus, if already open) the sidebar, docked to the left edge. Bind this to a
+# keybinding in ~/.config/herdr/config.toml (see README's "Install as a herdr plugin").
+[[actions]]
+id = "open-feedr"
+platforms = ["linux", "macos"]
+title = "Open feedr"
+description = "Open or focus the feedr sidebar, docked to the left edge of the current tab."
+command = ["bash", "scripts/open-feedr.sh"]
+
+# Close the sidebar if it's open; otherwise open it (same dock behavior as open-feedr).
+[[actions]]
+id = "toggle-feedr"
+platforms = ["linux", "macos"]
+title = "Toggle feedr"
+description = "Close the feedr sidebar if it's open, otherwise open it."
+command = ["bash", "scripts/toggle-feedr.sh"]

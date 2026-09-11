@@ -2,11 +2,15 @@ use super::*;
 
 /// Lossless for lines the parser does not own (they become [`Node::Raw`] and
 /// re-emit verbatim). Recognized lines (headings, items, bodies) are
-/// normalized: trailing whitespace is trimmed and token spacing is
-/// canonicalized, so render∘parse is byte-exact only for canonical input.
+/// normalized: trailing whitespace is trimmed and token spacing and order are
+/// canonicalized (agent before done), so render∘parse is byte-exact only for
+/// canonical input.
 pub fn parse(text: &str) -> Document {
+    let lines: Vec<&str> = text.lines().collect();
     let mut nodes: Vec<Node> = Vec::new();
-    for line in text.lines() {
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let line = lines[idx];
         if let Some(rest) = line.strip_prefix("## ") {
             nodes.push(Node::Heading {
                 level: 2,
@@ -24,12 +28,31 @@ pub fn parse(text: &str) -> Document {
             // (an item's body is contiguous).
             if let Some(Node::Item(item)) = nodes.last_mut() {
                 item.body.push(line[2..].to_string());
-                continue;
+            } else {
+                nodes.push(Node::Raw(line.to_string()));
             }
-            nodes.push(Node::Raw(line.to_string()));
+        } else if line.trim().is_empty() {
+            // A blank line is a BODY line (stored as "") only when it sits
+            // between an item's body content and a following indented body
+            // line — e.g. a blank line inside a fenced code block or between
+            // paragraphs. Otherwise it's a Raw line (blank lines that end a
+            // body, or that sit between unrelated nodes, stay Raw).
+            let preceding_is_body_context = matches!(nodes.last(), Some(Node::Item(_)));
+            let next_is_body_line = lines[idx + 1..]
+                .iter()
+                .find(|l| !l.trim().is_empty())
+                .is_some_and(|l| l.starts_with("  ") && !l.trim().is_empty());
+            if preceding_is_body_context && next_is_body_line {
+                if let Some(Node::Item(item)) = nodes.last_mut() {
+                    item.body.push(String::new());
+                }
+            } else {
+                nodes.push(Node::Raw(line.to_string()));
+            }
         } else {
             nodes.push(Node::Raw(line.to_string()));
         }
+        idx += 1;
     }
     Document { nodes }
 }
@@ -193,6 +216,24 @@ mod tests {
             }
             n => panic!("expected item, got {n:?}"),
         }
+    }
+
+    #[test]
+    fn blank_lines_inside_body_stay_in_body() {
+        let text = "- [ ] Task\n  para one\n\n  para two\n";
+        let doc = parse(text);
+        match &doc.nodes[0] {
+            Node::Item(it) => assert_eq!(it.body, vec!["para one", "", "para two"]),
+            n => panic!("expected item, got {n:?}"),
+        }
+        assert_eq!(doc.nodes.len(), 1);
+    }
+
+    #[test]
+    fn trailing_blank_after_body_is_raw() {
+        let doc = parse("- [ ] Task\n  body\n\n- [ ] Next\n");
+        assert_eq!(doc.nodes.len(), 3); // item, Raw(""), item
+        assert!(matches!(&doc.nodes[1], Node::Raw(s) if s.is_empty()));
     }
 
     #[test]

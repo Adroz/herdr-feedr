@@ -80,7 +80,7 @@ Interactions:
 
 The same binary as the TUI. Subcommands are the machine interface to the feed:
 
-`feedr list` · `feedr show <item>` · `feedr claim <item>` · `feedr add [--mine|--agent] <title>` · `feedr review <item>` · `feedr done <item>` · `feedr sweep`
+`feedr list` · `feedr show <item>` · `feedr claim <item>` · `feedr add [--agent-owned] <title>` · `feedr review <item>` · `feedr done <item>` · `feedr sweep`
 
 - `claim` writes `[~]` and stamps `@agent(<kind>:<session-id>)`.
 - `review` writes `[?]` (+ the evidence note comes from the body the agent appends); `done` writes `[x]` — permitted only per §2 authority.
@@ -91,7 +91,7 @@ The same binary as the TUI. Subcommands are the machine interface to the feed:
 `skills/herdr-feedr/SKILL.md` — the agent's interface to the feed, expressed as "run the `feedr` CLI":
 
 - Agents normally arrive with context (a named task, or a task to create). A context-free invocation lists open items and **asks**; it never auto-grabs.
-- Claim before working; finish per §2 (`review` + evidence on human-created, `done` on agent-created); add follow-up work with `add --agent`.
+- Claim before working; finish per §2 (`review` + evidence on human-created, `done` on agent-created); add follow-up work with `add --agent-owned`.
 - Delivery (herdr has no skill mechanism; plugin `skills/` dirs are inert convention): primary install `npx skills add Adroz/herdr-feedr -g`; the plugin build step copies (never symlinks) the skill over installed copies so herdr's reinstall-to-update flow refreshes it; AGENTS.md paste-in documented as fallback. The skill is version-stamped and consistency-tested against the CLI.
 
 ## 6. Concurrency ([#8](https://github.com/Adroz/herdr-feedr/issues/8), map fog)

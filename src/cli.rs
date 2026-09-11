@@ -60,7 +60,9 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let path = config::resolve_feed_path(
         cli.file.clone(),
-        std::env::var_os("FEEDR_FEED").map(PathBuf::from),
+        std::env::var_os("FEEDR_FEED")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
         &config::default_config_dir(),
     );
     let text = match std::fs::read_to_string(&path) {

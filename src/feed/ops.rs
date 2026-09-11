@@ -92,7 +92,7 @@ pub fn add(doc: &mut Document, title: &str, body: &[String], zone: Zone) {
         title: title.to_string(),
         agent: None,
         done_date: None,
-        body: body.iter().filter(|l| !l.is_empty()).cloned().collect(),
+        body: trim_blank_edges(body),
     });
     let insert_at = match zone {
         Zone::Human => end_of_first_human_section(doc),
@@ -118,6 +118,20 @@ pub fn add(doc: &mut Document, title: &str, body: &[String], zone: Zone) {
         },
     };
     doc.nodes.insert(insert_at, item);
+}
+
+/// Trims leading/trailing empty lines from a provided body while keeping
+/// interior blanks (e.g. blank lines inside a fenced code block).
+fn trim_blank_edges(lines: &[String]) -> Vec<String> {
+    let start = lines
+        .iter()
+        .position(|l| !l.is_empty())
+        .unwrap_or(lines.len());
+    let end = lines
+        .iter()
+        .rposition(|l| !l.is_empty())
+        .map_or(start, |i| i + 1);
+    lines[start..end].to_vec()
 }
 
 /// Insertion index for a new human item: just past the last item of the first
@@ -258,17 +272,37 @@ pub fn sweep(doc: &mut Document, today: &str) {
         let insert_at = match archive_insertion_point(doc, done_at, &section) {
             Some(at) => at,
             None => {
-                doc.nodes.push(Node::Raw(String::new()));
-                doc.nodes.push(Node::Heading {
-                    level: 2,
-                    text: section,
-                });
-                doc.nodes.push(Node::Raw(String::new()));
-                doc.nodes.len()
+                // Create the missing mirrored section, but stay inside the
+                // Done region — insert before the next top-level (`#`)
+                // heading rather than at EOF, so later `# Notes`-style
+                // sections aren't mistaken for part of the archive.
+                let end = done_region_end(doc, done_at);
+                doc.nodes.insert(end, Node::Raw(String::new()));
+                doc.nodes.insert(
+                    end + 1,
+                    Node::Heading {
+                        level: 2,
+                        text: section,
+                    },
+                );
+                doc.nodes.insert(end + 2, Node::Raw(String::new()));
+                end + 3
             }
         };
         doc.nodes.insert(insert_at, Node::Item(item));
     }
+}
+
+/// End of the `# Done` region: the index of the next level-1 heading after
+/// `done_at`, or the end of the document when there is none.
+fn done_region_end(doc: &Document, done_at: usize) -> usize {
+    doc.nodes
+        .iter()
+        .enumerate()
+        .skip(done_at + 1)
+        .find(|(_, n)| matches!(n, Node::Heading { level: 1, .. }))
+        .map(|(i, _)| i)
+        .unwrap_or(doc.nodes.len())
 }
 
 /// Index at which to insert a newly-archived item under the mirrored `##
@@ -394,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn add_filters_empty_body_lines() {
+    fn add_keeps_single_interior_blank_body_line() {
         let mut doc = parse("- [ ] A\n");
         add(
             &mut doc,
@@ -404,7 +438,23 @@ mod tests {
         );
         let i = find(&doc, "B").unwrap();
         match &doc.nodes[i] {
-            Node::Item(it) => assert_eq!(it.body, vec!["one", "two"]),
+            Node::Item(it) => assert_eq!(it.body, vec!["one", "", "two"]),
+            n => panic!("expected item, got {n:?}"),
+        }
+    }
+
+    #[test]
+    fn add_keeps_interior_blank_body_lines() {
+        let mut doc = parse("- [ ] A\n");
+        add(
+            &mut doc,
+            "B",
+            &["".into(), "one".into(), "".into(), "two".into(), "".into()],
+            Zone::Human,
+        );
+        let i = find(&doc, "B").unwrap();
+        match &doc.nodes[i] {
+            Node::Item(it) => assert_eq!(it.body, vec!["one", "", "two"]),
             n => panic!("expected item, got {n:?}"),
         }
     }
@@ -563,5 +613,35 @@ mod tests {
             out.contains("- [x] Old @done(2026-09-01)\n- [x] New thing @done(2026-09-11)\n\n## Other"),
             "item must append directly after the last archive item, blank line preserved before ## Other; got:\n{out}"
         );
+    }
+
+    #[test]
+    fn sweep_stays_inside_done_region_and_is_idempotent() {
+        let text = "\
+# Feed
+
+- [x] Ship it
+
+# Done
+
+## Other
+
+- [x] Old @done(2026-09-01)
+
+# Notes
+
+Some prose.
+";
+        let mut doc = parse(text);
+        sweep(&mut doc, "2026-09-11");
+        let once = render(&doc);
+        let ship = once.find("Ship it").unwrap();
+        assert!(
+            ship > once.find("# Done").unwrap() && ship < once.find("# Notes").unwrap(),
+            "archived item must sit inside the Done region:\n{once}"
+        );
+        let mut doc2 = parse(&once);
+        sweep(&mut doc2, "2026-09-12");
+        assert_eq!(render(&doc2), once, "second sweep must be a no-op");
     }
 }

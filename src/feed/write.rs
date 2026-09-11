@@ -39,8 +39,10 @@ pub fn render(doc: &Document) -> String {
                 }
                 out.push('\n');
                 for b in &item.body {
-                    out.push_str("  ");
-                    out.push_str(b);
+                    if !b.is_empty() {
+                        out.push_str("  ");
+                        out.push_str(b);
+                    }
                     out.push('\n');
                 }
             }
@@ -98,6 +100,12 @@ Some stray prose the parser doesn't own.
     #[test]
     fn empty_title_tokenless_item_round_trips() {
         assert_eq!(render(&parse("- [ ] \n")), "- [ ] \n");
+    }
+
+    #[test]
+    fn body_with_blank_line_round_trips() {
+        let text = "- [ ] Task\n  ```sh\n  echo one\n\n  echo two\n  ```\n";
+        assert_eq!(render(&parse(text)), text);
     }
 
     #[cfg(unix)]

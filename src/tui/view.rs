@@ -2,15 +2,27 @@ use crate::tui::app::{App, Row};
 use crate::tui::modal::{self, EditFocus, Modal};
 use crate::tui::socket::AgentStatus;
 use crate::tui::theme;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 /// Toolbar text; the click spans in input.rs must match these columns:
-/// « at 0, "sweep" at 2..=6, "file" at 8..=11.
-pub const TOOLBAR: &str = "« sweep file";
+/// "clear completed" at 0..=14, "file" at 17..=20. Round-3 item 2 moved the
+/// collapse chevron off the toolbar onto the bottom-right of the status row
+/// (`draw_status_row`) — herdr's own native position for it.
+pub const TOOLBAR: &str = "clear completed  file";
+
+/// Collapse-chevron glyph, pinned bottom-right of the status row (round-3
+/// item 2). Same glyph the toolbar used to show at column 0.
+const COLLAPSE_CHEVRON: &str = "«";
+
+/// Width, in cells, of the chevron's click zone at the right edge of the
+/// status row (input.rs hit-tests the same width) — one cell of breathing
+/// room plus the glyph itself, mirroring the toolbar's own multi-cell click
+/// zones rather than a single hard-to-hit column.
+const CHEVRON_ZONE_WIDTH: u16 = 2;
 
 /// Display-only live status (spec §3: never written to the file).
 /// Unknown renders nothing — it must not look like done.
@@ -84,12 +96,40 @@ pub fn draw(f: &mut Frame, app: &App) {
             .style(theme::muted_row().add_modifier(Modifier::BOLD)),
         done,
     );
-    f.render_widget(
-        Paragraph::new(app.status_msg.clone().unwrap_or_default()).style(theme::muted_row()),
-        status,
-    );
+    draw_status_row(f, status, app);
 
     draw_modal(f, app);
+}
+
+/// Status row: the status message on the left, the collapse chevron pinned
+/// to the bottom-right corner (round-3 item 2 — herdr's own native position
+/// for its collapse control). The chevron always owns the rightmost
+/// `CHEVRON_ZONE_WIDTH` cells; a status message that would run into that
+/// zone is truncated first so the chevron never gets clipped or overwritten.
+fn draw_status_row(f: &mut Frame, area: Rect, app: &App) {
+    let chevron_w = CHEVRON_ZONE_WIDTH.min(area.width);
+    let text_w = area.width - chevron_w;
+    let msg = app.status_msg.as_deref().unwrap_or("");
+    f.render_widget(
+        Paragraph::new(ellipsize(msg, text_w as usize)).style(theme::muted_row()),
+        Rect {
+            width: text_w,
+            ..area
+        },
+    );
+    if chevron_w > 0 {
+        let chevron_area = Rect {
+            x: area.x + text_w,
+            width: chevron_w,
+            ..area
+        };
+        f.render_widget(
+            Paragraph::new(COLLAPSE_CHEVRON)
+                .style(theme::muted_row())
+                .alignment(Alignment::Right),
+            chevron_area,
+        );
+    }
 }
 
 fn draw_modal(f: &mut Frame, app: &App) {
@@ -309,7 +349,7 @@ mod tests {
         );
         app.status_msg = Some("hello".into());
         let rows = render_to_strings(&app, 20, 12);
-        assert_eq!(rows[0], "« sweep file");
+        assert_eq!(rows[0], "clear completed  fil"); // round-3: no leading «, renamed label (clipped at 20 cols)
         assert_eq!(rows[1], "[ ] Fix auth redire…"); // ellipsized at 20 cols
         assert_eq!(rows[2], "[~] Migrate CI");
         assert_eq!(rows[3], "  @claude >"); // live working glyph
@@ -318,7 +358,42 @@ mod tests {
         assert_eq!(rows[6], "  @claude >");
         assert_eq!(rows[7], "+ add");
         assert_eq!(rows[10], "Done (1)"); // bottom-pinned, h-2
-        assert_eq!(rows[11], "hello"); // status line, h-1
+                                          // status line, h-1: "hello" on the left, « pinned bottom-right
+                                          // (round-3 item 2 — native-herdr collapse position). 20-col row:
+                                          // "hello" (5) + 14 blank cells + « (1) = 20.
+        assert_eq!(rows[11], format!("hello{}«", " ".repeat(14)));
+    }
+
+    /// Round-3 item 2: the collapse chevron lives at the bottom-right of the
+    /// status row now, not the toolbar. It occupies the rightmost 2 cells
+    /// (a click zone, input.rs); the glyph itself renders in the very last
+    /// cell.
+    #[test]
+    fn collapse_chevron_renders_bottom_right_of_status_row() {
+        let app = app_with(SAMPLE);
+        let rows = render_to_strings(&app, 20, 12);
+        assert!(rows[11].ends_with('«'), "got: {:?}", rows[11]);
+        assert_eq!(rows[11].chars().last(), Some('«'));
+    }
+
+    /// Round-3 item 2: a status message that would collide with the chevron
+    /// zone is truncated so the chevron always wins the rightmost cell.
+    #[test]
+    fn long_status_message_truncates_before_chevron() {
+        let mut app = app_with(SAMPLE);
+        app.status_msg = Some("this is a very long status message that will not fit".into());
+        let rows = render_to_strings(&app, 20, 12);
+        assert_eq!(rows[11].chars().last(), Some('«'));
+        assert_eq!(rows[11].chars().count(), 20);
+    }
+
+    /// Round-3 item 3: "sweep" is renamed "clear completed" with no leading
+    /// chevron (that moved to the status row — item 2).
+    #[test]
+    fn toolbar_text_matches_round3_spec() {
+        assert!(!TOOLBAR.starts_with('«'));
+        assert!(TOOLBAR.contains("clear completed"));
+        assert!(!TOOLBAR.contains("sweep"));
     }
 
     /// Round-2 item 2: the brackets are always normal text; only the

@@ -5,7 +5,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind
 /// geometry must mirror view::draw: y=0 toolbar, list at y=1..=h-3,
 /// Done(n) at h-2, status line at h-1.
 pub fn translate(ev: &Event, app: &App, size: (u16, u16)) -> Option<Action> {
-    let (_w, h) = size;
+    let (w, h) = size;
     match ev {
         Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
             KeyCode::Char('q') => Some(Action::Quit),
@@ -18,26 +18,37 @@ pub fn translate(ev: &Event, app: &App, size: (u16, u16)) -> Option<Action> {
         Event::Mouse(m) => match m.kind {
             MouseEventKind::ScrollUp => Some(Action::ScrollUp),
             MouseEventKind::ScrollDown => Some(Action::ScrollDown),
-            MouseEventKind::Down(MouseButton::Left) => click(app, m.column, m.row, h),
+            MouseEventKind::Down(MouseButton::Left) => click(app, m.column, m.row, w, h),
             _ => None,
         },
         _ => None,
     }
 }
 
-fn click(app: &App, x: u16, y: u16, h: u16) -> Option<Action> {
+/// Width, in cells, of the bottom-right collapse-chevron click zone on the
+/// status row — must match `view::CHEVRON_ZONE_WIDTH` so the clickable area
+/// and the drawn glyph never drift apart.
+const CHEVRON_ZONE_WIDTH: u16 = 2;
+
+fn click(app: &App, x: u16, y: u16, w: u16, h: u16) -> Option<Action> {
     if app.collapsed {
         // Any click on the rail restores the sidebar.
         return Some(Action::ToggleCollapse);
     }
     if y == 0 {
-        // Toolbar columns must match view::TOOLBAR ("« sweep file").
+        // Toolbar columns must match view::TOOLBAR ("clear completed  file").
         return match x {
-            0 => Some(Action::ToggleCollapse),
-            2..=6 => Some(Action::Sweep),
-            8..=11 => Some(Action::OpenFileView),
+            0..=14 => Some(Action::Sweep),
+            17..=20 => Some(Action::OpenFileView),
             _ => None,
         };
+    }
+    if h >= 1 && y == h - 1 {
+        // Status row: the collapse chevron owns the rightmost
+        // CHEVRON_ZONE_WIDTH cells (round-3 item 2, native-herdr position);
+        // the rest of the row is the (unclickable) status message.
+        let chevron_w = CHEVRON_ZONE_WIDTH.min(w);
+        return (chevron_w > 0 && x >= w - chevron_w).then_some(Action::ToggleCollapse);
     }
     if h >= 2 && y == h - 2 {
         return Some(Action::OpenDoneView);
@@ -120,7 +131,7 @@ mod tests {
         Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
     }
 
-    const SIZE: (u16, u16) = (20, 10); // list rows y=1..=7, Done row y=8, status y=9
+    const SIZE: (u16, u16) = (22, 10); // list rows y=1..=7, Done row y=8, status y=9; w=22 so the full round-3 toolbar ("clear completed  file", 21 cols) and the bottom-right chevron zone both fit
 
     #[test]
     fn keys_quit_add_editor_scroll() {
@@ -138,19 +149,46 @@ mod tests {
         );
     }
 
+    /// Round-3 item 3: toolbar is now "clear completed  file" — no leading
+    /// chevron (that moved to the status row, round-3 item 2). "clear
+    /// completed" spans 0..=14, a two-space gap at 15..=16, "file" at
+    /// 17..=20.
     #[test]
     fn toolbar_clicks() {
         let app = app_with(SAMPLE);
+        assert_eq!(translate(&click(0, 0), &app, SIZE), Some(Action::Sweep));
+        assert_eq!(translate(&click(14, 0), &app, SIZE), Some(Action::Sweep));
+        assert_eq!(translate(&click(15, 0), &app, SIZE), None); // gap
+        assert_eq!(translate(&click(16, 0), &app, SIZE), None); // gap
         assert_eq!(
-            translate(&click(0, 0), &app, SIZE),
-            Some(Action::ToggleCollapse)
-        );
-        assert_eq!(translate(&click(4, 0), &app, SIZE), Some(Action::Sweep));
-        assert_eq!(
-            translate(&click(9, 0), &app, SIZE),
+            translate(&click(17, 0), &app, SIZE),
             Some(Action::OpenFileView)
         );
-        assert_eq!(translate(&click(15, 0), &app, SIZE), None); // dead zone
+        assert_eq!(
+            translate(&click(20, 0), &app, SIZE),
+            Some(Action::OpenFileView)
+        );
+        assert_eq!(translate(&click(21, 0), &app, SIZE), None); // dead zone past "file"
+    }
+
+    /// Round-3 item 2: the collapse chevron moved off the toolbar onto the
+    /// bottom-right of the status row (native-herdr position), owning the
+    /// rightmost 2 cells of that row; the rest of the status row (where the
+    /// status message renders) is a dead zone.
+    #[test]
+    fn status_row_chevron_click_toggles_collapse() {
+        let app = app_with(SAMPLE);
+        // SIZE = (22, 10): status row y = h-1 = 9; chevron zone x = 20..=21.
+        assert_eq!(
+            translate(&click(21, 9), &app, SIZE),
+            Some(Action::ToggleCollapse)
+        );
+        assert_eq!(
+            translate(&click(20, 9), &app, SIZE),
+            Some(Action::ToggleCollapse)
+        );
+        assert_eq!(translate(&click(19, 9), &app, SIZE), None); // status text zone
+        assert_eq!(translate(&click(0, 9), &app, SIZE), None); // status text zone
     }
 
     /// Round-2 item 2: row is "[<char>] title" — checkbox zone x 0..=2,

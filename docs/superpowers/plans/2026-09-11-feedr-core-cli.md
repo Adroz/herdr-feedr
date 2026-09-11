@@ -1273,7 +1273,14 @@ pub fn run() -> Result<()> {
         std::env::var_os("FEEDR_FEED").map(PathBuf::from),
         &config::default_config_dir(),
     );
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    // NotFound => empty feed; any other read error (permissions, non-UTF-8)
+    // must abort — parsing it as empty would clobber the real file on the
+    // next atomic save (review-caught data-loss path).
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => bail!("cannot read {}: {e}", path.display()),
+    };
     let mut doc = parse(&text);
 
     match cli.command {

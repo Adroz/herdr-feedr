@@ -176,6 +176,59 @@ fn list_shows_sections_and_hides_archive() {
 }
 
 #[test]
+fn add_with_section_lands_in_named_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("feed.md");
+    std::fs::write(
+        &path,
+        "\
+# Feed
+
+- [ ] Top task
+
+## Later
+
+- [ ] Later task
+",
+    )
+    .unwrap();
+    feedr(&path)
+        .args([
+            "add",
+            "--section",
+            "Later",
+            "New later task",
+            "--body",
+            "extra context",
+        ])
+        .assert()
+        .success();
+    let text = std::fs::read_to_string(&path).unwrap();
+    // Must land inside "## Later", after the section heading — not in the
+    // default (first/"# Feed") section.
+    let later_idx = text.find("## Later").expect("section heading kept");
+    let new_item_idx = text.find("New later task").expect("item was added");
+    assert!(
+        new_item_idx > later_idx,
+        "new item must land inside ## Later, got:\n{text}"
+    );
+    assert!(text.contains("extra context"));
+}
+
+#[test]
+fn add_with_missing_section_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    feedr(&feed)
+        .args(["add", "--section", "Nonexistent", "New item"])
+        .assert()
+        .failure()
+        .stderr(contains("no item matches"));
+    // Nothing was written on failure.
+    assert!(!std::fs::read_to_string(&feed).unwrap().contains("New item"));
+}
+
+#[test]
 fn sidebar_subcommand_is_wired() {
     let mut cmd = Command::cargo_bin("feedr").unwrap();
     cmd.args(["sidebar", "--help"])

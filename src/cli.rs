@@ -130,15 +130,16 @@ pub fn run() -> Result<()> {
             agent_owned,
             section,
         } => {
-            if section.is_some() {
-                bail!("--section: not implemented in v0.1, edit the file or omit");
-            }
-            let zone = if agent_owned {
-                Zone::Agent
+            if let Some(section) = section {
+                ops::add_in_section(&mut doc, &title, &body, &section)?;
             } else {
-                Zone::Human
-            };
-            ops::add(&mut doc, &title, &body, zone);
+                let zone = if agent_owned {
+                    Zone::Agent
+                } else {
+                    Zone::Human
+                };
+                ops::add(&mut doc, &title, &body, zone);
+            }
             write::save_atomic(&doc, &path)?;
         }
         Cmd::Review { item } => {

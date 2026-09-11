@@ -221,27 +221,38 @@ impl App {
     /// reload. This is the ONLY path that writes the feed from the TUI
     /// (spec §6).
     ///
-    /// Unlike `reload`, a missing file here is NOT treated as an empty
-    /// document: the file may have been deleted between the last render and
-    /// this action (e.g. a click), and saving an empty document back would
-    /// turn a transient deletion into permanent data loss. So a mid-action
-    /// NotFound just drops the action.
+    /// Unlike `reload`, a missing file here is not automatically treated as
+    /// an empty document — that distinction matters mid-action:
+    ///
+    /// - First run: the default feed path simply doesn't exist yet. If we
+    ///   dropped every action on NotFound, a new user could never create
+    ///   their first item. When the in-memory doc has no items at all
+    ///   (nothing to lose), proceed with an empty `Document` so the action
+    ///   goes through and `save_atomic` creates the file.
+    /// - Mid-session deletion: the file existed and was removed between the
+    ///   last render and this action (e.g. a click). If the in-memory doc
+    ///   HAS items, saving an empty document back would turn a transient
+    ///   deletion into permanent data loss — so that case still drops the
+    ///   action.
     fn with_feed<F>(&mut self, f: F)
     where
         F: FnOnce(&mut Document) -> Result<Outcome>,
     {
-        let text = match std::fs::read_to_string(&self.feed_path) {
-            Ok(t) => t,
+        let mut doc = match std::fs::read_to_string(&self.feed_path) {
+            Ok(t) => crate::feed::parse::parse(&t),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.status_msg = Some("feed file missing; action dropped".into());
-                return;
+                let has_items = self.doc.nodes.iter().any(|n| matches!(n, Node::Item(_)));
+                if has_items {
+                    self.status_msg = Some("feed file missing; action dropped".into());
+                    return;
+                }
+                Document::default()
             }
             Err(e) => {
                 self.status_msg = Some(format!("cannot read feed: {e}"));
                 return;
             }
         };
-        let mut doc = crate::feed::parse::parse(&text);
         match f(&mut doc) {
             Ok(Outcome::Changed(msg)) => match save_atomic(&doc, &self.feed_path) {
                 Ok(()) => self.status_msg = msg,
@@ -834,6 +845,13 @@ mod tests {
     /// path must NOT treat NotFound as an empty document and save that
     /// empty document back — that would turn a transient deletion into
     /// permanent data loss. The action is simply dropped.
+    ///
+    /// Seed is deliberately non-empty ("- [ ] Alpha" loaded into
+    /// `app.doc` via `app_on_disk`'s `reload()`) so this exercises the
+    /// "file existed and vanished mid-session" branch of `with_feed`'s
+    /// NotFound handling, not the first-run branch covered by
+    /// `with_feed_proceeds_on_missing_file_when_in_memory_doc_has_no_items`
+    /// below.
     #[test]
     fn action_on_deleted_feed_drops_and_does_not_create_empty_file() {
         let (mut app, _fake, _dir) = app_on_disk("- [ ] Alpha\n");
@@ -853,6 +871,57 @@ mod tests {
             msg.contains("missing") || msg.contains("dropped"),
             "expected a dropped-action status message, got: {msg}"
         );
+    }
+
+    /// User-feedback bug: on first run the default feed path doesn't exist
+    /// yet, so `with_feed`'s NotFound handling used to drop every action —
+    /// new users could never create their first item. When the in-memory
+    /// doc has no items (fresh/empty session, nothing to lose), a
+    /// mid-action NotFound must proceed with an empty Document instead of
+    /// dropping, letting `save_atomic` create the file via its
+    /// `create_dir_all`.
+    #[test]
+    fn with_feed_proceeds_on_missing_file_when_in_memory_doc_has_no_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("feed.md"); // deliberately never created
+        let mut app = App::new(path.clone(), test_cfg(), Box::new(FakeHerdr::default()));
+        assert!(!path.exists());
+
+        app.with_feed(|doc| {
+            ops::add(doc, "First item", &[], Zone::Human);
+            Ok(Outcome::Changed(None))
+        });
+
+        assert!(path.exists(), "first-run create must create the feed file");
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("First item"));
+    }
+
+    /// Same bug, exercised through the real create flow (`a` → type title →
+    /// ^S) rather than calling `with_feed` directly, so the fix is proven at
+    /// the level the user actually hit it.
+    #[test]
+    fn create_modal_save_creates_feed_file_on_first_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("feed.md"); // deliberately never created
+        let mut app = App::new(path.clone(), test_cfg(), Box::new(FakeHerdr::default()));
+        assert!(!path.exists());
+
+        app.apply(Action::OpenCreate);
+        assert!(app.modal_active());
+        press(&mut app, KeyCode::Tab); // Section (only FirstHuman/Agent) → Title
+        type_str(&mut app, "First item");
+        press_ctrl(&mut app, 's');
+
+        assert!(!app.modal_active());
+        assert!(
+            path.exists(),
+            "first-run create-via-modal must create the feed file"
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("First item"));
     }
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};

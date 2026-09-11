@@ -5,6 +5,7 @@ pub mod socket;
 #[cfg(test)]
 pub mod test_util;
 pub mod view;
+pub mod watch;
 
 use crate::config::SidebarConfig;
 use anyhow::{bail, Result};
@@ -45,7 +46,9 @@ pub fn run(feed_path: PathBuf, cfg: SidebarConfig) -> Result<()> {
     }
     check_feed_readable(&feed_path)?;
 
-    let (_tx, rx) = mpsc::channel::<AppEvent>();
+    let (tx, rx) = mpsc::channel::<AppEvent>();
+    let _watcher = watch::spawn(&feed_path, tx.clone())
+        .map_err(|e| anyhow::anyhow!("cannot watch {}: {e}", feed_path.display()))?;
     let mut app = App::new(feed_path, cfg, Box::new(NoHerdr));
     app.reload();
 

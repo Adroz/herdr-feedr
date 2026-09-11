@@ -169,9 +169,9 @@ pub fn step(modal: Modal, ev: Event) -> ModalStep {
             Event::Key(k) if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) => {
                 ModalStep::Continue(Modal::None)
             }
-            Event::Key(k) if k.code == KeyCode::Down => {
-                ModalStep::Continue(Modal::DoneView { scroll: scroll + 1 })
-            }
+            Event::Key(k) if k.code == KeyCode::Down => ModalStep::Continue(Modal::DoneView {
+                scroll: scroll.saturating_add(1),
+            }),
             Event::Key(k) if k.code == KeyCode::Up => ModalStep::Continue(Modal::DoneView {
                 scroll: scroll.saturating_sub(1),
             }),
@@ -182,9 +182,9 @@ pub fn step(modal: Modal, ev: Event) -> ModalStep {
                 ModalStep::Continue(Modal::None)
             }
             Event::Key(k) if k.code == KeyCode::Char('e') => ModalStep::OpenEditor,
-            Event::Key(k) if k.code == KeyCode::Down => {
-                ModalStep::Continue(Modal::FileView { scroll: scroll + 1 })
-            }
+            Event::Key(k) if k.code == KeyCode::Down => ModalStep::Continue(Modal::FileView {
+                scroll: scroll.saturating_add(1),
+            }),
             Event::Key(k) if k.code == KeyCode::Up => ModalStep::Continue(Modal::FileView {
                 scroll: scroll.saturating_sub(1),
             }),
@@ -239,4 +239,46 @@ fn edit_step(mut m: EditModal, ev: Event) -> ModalStep {
         }
     }
     ModalStep::Continue(Modal::Edit(m))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    fn down() -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+    }
+
+    /// Rider from Task 10's review: the viewer scroll `Down` arms used plain
+    /// `scroll + 1` (u16), which debug-panics on overflow at 65,535 presses.
+    /// Hammer both DoneView and FileView well past u16::MAX to prove
+    /// `saturating_add` holds instead of panicking.
+    #[test]
+    fn done_view_scroll_down_saturates_past_u16_max() {
+        let mut modal = Modal::DoneView {
+            scroll: u16::MAX - 5,
+        };
+        for _ in 0..70_000 {
+            modal = match step(modal, down()) {
+                ModalStep::Continue(m) => m,
+                _ => panic!("DoneView Down must stay in Continue"),
+            };
+        }
+        assert!(matches!(modal, Modal::DoneView { scroll } if scroll == u16::MAX));
+    }
+
+    #[test]
+    fn file_view_scroll_down_saturates_past_u16_max() {
+        let mut modal = Modal::FileView {
+            scroll: u16::MAX - 5,
+        };
+        for _ in 0..70_000 {
+            modal = match step(modal, down()) {
+                ModalStep::Continue(m) => m,
+                _ => panic!("FileView Down must stay in Continue"),
+            };
+        }
+        assert!(matches!(modal, Modal::FileView { scroll } if scroll == u16::MAX));
+    }
 }

@@ -377,7 +377,15 @@ enum Token {
 }
 
 fn split_trailing_token(s: &str) -> Option<(&str, Token)> {
-    let open = s.rfind("@agent(").or(s.rfind("@done("))?;
+    let a = s.rfind("@agent(");
+    let d = s.rfind("@done(");
+    // Rightmost of the two token types — .or() would wrongly prefer @agent's
+    // position anywhere in the string (bug caught in review: "@agent(x) @done(y)"
+    // extracted neither token).
+    let open = match (a, d) {
+        (Some(x), Some(y)) => x.max(y),
+        (x, y) => x.or(y)?,
+    };
     let tail = &s[open..];
     let close = tail.find(')')?;
     if open + close + 1 != s.len() {

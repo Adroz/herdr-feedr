@@ -1,5 +1,9 @@
 use super::*;
 
+/// Lossless for lines the parser does not own (they become [`Node::Raw`] and
+/// re-emit verbatim). Recognized lines (headings, items, bodies) are
+/// normalized: trailing whitespace is trimmed and token spacing is
+/// canonicalized, so render∘parse is byte-exact only for canonical input.
 pub fn parse(text: &str) -> Document {
     let mut nodes: Vec<Node> = Vec::new();
     for line in text.lines() {

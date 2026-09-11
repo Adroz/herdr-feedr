@@ -61,6 +61,9 @@ pub struct Item {
     /// Set on swept items: YYYY-MM-DD.
     pub done_date: Option<String>,
     /// Body lines without their two-space indent.
+    /// Invariant: lines are non-empty — the parser never produces empty body
+    /// lines, and ops must not insert them (an empty body line renders as
+    /// "  \n", which re-parses as Raw and detaches the following body lines).
     pub body: Vec<String>,
 }
 

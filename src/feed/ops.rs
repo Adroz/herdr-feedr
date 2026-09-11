@@ -77,6 +77,7 @@ pub fn find(doc: &Document, query: &str) -> Result<usize, OpError> {
 }
 
 pub fn claim(doc: &mut Document, index: usize, agent: AgentRef) {
+    debug_assert!(matches!(doc.nodes[index], Node::Item(_)));
     if let Node::Item(it) = &mut doc.nodes[index] {
         it.state = State::InProgress;
         it.agent = Some(agent);
@@ -89,7 +90,7 @@ pub fn add(doc: &mut Document, title: &str, body: &[String], zone: Zone) {
         title: title.to_string(),
         agent: None,
         done_date: None,
-        body: body.to_vec(),
+        body: body.iter().filter(|l| !l.is_empty()).cloned().collect(),
     });
     let insert_at = match zone {
         Zone::Human => end_of_first_human_section(doc),
@@ -117,30 +118,43 @@ pub fn add(doc: &mut Document, title: &str, body: &[String], zone: Zone) {
     doc.nodes.insert(insert_at, item);
 }
 
-/// Index just past the last item (or heading) of the first human region.
+/// Insertion index for a new human item: just past the last item of the first
+/// non-empty human region, or — when no human items exist yet — directly
+/// before the boundary heading (`## Agent` / `# Done`), stepping back over a
+/// single preceding blank line; end of document when there is no boundary.
 fn end_of_first_human_section(doc: &Document) -> usize {
-    let mut end = 0;
+    let mut last_item_end = 0usize;
+    let mut boundary: Option<usize> = None;
     for (i, n) in doc.nodes.iter().enumerate() {
         match n {
-            Node::Heading { level: 2, text } if text.eq_ignore_ascii_case("Agent") => break,
-            Node::Heading { level: 1, text } if text.eq_ignore_ascii_case("Done") => break,
-            Node::Heading { level: 2, .. } if end > 0 => break, // next human section
-            Node::Item(_) => end = i + 1,
+            Node::Heading { level: 2, text } if text.eq_ignore_ascii_case("Agent") => {
+                boundary = Some(i);
+                break;
+            }
+            Node::Heading { level: 1, text } if text.eq_ignore_ascii_case("Done") => {
+                boundary = Some(i);
+                break;
+            }
+            Node::Heading { level: 2, .. } if last_item_end > 0 => {
+                boundary = Some(i);
+                break;
+            }
+            Node::Item(_) => last_item_end = i + 1,
             _ => {}
         }
     }
-    if end == 0 {
-        doc.nodes
-            .iter()
-            .position(|n| matches!(n, Node::Item(_)))
-            .unwrap_or_else(|| {
-                doc.nodes
-                    .iter()
-                    .take_while(|n| !matches!(n, Node::Heading { level: 2, .. }))
-                    .count()
-            })
-    } else {
-        end
+    if last_item_end > 0 {
+        return last_item_end;
+    }
+    match boundary {
+        Some(b) => {
+            if b > 0 && matches!(&doc.nodes[b - 1], Node::Raw(s) if s.is_empty()) {
+                b - 1
+            } else {
+                b
+            }
+        }
+        None => doc.nodes.len(),
     }
 }
 
@@ -234,5 +248,41 @@ mod tests {
         add(&mut doc, "Agent task", &[], Zone::Agent);
         let out = render(&doc);
         assert!(out.contains("## Agent\n\n- [ ] Agent task\n"));
+    }
+
+    fn human_add_zone(text: &str) -> Zone {
+        let mut doc = parse(text);
+        add(&mut doc, "Human task", &[], Zone::Human);
+        let i = find(&doc, "Human task").unwrap();
+        zone_of(&doc, i)
+    }
+
+    #[test]
+    fn add_mine_with_empty_human_region_stays_human() {
+        assert_eq!(
+            human_add_zone("# Feed\n\n## Agent\n\n- [ ] agent task\n"),
+            Zone::Human
+        );
+        assert_eq!(
+            human_add_zone("# Feed\n\n# Done\n\n## Feed\n\n- [x] Old thing @done(2026-09-01)\n"),
+            Zone::Human
+        );
+        assert_eq!(human_add_zone("# Feed\n\n# Done\n"), Zone::Human);
+    }
+
+    #[test]
+    fn add_filters_empty_body_lines() {
+        let mut doc = parse("- [ ] A\n");
+        add(
+            &mut doc,
+            "B",
+            &["one".into(), "".into(), "two".into()],
+            Zone::Human,
+        );
+        let i = find(&doc, "B").unwrap();
+        match &doc.nodes[i] {
+            Node::Item(it) => assert_eq!(it.body, vec!["one", "two"]),
+            n => panic!("expected item, got {n:?}"),
+        }
     }
 }

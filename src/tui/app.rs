@@ -136,6 +136,15 @@ pub fn section_choices(doc: &Document) -> Vec<SectionChoice> {
     v
 }
 
+/// Whether a `with_feed` closure actually mutated the document — controls
+/// whether `with_feed` bothers to save. Every dropped-action path (relocate
+/// miss, no-op sweep, etc.) must report `Unchanged` so a no-op click doesn't
+/// rewrite the file (and self-trigger the file watcher for nothing).
+pub enum Outcome {
+    Changed(Option<String>),
+    Unchanged(Option<String>),
+}
+
 pub struct App {
     pub feed_path: PathBuf,
     pub cfg: SidebarConfig,
@@ -192,16 +201,25 @@ impl App {
         self.rebuild();
     }
 
-    /// Read fresh → apply one change → atomic save → reload. The closure
-    /// returns an optional status message. This is the ONLY path that writes
-    /// the feed from the TUI (spec §6).
+    /// Read fresh → apply one change → atomic save (only if it mutated) →
+    /// reload. This is the ONLY path that writes the feed from the TUI
+    /// (spec §6).
+    ///
+    /// Unlike `reload`, a missing file here is NOT treated as an empty
+    /// document: the file may have been deleted between the last render and
+    /// this action (e.g. a click), and saving an empty document back would
+    /// turn a transient deletion into permanent data loss. So a mid-action
+    /// NotFound just drops the action.
     fn with_feed<F>(&mut self, f: F)
     where
-        F: FnOnce(&mut Document) -> Result<Option<String>>,
+        F: FnOnce(&mut Document) -> Result<Outcome>,
     {
         let text = match std::fs::read_to_string(&self.feed_path) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.status_msg = Some("feed file missing; action dropped".into());
+                return;
+            }
             Err(e) => {
                 self.status_msg = Some(format!("cannot read feed: {e}"));
                 return;
@@ -209,10 +227,11 @@ impl App {
         };
         let mut doc = crate::feed::parse::parse(&text);
         match f(&mut doc) {
-            Ok(msg) => match save_atomic(&doc, &self.feed_path) {
+            Ok(Outcome::Changed(msg)) => match save_atomic(&doc, &self.feed_path) {
                 Ok(()) => self.status_msg = msg,
                 Err(e) => self.status_msg = Some(format!("save failed: {e}")),
             },
+            Ok(Outcome::Unchanged(msg)) => self.status_msg = msg,
             Err(e) => self.status_msg = Some(e.to_string()),
         }
         self.reload();
@@ -242,7 +261,11 @@ impl App {
                         })
                         .count();
                     ops::sweep(doc, &today);
-                    Ok(Some(format!("swept {n} item(s)")))
+                    if n == 0 {
+                        Ok(Outcome::Unchanged(Some("swept 0 item(s)".into())))
+                    } else {
+                        Ok(Outcome::Changed(Some(format!("swept {n} item(s)"))))
+                    }
                 });
             }
             Action::AgentClick(key) => self.agent_click(key),
@@ -267,9 +290,11 @@ impl App {
         self.with_feed(|doc| match relocate(doc, &key) {
             Some(i) => {
                 ops::set_state(doc, i, next, Authority::Human)?;
-                Ok(None)
+                Ok(Outcome::Changed(None))
             }
-            None => Ok(Some("item changed on disk — click dropped".into())),
+            None => Ok(Outcome::Unchanged(Some(
+                "item changed on disk — click dropped".into(),
+            ))),
         });
     }
 
@@ -591,5 +616,84 @@ mod tests {
             app.apply(Action::ScrollUp);
         }
         assert_eq!(app.scroll, 0);
+    }
+
+    /// Spec review follow-up: a stale key (relocate miss) must drop the
+    /// action without rewriting the file at all — not just "same bytes",
+    /// but no save_atomic call. We prove that by backdating the file's
+    /// mtime before the click and asserting it — and the content — are
+    /// completely untouched afterward. A buggy always-save implementation
+    /// would bump the mtime to "now" via the atomic rename even though the
+    /// rendered bytes happen to round-trip identically.
+    #[test]
+    fn dropped_action_does_not_rewrite_file() {
+        let (mut app, _fake, _dir) = app_on_disk("- [ ] Alpha\n");
+        // Simulate a concurrent agent claim between render and click, same
+        // as `stale_key_drops_action_with_message`:
+        std::fs::write(&app.feed_path, "- [~] Alpha @agent(claude:abc)\n").unwrap();
+
+        // Backdate the mtime so any rewrite (even a byte-identical one via
+        // save_atomic's tempfile-rename) is detectable.
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&app.feed_path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+
+        let content_before = std::fs::read_to_string(&app.feed_path).unwrap();
+        let mtime_before = std::fs::metadata(&app.feed_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // Stale key: UI still thinks the item is [ ] Open, but disk now has
+        // it as [~] claimed by an agent — relocate() misses.
+        app.apply(Action::Advance(ItemKey {
+            title: "Alpha".into(),
+            state: State::Open,
+        }));
+
+        let content_after = std::fs::read_to_string(&app.feed_path).unwrap();
+        let mtime_after = std::fs::metadata(&app.feed_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        assert_eq!(
+            content_after, content_before,
+            "file content must not change"
+        );
+        assert_eq!(
+            mtime_after, mtime_before,
+            "file must not be rewritten at all"
+        );
+    }
+
+    /// Spec review follow-up: if the feed file is deleted between the
+    /// snapshot render and the click (mid-action read), the dropped-action
+    /// path must NOT treat NotFound as an empty document and save that
+    /// empty document back — that would turn a transient deletion into
+    /// permanent data loss. The action is simply dropped.
+    #[test]
+    fn action_on_deleted_feed_drops_and_does_not_create_empty_file() {
+        let (mut app, _fake, _dir) = app_on_disk("- [ ] Alpha\n");
+        std::fs::remove_file(&app.feed_path).unwrap();
+
+        app.apply(Action::Advance(ItemKey {
+            title: "Alpha".into(),
+            state: State::Open,
+        }));
+
+        assert!(
+            !app.feed_path.exists(),
+            "a deleted feed must not be recreated (even empty) by a dropped action"
+        );
+        let msg = app.status_msg.as_deref().unwrap();
+        assert!(
+            msg.contains("missing") || msg.contains("dropped"),
+            "expected a dropped-action status message, got: {msg}"
+        );
     }
 }

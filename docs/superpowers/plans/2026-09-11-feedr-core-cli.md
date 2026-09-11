@@ -453,6 +453,7 @@ Some stray prose the parser doesn't own.
 ## Agent
 
 - [x] Old thing @done(2026-09-01)
+- [x] @done(2026-09-02)
 ";
         assert_eq!(render(&parse(text)), text);
     }
@@ -495,7 +496,15 @@ pub fn render(doc: &Document) -> String {
                 out.push('\n');
             }
             Node::Item(item) => {
-                out.push_str(&format!("- [{}] {}", item.state.to_char(), item.title));
+                // No space after "]" when the title is empty — otherwise
+                // "- [x] @done(...)" (empty title + token) round-trips with a
+                // double space. Items can have empty titles (parser accepts
+                // "- [x] " and token-only lines).
+                out.push_str(&format!("- [{}]", item.state.to_char()));
+                if !item.title.is_empty() {
+                    out.push(' ');
+                    out.push_str(&item.title);
+                }
                 if let Some(a) = &item.agent {
                     out.push_str(&format!(" @agent({a})"));
                 }

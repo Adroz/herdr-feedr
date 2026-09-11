@@ -1,4 +1,5 @@
 use ratatui::backend::{Backend, TestBackend};
+use ratatui::buffer::Buffer;
 use ratatui::layout::Position;
 use ratatui::Terminal;
 
@@ -34,4 +35,14 @@ pub fn render_cursor(app: &crate::tui::app::App, w: u16, h: u16) -> Option<Posit
     let backend = terminal.backend_mut();
     let visible = format!("{backend:?}").contains("cursor: true");
     visible.then(|| backend.get_cursor_position().unwrap())
+}
+
+/// Draw the app into an in-memory buffer and return the raw `Buffer` — for
+/// tests that need per-cell style (fg/bg/modifier), not just the rendered
+/// text `render_to_strings` gives (round-3 item 1: dimmed-backdrop modal
+/// overlay tests need to inspect `Modifier::DIM` and background color).
+pub fn render_buffer(app: &crate::tui::app::App, w: u16, h: u16) -> Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    terminal.draw(|f| crate::tui::view::draw(f, app)).unwrap();
+    terminal.backend().buffer().clone()
 }

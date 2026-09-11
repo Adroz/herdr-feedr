@@ -5,7 +5,7 @@ use crate::tui::theme;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Padding, Paragraph};
 use ratatui::Frame;
 
 /// Toolbar text; the click spans in input.rs must match these columns:
@@ -132,7 +132,18 @@ fn draw_status_row(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+/// Round-3 item 1: every modal reads as a true catppuccin-style overlay —
+/// before the panel itself is drawn, the whole frame is repainted as a
+/// dimmed backdrop (`theme::backdrop`: `Modifier::DIM` + `theme::BASE` bg).
+/// Each panel below then draws `Clear` over its own rect first (resetting
+/// style/modifiers there) followed by a `Block` styled with
+/// `theme::modal_panel_style` (solid `theme::MANTLE` bg), so the panel
+/// itself — and everything drawn inside it — never carries the dim.
 fn draw_modal(f: &mut Frame, app: &App) {
+    if matches!(app.modal, Modal::None) {
+        return;
+    }
+    dim_backdrop(f);
     match &app.modal {
         Modal::None => {}
         Modal::Edit(m) => draw_edit_modal(f, m),
@@ -140,8 +151,11 @@ fn draw_modal(f: &mut Frame, app: &App) {
             let area = modal::centered(f.area(), 80, 20);
             f.render_widget(Clear, area);
             let outer = Block::bordered()
+                .style(theme::modal_panel_style())
                 .border_style(theme::modal_border())
-                .title("Confirm delete");
+                .title_style(theme::modal_title())
+                .title("Confirm delete")
+                .padding(Padding::uniform(1));
             let inner = outer.inner(area);
             f.render_widget(outer, area);
             let title = m
@@ -167,6 +181,15 @@ fn draw_modal(f: &mut Frame, app: &App) {
     }
 }
 
+/// Paint the entire frame with `theme::backdrop` (round-3 item 1). Every
+/// modal branch below draws `Clear` over its own panel rect before drawing
+/// the panel, which resets that rect's modifiers/colors — so only the area
+/// outside the panel ends up dimmed.
+fn dim_backdrop(f: &mut Frame) {
+    let area = f.area();
+    f.buffer_mut().set_style(area, theme::backdrop());
+}
+
 /// Draw the edit/create modal from its shared pure geometry (`modal::edit_layout`
 /// — the same function `modal::step`'s mouse handling hit-tests against, so
 /// the drawn boxes and the clickable ones can never drift apart), render the
@@ -179,8 +202,11 @@ fn draw_edit_modal(f: &mut Frame, m: &modal::EditModal) {
 
     f.render_widget(Clear, layout.outer);
     let outer = Block::bordered()
+        .style(theme::modal_panel_style())
         .border_style(theme::modal_border())
-        .title(if is_edit { "Edit item" } else { "New item" });
+        .title_style(theme::modal_title())
+        .title(if is_edit { "Edit item" } else { "New item" })
+        .padding(Padding::uniform(1));
     f.render_widget(outer, layout.outer);
 
     f.render_widget(&m.title, layout.title);
@@ -244,8 +270,11 @@ fn draw_viewer(f: &mut Frame, title: &str, text: &str, scroll: u16) {
             .style(theme::normal_text())
             .block(
                 Block::bordered()
+                    .style(theme::modal_panel_style())
                     .border_style(theme::modal_border())
-                    .title(title.to_string()),
+                    .title_style(theme::modal_title())
+                    .title(title.to_string())
+                    .padding(Padding::uniform(1)),
             )
             .scroll((scroll, 0)),
         area,
@@ -296,7 +325,7 @@ mod tests {
     use crate::feed::State;
     use crate::tui::app::{Action, App, ItemKey, Row};
     use crate::tui::socket::{AgentInfo, AgentStatus, FakeHerdr};
-    use crate::tui::test_util::{render_cursor, render_to_strings};
+    use crate::tui::test_util::{render_buffer, render_cursor, render_to_strings};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     fn test_cfg() -> SidebarConfig {
@@ -552,5 +581,111 @@ mod tests {
         let rows = render_to_strings(&app, 60, 20);
         let joined = rows.join("\n");
         assert!(joined.contains(modal::DELETE_LABEL), "got:\n{joined}");
+    }
+
+    // --- Round-3 item 1: dimmed-backdrop modal overlay ---------------------
+    //
+    // Every modal is a true overlay now: the whole frame is repainted as a
+    // dimmed backdrop (Modifier::DIM + theme::BASE bg) before the panel is
+    // drawn, and the panel itself gets a solid, undimmed background
+    // (theme::MANTLE) with a Surface1 border — so the panel never carries
+    // the backdrop's dim, and everything drawn inside it (buttons,
+    // textareas) inherits the panel's own background.
+
+    #[test]
+    fn edit_modal_overlay_dims_backdrop_paints_panel_and_propagates_bg_to_buttons() {
+        let mut app = app_with(SAMPLE);
+        app.apply(Action::OpenCreate);
+        let (w, h) = (60, 20);
+        let buf = render_buffer(&app, w, h);
+        let layout = modal::edit_layout(Rect::new(0, 0, w, h), false);
+
+        // Top-left corner is outside the centered 90%x80% panel.
+        let outside = &buf[(0, 0)];
+        assert!(
+            outside.modifier.contains(Modifier::DIM),
+            "cell outside the panel must be dimmed"
+        );
+        assert_eq!(outside.bg, theme::BASE);
+
+        let border_cell = &buf[(layout.outer.x, layout.outer.y)];
+        assert!(
+            !border_cell.modifier.contains(Modifier::DIM),
+            "panel border must not carry the backdrop's dim"
+        );
+        assert_eq!(border_cell.fg, theme::SURFACE1);
+        assert_eq!(border_cell.bg, theme::MANTLE);
+
+        let save_cell = &buf[(layout.save.x, layout.save.y)];
+        assert!(
+            !save_cell.modifier.contains(Modifier::DIM),
+            "buttons must not carry the backdrop's dim"
+        );
+        assert_eq!(
+            save_cell.bg,
+            theme::MANTLE,
+            "buttons must inherit the panel's own background"
+        );
+    }
+
+    #[test]
+    fn confirm_delete_modal_dims_backdrop_and_paints_its_own_panel() {
+        let mut app = app_with(SAMPLE);
+        app.apply(Action::OpenEdit(ItemKey {
+            title: "Fix auth redirect loop".into(),
+            state: State::Open,
+        }));
+        let (w, h) = (60, 20);
+        app.handle_modal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            (w, h),
+        );
+        assert!(matches!(app.modal, Modal::ConfirmDelete(_)));
+
+        let buf = render_buffer(&app, w, h);
+        let outer = modal::centered(Rect::new(0, 0, w, h), 80, 20);
+
+        assert!(buf[(0, 0)].modifier.contains(Modifier::DIM));
+        let border_cell = &buf[(outer.x, outer.y)];
+        assert!(!border_cell.modifier.contains(Modifier::DIM));
+        assert_eq!(border_cell.fg, theme::SURFACE1);
+        assert_eq!(border_cell.bg, theme::MANTLE);
+    }
+
+    #[test]
+    fn done_view_modal_dims_backdrop_and_paints_its_own_panel() {
+        let mut app = app_with(SAMPLE);
+        app.apply(Action::OpenDoneView);
+        let (w, h) = (60, 20);
+        let buf = render_buffer(&app, w, h);
+        let outer = modal::centered(Rect::new(0, 0, w, h), 90, 80);
+
+        assert!(buf[(0, 0)].modifier.contains(Modifier::DIM));
+        let border_cell = &buf[(outer.x, outer.y)];
+        assert!(!border_cell.modifier.contains(Modifier::DIM));
+        assert_eq!(border_cell.fg, theme::SURFACE1);
+        assert_eq!(border_cell.bg, theme::MANTLE);
+    }
+
+    #[test]
+    fn file_view_modal_dims_backdrop_and_paints_its_own_panel() {
+        let mut app = app_with(SAMPLE);
+        app.apply(Action::OpenFileView);
+        let (w, h) = (60, 20);
+        let buf = render_buffer(&app, w, h);
+        let outer = modal::centered(Rect::new(0, 0, w, h), 90, 80);
+
+        assert!(buf[(0, 0)].modifier.contains(Modifier::DIM));
+        let border_cell = &buf[(outer.x, outer.y)];
+        assert!(!border_cell.modifier.contains(Modifier::DIM));
+        assert_eq!(border_cell.fg, theme::SURFACE1);
+        assert_eq!(border_cell.bg, theme::MANTLE);
+    }
+
+    #[test]
+    fn no_dim_applied_when_no_modal_active() {
+        let app = app_with(SAMPLE);
+        let buf = render_buffer(&app, 60, 20);
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::DIM));
     }
 }

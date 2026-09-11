@@ -11,12 +11,16 @@ use crate::feed::State;
 use crate::tui::socket::AgentStatus;
 use ratatui::style::{Color, Modifier, Style};
 
-/// Reserved for a future bordered (non-modal) panel — the sidebar's own
-/// list/toolbar area has no `Block` border today, but the palette defines
-/// this per spec so a config theme (or a later bordered-panel change) has
-/// it ready without re-deriving the color.
-#[allow(dead_code)]
+/// Modal borders (round-3 item 1 gave this its first real use — see
+/// `modal_border`).
 pub const SURFACE1: Color = Color::Rgb(0x45, 0x47, 0x5a);
+/// Sidebar's own background — the dimmed backdrop behind an open modal
+/// (round-3 item 1) is painted with this.
+pub const BASE: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
+/// Modal panel background — one shade darker than `BASE`, so an open modal
+/// reads as a solid, undimmed panel sitting on top of the dimmed sidebar
+/// (round-3 item 1), matching herdr's own overlay style.
+pub const MANTLE: Color = Color::Rgb(0x18, 0x18, 0x25);
 pub const TEXT: Color = Color::Rgb(0xcd, 0xd6, 0xf4);
 pub const LAVENDER: Color = Color::Rgb(0xb4, 0xbe, 0xfe);
 pub const YELLOW: Color = Color::Rgb(0xf9, 0xe2, 0xaf);
@@ -77,9 +81,33 @@ pub fn agent_status(status: AgentStatus) -> Style {
     }
 }
 
-/// Modal and viewer chrome borders.
+/// Modal and viewer chrome borders (round-3 item 1: Surface1, not the
+/// louder Lavender focus accent — the title carries Lavender instead, see
+/// `modal_title`).
 pub fn modal_border() -> Style {
-    Style::default().fg(LAVENDER)
+    Style::default().fg(SURFACE1)
+}
+
+/// Modal/viewer titles — the one place Lavender still calls out an open
+/// modal, bold so it reads as the panel's name at a glance.
+pub fn modal_title() -> Style {
+    Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD)
+}
+
+/// Solid panel background for an open modal/viewer (round-3 item 1) — set
+/// on the panel's outer `Block` so border, title, and every widget drawn
+/// inside (textareas, buttons, body text) inherit it automatically, and so
+/// the panel reads as undimmed against the backdrop (see `backdrop`).
+pub fn modal_panel_style() -> Style {
+    Style::default().bg(MANTLE)
+}
+
+/// Dimmed-backdrop style painted over the whole frame before an open
+/// modal's panel is drawn (round-3 item 1) — the panel itself is drawn with
+/// `Clear` first, which resets modifiers/colors within its own rect, so
+/// only the area outside the panel ends up dimmed.
+pub fn backdrop() -> Style {
+    Style::default().bg(BASE).add_modifier(Modifier::DIM)
 }
 
 /// Edit/create modal `[ Save ]` / `[ Cancel ]` / `[ Delete ]` buttons —
@@ -90,5 +118,36 @@ pub fn button(focused: bool) -> Style {
         Style::default().fg(TEXT).add_modifier(Modifier::REVERSED)
     } else {
         normal_text()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modal_border_uses_surface1() {
+        assert_eq!(modal_border(), Style::default().fg(SURFACE1));
+    }
+
+    #[test]
+    fn modal_title_is_bold_lavender() {
+        assert_eq!(
+            modal_title(),
+            Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn modal_panel_style_has_mantle_background() {
+        assert_eq!(modal_panel_style(), Style::default().bg(MANTLE));
+    }
+
+    #[test]
+    fn backdrop_dims_over_a_base_background() {
+        assert_eq!(
+            backdrop(),
+            Style::default().bg(BASE).add_modifier(Modifier::DIM)
+        );
     }
 }

@@ -14,7 +14,7 @@ use crate::tui::app::ItemKey;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
-use ratatui::widgets::Block;
+use ratatui::widgets::{Block, Padding};
 use tui_textarea::{CursorMove, TextArea};
 
 pub enum Modal {
@@ -177,9 +177,12 @@ pub(crate) fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
 }
 
 /// Pure geometry for the edit/create modal, given the full terminal area.
+/// One cell of inner padding (round-3 item 1) — the same padding
+/// `view::draw_edit_modal`'s `Block` is drawn with, so the visual panel and
+/// this hit-tested geometry can never drift apart.
 pub fn edit_layout(term_area: Rect, is_edit: bool) -> EditLayout {
     let outer = centered(term_area, 90, 80);
-    let inner = Block::bordered().inner(outer);
+    let inner = Block::bordered().padding(Padding::uniform(1)).inner(outer);
     let [title, body, buttons, hints] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(3),

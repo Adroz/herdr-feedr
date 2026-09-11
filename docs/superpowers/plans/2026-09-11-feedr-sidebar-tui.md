@@ -1747,6 +1747,12 @@ git commit -m "feat: sidebar actions — advance/sweep/agent-click via fresh-rea
 
 ---
 
+> **Plan amendment (Task 7 review):** `with_feed`'s closure now signals
+> whether it mutated the document; saves happen only on mutation, and a feed
+> file missing mid-action drops the action (status message) instead of
+> persisting an empty document. Tasks 9/10/11 build on these semantics —
+> repo code is authoritative over any older `with_feed` snippets below.
+
 ### Task 8: ops extensions — edit, remove, add_in_section
 
 **Files:**

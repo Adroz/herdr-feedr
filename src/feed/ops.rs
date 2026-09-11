@@ -176,6 +176,112 @@ fn agent_section_end(doc: &Document) -> Option<usize> {
     Some(end)
 }
 
+pub fn set_state(
+    doc: &mut Document,
+    index: usize,
+    state: State,
+    by: Authority,
+) -> Result<(), OpError> {
+    if state == State::Done && by == Authority::Agent && zone_of(doc, index) == Zone::Human {
+        return Err(OpError::NotAuthorised);
+    }
+    if let Node::Item(it) = &mut doc.nodes[index] {
+        it.state = state;
+    }
+    Ok(())
+}
+
+/// Section name an item sits under, for mirroring in the Done archive.
+fn section_name(doc: &Document, index: usize) -> String {
+    let mut name = "Feed".to_string();
+    for node in &doc.nodes[..index] {
+        match node {
+            Node::Heading { level: 1, text } => name = text.clone(),
+            Node::Heading { level: 2, text } => name = text.clone(),
+            _ => {}
+        }
+    }
+    name
+}
+
+/// Manual archive/cleanup pass: active `[x]` human items are moved under
+/// `# Done` into a mirrored `##` section and stamped `@done(date)`; active
+/// `[x]` agent-zone items are deleted outright; everything else is left
+/// untouched.
+pub fn sweep(doc: &mut Document, today: &str) {
+    let done_items: Vec<usize> = doc
+        .nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| match n {
+            Node::Item(it) if it.state == State::Done && zone_of(doc, i) != Zone::Archive => {
+                Some(i)
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut archived: Vec<(String, Item)> = Vec::new();
+    for &i in done_items.iter().rev() {
+        let zone = zone_of(doc, i);
+        let section = section_name(doc, i);
+        if let Node::Item(item) = doc.nodes.remove(i) {
+            if zone == Zone::Human {
+                let mut item = item;
+                item.done_date = Some(today.to_string());
+                archived.push((section, item));
+            }
+        }
+    }
+    archived.reverse();
+
+    if archived.is_empty() {
+        return;
+    }
+
+    let done_at = doc.nodes.iter().position(
+        |n| matches!(n, Node::Heading { level: 1, text } if text.eq_ignore_ascii_case("Done")),
+    );
+    let done_at = done_at.unwrap_or_else(|| {
+        doc.nodes.push(Node::Raw(String::new()));
+        doc.nodes.push(Node::Heading {
+            level: 1,
+            text: "Done".into(),
+        });
+        doc.nodes.len() - 1
+    });
+
+    for (section, item) in archived {
+        let mut insert_at = doc.nodes.len();
+        let mut found = false;
+        let mut i = done_at + 1;
+        while i < doc.nodes.len() {
+            match &doc.nodes[i] {
+                Node::Heading { level: 2, text } if text.eq_ignore_ascii_case(&section) => {
+                    found = true;
+                    let mut j = i + 1;
+                    while j < doc.nodes.len() && !matches!(doc.nodes[j], Node::Heading { .. }) {
+                        j += 1;
+                    }
+                    insert_at = j;
+                    break;
+                }
+                _ => i += 1,
+            }
+        }
+        if !found {
+            doc.nodes.push(Node::Raw(String::new()));
+            doc.nodes.push(Node::Heading {
+                level: 2,
+                text: section,
+            });
+            doc.nodes.push(Node::Raw(String::new()));
+            insert_at = doc.nodes.len();
+        }
+        doc.nodes.insert(insert_at, Node::Item(item));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,5 +390,68 @@ mod tests {
             Node::Item(it) => assert_eq!(it.body, vec!["one", "two"]),
             n => panic!("expected item, got {n:?}"),
         }
+    }
+
+    #[test]
+    fn review_sets_question_state() {
+        let mut doc = parse(SAMPLE);
+        let i = find(&doc, "auth").unwrap();
+        set_state(&mut doc, i, State::Review, Authority::Agent).unwrap();
+        assert!(render(&doc).contains("- [?] Fix auth redirect loop"));
+    }
+
+    #[test]
+    fn agent_cannot_close_human_item() {
+        let mut doc = parse(SAMPLE);
+        let i = find(&doc, "auth").unwrap();
+        let err = set_state(&mut doc, i, State::Done, Authority::Agent).unwrap_err();
+        assert!(matches!(err, OpError::NotAuthorised));
+    }
+
+    #[test]
+    fn agent_can_close_agent_item_and_human_can_close_anything() {
+        let mut doc = parse(SAMPLE);
+        let i = find(&doc, "deploy").unwrap();
+        set_state(&mut doc, i, State::Done, Authority::Agent).unwrap();
+        let i = find(&doc, "auth").unwrap();
+        set_state(&mut doc, i, State::Done, Authority::Human).unwrap();
+        let out = render(&doc);
+        assert!(out.contains("- [x] Add retry to deploy test"));
+        assert!(out.contains("- [x] Fix auth redirect loop"));
+    }
+
+    #[test]
+    fn sweep_archives_human_done_and_deletes_agent_done() {
+        let text = "\
+# Feed
+
+- [x] Shipped thing
+  Evidence: PR #9.
+- [ ] Still open
+- [?] Awaiting review
+
+## Agent
+
+- [x] Agent chore
+
+# Done
+
+## Feed
+
+- [x] Older thing @done(2026-09-01)
+";
+        let mut doc = parse(text);
+        sweep(&mut doc, "2026-09-11");
+        let out = render(&doc);
+        // Human [x] moved to Done under mirrored section, body kept, stamped.
+        assert!(out.contains("# Done"));
+        assert!(out.contains("- [x] Shipped thing @done(2026-09-11)\n  Evidence: PR #9.\n"));
+        // Moved, not copied; [ ] and [?] untouched; agent [x] deleted.
+        assert_eq!(out.matches("Shipped thing").count(), 1);
+        assert!(out.find("Shipped thing").unwrap() > out.find("# Done").unwrap());
+        assert!(out.contains("- [ ] Still open"));
+        assert!(out.contains("- [?] Awaiting review"));
+        assert!(!out.contains("Agent chore"));
+        assert!(out.contains("@done(2026-09-01)"));
     }
 }

@@ -721,7 +721,9 @@ pub fn add(doc: &mut Document, title: &str, body: &[String], zone: Zone) {
         title: title.to_string(),
         agent: None,
         done_date: None,
-        body: body.to_vec(),
+        // Filter empty lines per the Item.body invariant (empty body lines
+        // break lossless round-tripping).
+        body: body.iter().filter(|l| !l.is_empty()).cloned().collect(),
     });
     let insert_at = match zone {
         Zone::Human => end_of_first_human_section(doc),
@@ -745,24 +747,45 @@ pub fn add(doc: &mut Document, title: &str, body: &[String], zone: Zone) {
     doc.nodes.insert(insert_at, item);
 }
 
-/// Index just past the last item (or heading) of the first human region.
+/// Insertion index for a new human item: just past the last item of the first
+/// non-empty human region, or — when no human items exist yet — directly
+/// before the boundary heading (`## Agent` / `# Done`), stepping back over a
+/// single preceding blank line; end of document when there is no boundary.
+/// (An earlier draft searched globally for the first item as a fallback,
+/// which inserted into ## Agent / # Done on post-sweep feeds — review-caught.)
 fn end_of_first_human_section(doc: &Document) -> usize {
-    let mut end = 0;
+    let mut last_item_end = 0usize;
+    let mut boundary: Option<usize> = None;
     for (i, n) in doc.nodes.iter().enumerate() {
         match n {
-            Node::Heading { level: 2, text } if text.eq_ignore_ascii_case("Agent") => break,
-            Node::Heading { level: 1, text } if text.eq_ignore_ascii_case("Done") => break,
-            Node::Heading { level: 2, .. } if end > 0 => break, // next human section
-            Node::Item(_) => end = i + 1,
+            Node::Heading { level: 2, text } if text.eq_ignore_ascii_case("Agent") => {
+                boundary = Some(i);
+                break;
+            }
+            Node::Heading { level: 1, text } if text.eq_ignore_ascii_case("Done") => {
+                boundary = Some(i);
+                break;
+            }
+            Node::Heading { level: 2, .. } if last_item_end > 0 => {
+                boundary = Some(i);
+                break;
+            }
+            Node::Item(_) => last_item_end = i + 1,
             _ => {}
         }
     }
-    if end == 0 {
-        // No items yet: insert after leading headings/blank raws.
-        doc.nodes.iter().position(|n| matches!(n, Node::Item(_)))
-            .unwrap_or_else(|| doc.nodes.iter().take_while(|n| !matches!(n, Node::Heading { level: 2, .. })).count())
-    } else {
-        end
+    if last_item_end > 0 {
+        return last_item_end;
+    }
+    match boundary {
+        Some(b) => {
+            if b > 0 && matches!(&doc.nodes[b - 1], Node::Raw(s) if s.is_empty()) {
+                b - 1
+            } else {
+                b
+            }
+        }
+        None => doc.nodes.len(),
     }
 }
 

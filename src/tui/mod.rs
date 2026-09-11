@@ -1,4 +1,5 @@
 pub mod app;
+pub mod dock;
 pub mod input;
 pub mod modal;
 pub mod socket;
@@ -56,8 +57,20 @@ pub fn run(feed_path: PathBuf, cfg: SidebarConfig) -> Result<()> {
         Box::new(socket::UnixSocketClient::from_env()),
     );
     app.reload();
+    // Seed initial agent statuses synchronously (via the same Herdr trait
+    // the rest of the app uses) so glyphs aren't blank for the ~seconds it
+    // takes spawn_event_thread's background subscriber to land its first
+    // resync; on failure (herdr absent) this is a no-op — the background
+    // thread's own SocketDown/degrade path still applies.
+    if let Ok(agents) = app.herdr.list_agents() {
+        app.on_event(AppEvent::Agents(agents));
+    }
 
     let mut terminal = ratatui::init();
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::SetTitle(dock::PANE_TITLE_MARKER)
+    );
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let res = event_loop(&mut terminal, &mut app, &rx);
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);

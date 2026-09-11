@@ -181,5 +181,5 @@ fn sidebar_subcommand_is_wired() {
     cmd.args(["sidebar", "--help"])
         .assert()
         .success()
-        .stdout(contains("sidebar"));
+        .stdout(contains("--dock"));
 }

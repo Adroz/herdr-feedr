@@ -55,7 +55,11 @@ enum Cmd {
     /// Archive human [x] items under "# Done"; delete agent [x] items
     Sweep,
     /// Launch the sidebar TUI in this terminal
-    Sidebar,
+    Sidebar {
+        /// Dock a sidebar pane into herdr (idempotent open-or-focus), then exit
+        #[arg(long)]
+        dock: bool,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -67,8 +71,15 @@ pub fn run() -> Result<()> {
             .map(PathBuf::from),
         &config::default_config_dir(),
     );
-    if matches!(&cli.command, Cmd::Sidebar) {
+    if let Cmd::Sidebar { dock } = &cli.command {
         let cfg = config::load_sidebar_config(&config::default_config_dir());
+        if *dock {
+            let mut runner = crate::tui::dock::HerdrCli::from_env();
+            let mut client = crate::tui::socket::UnixSocketClient::from_env();
+            let msg = crate::tui::dock::dock(&mut runner, &mut client, &cfg)?;
+            println!("{msg}");
+            return Ok(());
+        }
         return crate::tui::run(path, cfg);
     }
     let text = match std::fs::read_to_string(&path) {
@@ -150,7 +161,7 @@ pub fn run() -> Result<()> {
             ops::sweep(&mut doc, &today);
             write::save_atomic(&doc, &path)?;
         }
-        Cmd::Sidebar => {
+        Cmd::Sidebar { .. } => {
             unreachable!()
         }
     }

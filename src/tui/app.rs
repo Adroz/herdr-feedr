@@ -166,6 +166,8 @@ pub struct App {
     /// env mutation racing parallel tests).
     pub editor_cmd: Option<String>,
     editor_request: Option<PathBuf>,
+    /// Our own herdr pane id (env HERDR_PANE_ID), when running inside herdr.
+    pub herdr_pane_id: Option<String>,
 }
 
 impl App {
@@ -185,6 +187,9 @@ impl App {
             modal: Modal::None,
             editor_cmd: std::env::var("EDITOR").ok().filter(|e| !e.is_empty()),
             editor_request: None,
+            herdr_pane_id: std::env::var("HERDR_PANE_ID")
+                .ok()
+                .filter(|p| !p.is_empty()),
         }
     }
 
@@ -252,7 +257,20 @@ impl App {
         self.status_msg = None;
         match action {
             Action::Quit => self.should_quit = true,
-            Action::ToggleCollapse => self.collapsed = !self.collapsed,
+            Action::ToggleCollapse => {
+                self.collapsed = !self.collapsed;
+                // Best-effort real pane resize; outside herdr there is no
+                // pane id and the rendered rail alone carries the collapse.
+                if let Some(pane) = self.herdr_pane_id.clone() {
+                    let mut runner = crate::tui::dock::HerdrCli::from_env();
+                    let _ = crate::tui::dock::resize_for_collapse(
+                        &mut runner,
+                        &self.cfg,
+                        self.collapsed,
+                        &pane,
+                    );
+                }
+            }
             Action::ScrollUp => self.scroll = self.scroll.saturating_sub(1),
             Action::ScrollDown => {
                 let max = self.rows.len().saturating_sub(1);

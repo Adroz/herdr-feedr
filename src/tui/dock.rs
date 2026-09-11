@@ -62,7 +62,14 @@ pub fn dock(runner: &mut dyn Runner, herdr: &mut dyn Herdr, cfg: &SidebarConfig)
     .context("no pane_id in `herdr pane split` output")?;
     // `herdr pane send-text --help` (0.9.0): positional `<PANE_ID> <TEXT>`,
     // not the --pane/--text flags the plan assumed — adapted here.
-    runner.run(&["pane", "send-text", &pane_id, "exec feedr sidebar\n"])?;
+    if let Err(e) = runner.run(&["pane", "send-text", &pane_id, "exec feedr sidebar\n"]) {
+        // Best-effort cleanup: the split succeeded but the pane never got the
+        // sidebar exec'd into it, so it's an orphan empty shell pane. Ignore
+        // the close result (nothing more useful to do if it fails too) and
+        // propagate the original error.
+        let _ = runner.run(&["pane", "close", &pane_id]);
+        return Err(e);
+    }
     if cfg.side == Side::Left {
         for _ in 0..6 {
             if runner
@@ -112,7 +119,11 @@ fn find_sidebar_pane(pane_list_stdout: &str) -> Option<String> {
             .get("terminal_title_stripped")
             .or_else(|| e.get("terminal_title"))?
             .as_str()?;
-        if title.contains(PANE_TITLE_MARKER) {
+        // Exact match, not `contains` — the running sidebar sets its title
+        // to exactly PANE_TITLE_MARKER (mod.rs's SetTitle call), so an exact
+        // check can't be fooled by e.g. an editor session on a file named
+        // "feedr-sidebar-notes.md" (Task 13 review rider).
+        if title == PANE_TITLE_MARKER {
             Some(e.get("pane_id")?.as_str()?.to_string())
         } else {
             None
@@ -241,6 +252,42 @@ mod tests {
                 "pane split --direction right",
                 "pane send-text w1:p9 exec feedr sidebar\n",
                 "pane resize --direction right --amount 0.18 --pane w1:p9",
+            ]
+        );
+    }
+
+    #[test]
+    fn find_sidebar_pane_requires_exact_marker_match() {
+        // A pane titled by e.g. an editor session on a file whose name
+        // happens to contain the marker string must NOT be mistaken for the
+        // running sidebar (rider on Task 13 review). Put the false-positive
+        // candidate first so a `.contains()`-based match would pick it.
+        let list = r#"{"id":"x","result":{"panes":[
+            {"pane_id":"w1:p1","terminal_title_stripped":"vim feedr-sidebar-notes.md"},
+            {"pane_id":"w1:p2","terminal_title_stripped":"feedr-sidebar"}]}}"#;
+        assert_eq!(find_sidebar_pane(list), Some("w1:p2".to_string()));
+    }
+
+    #[test]
+    fn dock_closes_orphan_pane_when_send_text_fails() {
+        let empty = r#"{"id":"cli:pane:list","result":{"panes":[]}}"#;
+        let split = r#"{"id":"cli:pane:split","result":{"pane_id":"w1:p9"}}"#;
+        let mut runner = FakeRunner::new(vec![
+            Ok(empty.into()),
+            Ok(split.into()),
+            Err(anyhow::anyhow!("send-text failed")),
+            Ok(String::new()), // pane close — result ignored
+        ]);
+        let mut herdr = FakeHerdr::default();
+        let result = dock(&mut runner, &mut herdr, &cfg(Side::Left));
+        assert!(result.is_err());
+        assert_eq!(
+            runner.calls,
+            [
+                "pane list",
+                "pane split --direction right",
+                "pane send-text w1:p9 exec feedr sidebar\n",
+                "pane close w1:p9",
             ]
         );
     }

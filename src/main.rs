@@ -1,6 +1,10 @@
+mod cli;
 mod config;
 mod feed;
 
 fn main() {
-    println!("feedr");
+    if let Err(e) = cli::run() {
+        eprintln!("feedr: {e}");
+        std::process::exit(1);
+    }
 }

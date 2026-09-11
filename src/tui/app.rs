@@ -281,14 +281,34 @@ impl App {
             Action::OpenEdit(key) => {
                 if let Some(i) = relocate(&self.doc, &key) {
                     if let Node::Item(it) = &self.doc.nodes[i] {
-                        self.modal = Modal::Edit(EditModal::edit(key, it));
+                        self.set_modal(Modal::Edit(EditModal::edit(key, it)));
                     }
                 }
             }
-            Action::OpenCreate => self.modal = Modal::Edit(EditModal::create()),
-            Action::OpenDoneView => self.modal = Modal::DoneView { scroll: 0 },
-            Action::OpenFileView => self.modal = Modal::FileView { scroll: 0 },
+            Action::OpenCreate => self.set_modal(Modal::Edit(EditModal::create())),
+            Action::OpenDoneView => self.set_modal(Modal::DoneView { scroll: 0 }),
+            Action::OpenFileView => self.set_modal(Modal::FileView { scroll: 0 }),
             Action::OpenEditor => self.request_editor(),
+        }
+    }
+
+    /// Set the active modal, zooming the sidebar's herdr pane to fill the
+    /// whole tab the moment a modal actually opens (round-2 item 4).
+    /// `handle_modal_event` is the mirror-image close path.
+    fn set_modal(&mut self, modal: Modal) {
+        self.modal = modal;
+        self.zoom(true);
+    }
+
+    /// Best-effort `pane.zoom`: outside herdr (no pane id discovered yet)
+    /// this is a no-op — the modal simply stays in-pane. A herdr call that
+    /// fails (socket down, etc.) degrades silently to a status message at
+    /// most; it never blocks opening or closing the modal.
+    fn zoom(&mut self, on: bool) {
+        if let Some(pane) = self.herdr_pane_id.clone() {
+            if let Err(e) = self.herdr.zoom_pane(&pane, on) {
+                self.status_msg = Some(format!("zoom: {e}"));
+            }
         }
     }
 
@@ -359,6 +379,13 @@ impl App {
                 Modal::None
             }
         };
+        // Round-2 item 4: the modal fully closed this step (Save/Cancel/Esc/
+        // viewer close/confirmed delete) — unzoom. A transition that stays
+        // inside the modal lifecycle (e.g. ConfirmDelete <-> Edit) must not
+        // toggle zoom again.
+        if matches!(self.modal, Modal::None) {
+            self.zoom(false);
+        }
     }
 
     fn save_modal(&mut self, m: EditModal) -> Modal {
@@ -1055,5 +1082,125 @@ mod tests {
         app.apply(Action::OpenEditor);
         assert_eq!(app.take_editor_request(), None);
         assert!(app.status_msg.as_deref().unwrap().contains("$EDITOR"));
+    }
+
+    // --- Round-2 item 4: modal auto-zoom -----------------------------------
+    //
+    // When the sidebar knows its own herdr pane id, opening any modal
+    // (edit/create/DoneView/FileView) zooms that pane to fill the whole
+    // tab; closing it (Save/Cancel/Esc/viewer close) unzooms. Outside herdr
+    // (no pane id) it's a no-op — the modal stays in-pane.
+
+    #[test]
+    fn create_modal_zooms_pane_on_open_and_off_on_cancel() {
+        let (mut app, fake, _dir) = app_on_disk("- [ ] A\n");
+        app.herdr_pane_id = Some("w1:p1".into());
+        app.apply(Action::OpenCreate);
+        assert_eq!(fake.log.borrow().as_slice(), ["zoom_pane w1:p1 on"]);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.modal_active());
+        assert_eq!(
+            fake.log.borrow().as_slice(),
+            ["zoom_pane w1:p1 on", "zoom_pane w1:p1 off"]
+        );
+    }
+
+    #[test]
+    fn edit_modal_zooms_pane_on_open_and_off_on_save() {
+        let (mut app, fake, _dir) = app_on_disk("- [ ] A\n");
+        app.herdr_pane_id = Some("w1:p1".into());
+        app.apply(Action::OpenEdit(ItemKey {
+            title: "A".into(),
+            state: State::Open,
+        }));
+        assert_eq!(fake.log.borrow().as_slice(), ["zoom_pane w1:p1 on"]);
+        press_ctrl(&mut app, 's');
+        assert!(!app.modal_active());
+        assert_eq!(
+            fake.log.borrow().as_slice(),
+            ["zoom_pane w1:p1 on", "zoom_pane w1:p1 off"]
+        );
+    }
+
+    #[test]
+    fn viewer_modals_zoom_pane_on_open_and_off_on_close() {
+        let (mut app, fake, _dir) = app_on_disk("- [ ] A\n");
+        app.herdr_pane_id = Some("w1:p1".into());
+
+        app.apply(Action::OpenDoneView);
+        assert_eq!(fake.log.borrow().as_slice(), ["zoom_pane w1:p1 on"]);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            fake.log.borrow().as_slice(),
+            ["zoom_pane w1:p1 on", "zoom_pane w1:p1 off"]
+        );
+
+        fake.log.borrow_mut().clear();
+        app.apply(Action::OpenFileView);
+        assert_eq!(fake.log.borrow().as_slice(), ["zoom_pane w1:p1 on"]);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            fake.log.borrow().as_slice(),
+            ["zoom_pane w1:p1 on", "zoom_pane w1:p1 off"]
+        );
+    }
+
+    /// The ConfirmDelete sub-state stays inside the same "modal open"
+    /// lifecycle — entering/backing out of it must not toggle zoom again;
+    /// only the eventual transition to `Modal::None` (confirmed delete)
+    /// unzooms.
+    #[test]
+    fn confirm_delete_substate_does_not_toggle_zoom() {
+        let (mut app, fake, _dir) = app_on_disk("- [ ] Doomed\n");
+        app.herdr_pane_id = Some("w1:p1".into());
+        app.apply(Action::OpenEdit(ItemKey {
+            title: "Doomed".into(),
+            state: State::Open,
+        }));
+        assert_eq!(fake.log.borrow().as_slice(), ["zoom_pane w1:p1 on"]);
+        press_ctrl(&mut app, 'd'); // -> ConfirmDelete
+        press(&mut app, KeyCode::Char('n')); // back out to Edit
+        assert!(matches!(app.modal, Modal::Edit(_)));
+        assert_eq!(
+            fake.log.borrow().as_slice(),
+            ["zoom_pane w1:p1 on"],
+            "no extra zoom toggles while staying inside the modal"
+        );
+        press_ctrl(&mut app, 'd');
+        press(&mut app, KeyCode::Char('y')); // confirm delete
+        assert!(!app.modal_active());
+        assert_eq!(
+            fake.log.borrow().as_slice(),
+            ["zoom_pane w1:p1 on", "zoom_pane w1:p1 off"]
+        );
+    }
+
+    #[test]
+    fn modal_zoom_is_noop_without_herdr_pane_id() {
+        let (mut app, fake, _dir) = app_on_disk("- [ ] A\n");
+        app.herdr_pane_id = None; // outside herdr / pane id not yet discovered
+        app.apply(Action::OpenCreate);
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            fake.log.borrow().is_empty(),
+            "no herdr calls when pane id absent"
+        );
+    }
+
+    #[test]
+    fn modal_zoom_failure_degrades_silently() {
+        let (mut app, _fake, _dir) = app_on_disk("- [ ] A\n");
+        app.herdr_pane_id = Some("w1:p1".into());
+        app.herdr = Box::new(FakeHerdr {
+            fail: true,
+            ..FakeHerdr::default()
+        });
+        app.apply(Action::OpenCreate);
+        assert!(app.modal_active(), "modal still opens even if zoom fails");
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            !app.modal_active(),
+            "modal still closes even if unzoom fails"
+        );
     }
 }

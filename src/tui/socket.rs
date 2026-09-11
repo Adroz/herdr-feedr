@@ -121,6 +121,11 @@ pub trait Herdr {
     /// agent binary.
     fn agent_start(&mut self, name: &str, kind: &str, pane_id: &str, args: &[String])
         -> Result<()>;
+    /// `pane.zoom {pane_id, mode}` — zoom (`on`) or unzoom (`off`) a pane to
+    /// fill its whole tab (round-2 item 4: auto-zoom the pane hosting a
+    /// modal). Explicit `on`/`off` is used rather than `toggle` so this is
+    /// idempotent regardless of the pane's current zoom state.
+    fn zoom_pane(&mut self, pane_id: &str, on: bool) -> Result<()>;
 
     /// Resume a session in a fresh tab (spec §3: @agent click with the pane
     /// gone): create a tab, then start the agent in its pane with the kind's
@@ -278,6 +283,14 @@ impl Herdr for UnixSocketClient {
         )?;
         Ok(())
     }
+    fn zoom_pane(&mut self, pane_id: &str, on: bool) -> Result<()> {
+        request(
+            &self.socket_path,
+            "pane.zoom",
+            serde_json::json!({"pane_id": pane_id, "mode": if on { "on" } else { "off" }}),
+        )?;
+        Ok(())
+    }
     // open_resume_tab: the trait's provided create_tab + agent_start
     // composition (Task 3) — no override needed.
 }
@@ -413,6 +426,16 @@ impl Herdr for FakeHerdr {
         self.log.borrow_mut().push(format!(
             "agent_start {name} {kind} {pane_id} {}",
             args.join(" ")
+        ));
+        Ok(())
+    }
+    fn zoom_pane(&mut self, pane_id: &str, on: bool) -> Result<()> {
+        if self.fail {
+            anyhow::bail!("herdr socket unavailable");
+        }
+        self.log.borrow_mut().push(format!(
+            "zoom_pane {pane_id} {}",
+            if on { "on" } else { "off" }
         ));
         Ok(())
     }
@@ -595,6 +618,30 @@ mod tests {
         assert!(seen[1].contains("\"kind\":\"claude\""));
         assert!(seen[1].contains("\"pane_id\":\"w1:p9\""));
         assert!(seen[1].contains("--resume"));
+    }
+
+    /// Round-2 item 4: `pane.zoom` verified live against herdr 0.9.0
+    /// (`herdr pane zoom --help` and `herdr api schema --json`) —
+    /// `PaneZoomParams { pane_id, mode: "toggle"|"on"|"off" }`. The sidebar
+    /// always sends an explicit `mode` ("on"/"off") rather than "toggle" so
+    /// zooming is idempotent regardless of the pane's current zoom state.
+    #[test]
+    fn live_client_zooms_pane_on_and_off() {
+        let ok = r#"{"id":"{id}","result":{"changed":true,"zoom_changed":true,"focus_changed":false,"pane_id":"w1:p3","focused_pane_id":"w1:p3","zoomed":true}}"#.to_string();
+        let (_dir, path, seen) = fake_server(vec![vec![ok.clone()], vec![ok]]);
+        let mut c = UnixSocketClient { socket_path: path };
+        c.zoom_pane("w1:p3", true).unwrap();
+        c.zoom_pane("w1:p3", false).unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "wire: {seen:?}");
+        assert!(
+            seen[0].contains("\"method\":\"pane.zoom\""),
+            "got: {}",
+            seen[0]
+        );
+        assert!(seen[0].contains("\"pane_id\":\"w1:p3\""));
+        assert!(seen[0].contains("\"mode\":\"on\""));
+        assert!(seen[1].contains("\"mode\":\"off\""));
     }
 
     #[test]

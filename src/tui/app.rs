@@ -140,6 +140,7 @@ pub fn section_choices(doc: &Document) -> Vec<SectionChoice> {
 /// whether `with_feed` bothers to save. Every dropped-action path (relocate
 /// miss, no-op sweep, etc.) must report `Unchanged` so a no-op click doesn't
 /// rewrite the file (and self-trigger the file watcher for nothing).
+#[derive(Debug)]
 pub enum Outcome {
     Changed(Option<String>),
     Unchanged(Option<String>),
@@ -251,16 +252,7 @@ impl App {
             Action::Sweep => {
                 let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                 self.with_feed(|doc| {
-                    let n = doc
-                        .nodes
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, node)| {
-                            matches!(node, Node::Item(it) if it.state == State::Done)
-                                && ops::zone_of(doc, *i) != Zone::Archive
-                        })
-                        .count();
-                    ops::sweep(doc, &today);
+                    let n = ops::sweep(doc, &today);
                     if n == 0 {
                         Ok(Outcome::Unchanged(Some("swept 0 item(s)".into())))
                     } else {
@@ -302,6 +294,7 @@ impl App {
     /// resume tab; herdr absent → status-line hint, feed untouched.
     fn agent_click(&mut self, key: ItemKey) {
         let Some(i) = relocate(&self.doc, &key) else {
+            self.status_msg = Some("item changed on disk — click dropped".into());
             return;
         };
         let Node::Item(it) = &self.doc.nodes[i] else {
@@ -572,6 +565,26 @@ mod tests {
                 "agent_start feedr-resume-abc claude w9:p9 --resume abc",
             ]
         );
+    }
+
+    /// Task 7 review follow-up: a relocate miss on agent-click must report a
+    /// status message, matching advance's policy, instead of silently
+    /// dropping the click.
+    #[test]
+    fn agent_click_relocate_miss_sets_status_message() {
+        let (mut app, _fake, _dir) = app_on_disk("- [~] Beta @agent(claude:abc)\n");
+        // Simulate the row changing underneath a stale click, in memory —
+        // agent_click reads self.doc directly, it doesn't go through with_feed:
+        app.doc = parse("- [ ] Beta\n");
+        app.apply(Action::AgentClick(ItemKey {
+            title: "Beta".into(),
+            state: State::InProgress,
+        }));
+        assert!(app
+            .status_msg
+            .as_deref()
+            .unwrap()
+            .contains("changed on disk"));
     }
 
     #[test]

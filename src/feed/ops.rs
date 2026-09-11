@@ -175,12 +175,19 @@ fn end_of_first_human_section(doc: &Document) -> usize {
 }
 
 fn agent_section_end(doc: &Document) -> Option<usize> {
-    let start = doc.nodes.iter().position(
-        |n| matches!(n, Node::Heading { level: 2, text } if text.eq_ignore_ascii_case("Agent")),
-    )?;
-    if zone_of(doc, start) == Zone::Archive {
-        return None;
-    }
+    named_section_end(doc, "Agent")
+}
+
+/// Index just past the last item of the active `## <name>` section.
+fn named_section_end(doc: &Document, name: &str) -> Option<usize> {
+    let start = doc.nodes.iter().enumerate().find_map(|(i, n)| match n {
+        Node::Heading { level: 2, text }
+            if text.eq_ignore_ascii_case(name) && zone_of(doc, i) != Zone::Archive =>
+        {
+            Some(i)
+        }
+        _ => None,
+    })?;
     let mut end = start + 1;
     for (i, n) in doc.nodes.iter().enumerate().skip(start + 1) {
         match n {
@@ -190,6 +197,52 @@ fn agent_section_end(doc: &Document) -> Option<usize> {
         }
     }
     Some(end)
+}
+
+/// Replace an item's title and body in place; state, agent tag, and done
+/// stamp are untouched. Body goes through the same blank-edge trimming as add.
+pub fn edit(doc: &mut Document, index: usize, title: &str, body: &[String]) {
+    debug_assert!(matches!(doc.nodes[index], Node::Item(_)));
+    if let Node::Item(it) = &mut doc.nodes[index] {
+        it.title = title.to_string();
+        it.body = trim_blank_edges(body);
+    }
+}
+
+/// Delete an item (its body lives inside the Item node, so one removal takes
+/// both). Returns the removed item, or None if the index isn't an item.
+pub fn remove(doc: &mut Document, index: usize) -> Option<Item> {
+    match doc.nodes.get(index) {
+        Some(Node::Item(_)) => match doc.nodes.remove(index) {
+            Node::Item(it) => Some(it),
+            _ => unreachable!(),
+        },
+        _ => None,
+    }
+}
+
+/// Add an open item at the end of the named active `##` section (the sidebar
+/// modal's section picker). Errors when no such active section exists —
+/// archive (`# Done`) subsections never match.
+pub fn add_in_section(
+    doc: &mut Document,
+    title: &str,
+    body: &[String],
+    section: &str,
+) -> Result<(), OpError> {
+    let end = named_section_end(doc, section)
+        .ok_or_else(|| OpError::NotFound(format!("section {section}")))?;
+    doc.nodes.insert(
+        end,
+        Node::Item(Item {
+            state: State::Open,
+            title: title.to_string(),
+            agent: None,
+            done_date: None,
+            body: trim_blank_edges(body),
+        }),
+    );
+    Ok(())
 }
 
 pub fn set_state(
@@ -224,8 +277,8 @@ fn section_name(doc: &Document, index: usize) -> String {
 /// Manual archive/cleanup pass: active `[x]` human items are moved under
 /// `# Done` into a mirrored `##` section and stamped `@done(date)`; active
 /// `[x]` agent-zone items are deleted outright; everything else is left
-/// untouched.
-pub fn sweep(doc: &mut Document, today: &str) {
+/// untouched. Returns the number of items swept (archived + deleted).
+pub fn sweep(doc: &mut Document, today: &str) -> usize {
     let done_items: Vec<usize> = doc
         .nodes
         .iter()
@@ -237,6 +290,8 @@ pub fn sweep(doc: &mut Document, today: &str) {
             _ => None,
         })
         .collect();
+
+    let swept = done_items.len();
 
     let mut archived: Vec<(String, Item)> = Vec::new();
     for &i in done_items.iter().rev() {
@@ -253,7 +308,7 @@ pub fn sweep(doc: &mut Document, today: &str) {
     archived.reverse();
 
     if archived.is_empty() {
-        return;
+        return swept;
     }
 
     let done_at = doc.nodes.iter().position(
@@ -291,6 +346,8 @@ pub fn sweep(doc: &mut Document, today: &str) {
         };
         doc.nodes.insert(insert_at, Node::Item(item));
     }
+
+    swept
 }
 
 /// End of the `# Done` region: the index of the next level-1 heading after
@@ -523,6 +580,34 @@ mod tests {
     }
 
     #[test]
+    fn sweep_returns_count_of_swept_items() {
+        // 2 human [x] archived + 1 agent-zone [x] deleted = 3 total swept.
+        let text = "\
+# Feed
+
+- [x] Shipped thing
+- [x] Another shipped thing
+- [ ] Still open
+
+## Agent
+
+- [x] Agent chore
+
+# Done
+
+## Feed
+
+- [x] Older thing @done(2026-09-01)
+";
+        let mut doc = parse(text);
+        let n = sweep(&mut doc, "2026-09-11");
+        assert_eq!(n, 3);
+        // No active [x] items left → nothing to sweep, count is 0.
+        let n2 = sweep(&mut doc, "2026-09-12");
+        assert_eq!(n2, 0);
+    }
+
+    #[test]
     fn sweep_creates_done_when_absent() {
         let mut doc = parse("# Feed\n\n- [x] Ship it\n- [ ] Keep\n");
         sweep(&mut doc, "2026-09-11");
@@ -643,5 +728,53 @@ Some prose.
         let mut doc2 = parse(&once);
         sweep(&mut doc2, "2026-09-12");
         assert_eq!(render(&doc2), once, "second sweep must be a no-op");
+    }
+
+    #[test]
+    fn edit_replaces_title_and_body_keeping_tokens() {
+        let mut doc = parse("- [~] Old title @agent(claude:abc)\n  old body\n");
+        let i = find(&doc, "old title").unwrap();
+        edit(
+            &mut doc,
+            i,
+            "New title",
+            &["".into(), "new body".into(), "".into()],
+        );
+        assert_eq!(
+            render(&doc),
+            "- [~] New title @agent(claude:abc)\n  new body\n"
+        );
+    }
+
+    #[test]
+    fn remove_deletes_item_with_body_only() {
+        let mut doc = parse("- [ ] A\n  body\n- [ ] B\n");
+        let i = find(&doc, "A").unwrap();
+        let removed = remove(&mut doc, i).unwrap();
+        assert_eq!(removed.title, "A");
+        assert_eq!(render(&doc), "- [ ] B\n");
+        // Non-item index is a no-op:
+        let mut doc = parse("# Feed\n- [ ] A\n");
+        assert!(remove(&mut doc, 0).is_none());
+        assert_eq!(render(&doc), "# Feed\n- [ ] A\n");
+    }
+
+    #[test]
+    fn add_in_section_appends_to_named_human_section() {
+        let mut doc = parse(SAMPLE); // has ## Agent and # Done/## Feed
+                                     // SAMPLE has no named human section — add one:
+        let mut doc2 = parse("# Feed\n\n- [ ] A\n\n## Later\n\n- [ ] L1\n\n## Agent\n\n- [ ] G\n");
+        add_in_section(&mut doc2, "L2", &["ctx".into()], "Later").unwrap();
+        let out = render(&doc2);
+        assert!(out.contains("- [ ] L1\n- [ ] L2\n  ctx\n"), "got:\n{out}");
+        // Missing section errors; archive sections never match:
+        assert!(matches!(
+            add_in_section(&mut doc, "X", &[], "Nope"),
+            Err(OpError::NotFound(_))
+        ));
+        assert!(matches!(
+            add_in_section(&mut doc, "X", &[], "Feed"), // only exists under # Done
+            Err(OpError::NotFound(_))
+        ));
     }
 }

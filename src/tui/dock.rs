@@ -44,17 +44,17 @@ impl Runner for HerdrCli {
 
 /// Idempotent dock launcher (spec §3, beads pattern): sidebar pane already
 /// open → focus it (reopen ≡ focus, which also recovers after a herdr server
-/// restart); otherwise split → swap-walk to the edge → shrink.
+/// restart); otherwise split beside the focused pane → swap-walk to the edge
+/// → shrink.
 pub fn dock(runner: &mut dyn Runner, herdr: &mut dyn Herdr, cfg: &SidebarConfig) -> Result<String> {
     let list = runner.run(&["pane", "list"])?;
     if let Some(pane_id) = find_sidebar_pane(&list) {
         herdr.focus_pane(&pane_id)?;
         return Ok(format!("focused existing sidebar pane {pane_id}"));
     }
-    // pane.split spawns a plain shell (no command param in 0.9.0) and splits
-    // only right/down: split right, exec the sidebar into the new shell,
-    // then swap-walk left.
-    let pane_id = open_split_dock(runner, cfg, &["pane", "split", "--direction", "right"])?;
+    let target_pane = focused_pane_id(&list)
+        .context("no focused pane found in `herdr pane list` to dock the sidebar beside")?;
+    let pane_id = open_split_dock(runner, cfg, &target_pane, false)?;
     Ok(format!("opened sidebar pane {pane_id}"))
 }
 
@@ -100,48 +100,39 @@ pub fn auto_dock_for_tab(
     // `--no-focus`: this hook fires unattended on every new tab, so it must
     // not yank focus away from wherever the user (or another agent) already
     // is — unlike the user-initiated `dock()` path above.
-    let pane_id = open_split_dock(
-        runner,
-        cfg,
-        &[
-            "pane",
-            "split",
-            "--pane",
-            &target_pane,
-            "--direction",
-            "right",
-            "--no-focus",
-        ],
-    )?;
+    let pane_id = open_split_dock(runner, cfg, &target_pane, true)?;
     Ok(format!(
         "auto-docked sidebar pane {pane_id} in tab {tab_id}"
     ))
 }
 
-/// Shared tail of both dock paths above: split (per `split_args`), exec the
-/// sidebar into the new pane, swap-walk it to `cfg.side`'s edge, then shrink
-/// it to `cfg.width`. Returns the new pane's id.
+/// herdr-feedr's own plugin id / pane entrypoint (herdr-plugin.toml) — the
+/// preferred dock path runs the sidebar this way rather than by execing a
+/// bare `feedr` (Task: `feedr` is not on PATH, so the old `pane split` +
+/// `send-text "exec feedr sidebar"` path spawned a shell that died
+/// instantly and the pane closed under it).
+const PLUGIN_ID: &str = "herdr-feedr";
+const PLUGIN_ENTRYPOINT: &str = "feedr-sidebar";
+
+/// Shared tail of both dock paths above: open the sidebar pane beside
+/// `target_pane` — PREFERRED via `herdr plugin pane open`, which launches
+/// the entrypoint from the installed plugin's own root regardless of PATH;
+/// FALLBACK (when `plugin pane open` errors — e.g. this binary invoked
+/// outside an installed plugin, or the plugin isn't registered) via `pane
+/// split` + `send-text` execing *this running binary's absolute path*
+/// (`std::env::current_exe()`) instead of a bare `feedr` — then swap-walk it
+/// to `cfg.side`'s edge and shrink it to `cfg.width`. Returns the new pane's
+/// id.
 fn open_split_dock(
     runner: &mut dyn Runner,
     cfg: &SidebarConfig,
-    split_args: &[&str],
+    target_pane: &str,
+    no_focus: bool,
 ) -> Result<String> {
-    let out = runner.run(split_args)?;
-    let pane_id = crate::tui::socket::find_string_field(
-        &serde_json::from_str::<Value>(&out).unwrap_or(Value::Null),
-        "pane_id",
-    )
-    .context("no pane_id in `herdr pane split` output")?;
-    // `herdr pane send-text --help` (0.9.0): positional `<PANE_ID> <TEXT>`,
-    // not the --pane/--text flags the plan assumed — adapted here.
-    if let Err(e) = runner.run(&["pane", "send-text", &pane_id, "exec feedr sidebar\n"]) {
-        // Best-effort cleanup: the split succeeded but the pane never got the
-        // sidebar exec'd into it, so it's an orphan empty shell pane. Ignore
-        // the close result (nothing more useful to do if it fails too) and
-        // propagate the original error.
-        let _ = runner.run(&["pane", "close", &pane_id]);
-        return Err(e);
-    }
+    let pane_id = match open_via_plugin_pane(runner, target_pane, no_focus) {
+        Ok(pane_id) => pane_id,
+        Err(_plugin_pane_open_err) => open_via_split_fallback(runner, target_pane, no_focus)?,
+    };
     if cfg.side == Side::Left {
         for _ in 0..6 {
             if runner
@@ -181,6 +172,105 @@ fn open_split_dock(
         &pane_id,
     ])?;
     Ok(pane_id)
+}
+
+/// PREFERRED path: `herdr plugin pane open` — verified live against herdr
+/// 0.9.0 with herdr-feedr installed as a local plugin (`herdr plugin pane
+/// open --plugin herdr-feedr --entrypoint feedr-sidebar --placement split
+/// --direction right --target-pane <PANE_ID>`). Its JSON result nests the
+/// new pane under `result.plugin_pane.pane.pane_id` (not flat like `pane
+/// split`'s), so this reuses the same structural `find_string_field` search
+/// as the fallback below rather than assuming a shape.
+fn open_via_plugin_pane(
+    runner: &mut dyn Runner,
+    target_pane: &str,
+    no_focus: bool,
+) -> Result<String> {
+    let mut args = vec![
+        "plugin",
+        "pane",
+        "open",
+        "--plugin",
+        PLUGIN_ID,
+        "--entrypoint",
+        PLUGIN_ENTRYPOINT,
+        "--placement",
+        "split",
+        "--direction",
+        "right",
+        "--target-pane",
+        target_pane,
+    ];
+    if no_focus {
+        args.push("--no-focus");
+    }
+    let out = runner.run(&args)?;
+    crate::tui::socket::find_string_field(
+        &serde_json::from_str::<Value>(&out).unwrap_or(Value::Null),
+        "pane_id",
+    )
+    .context("no pane_id in `herdr plugin pane open` output")
+}
+
+/// FALLBACK path, used when `open_via_plugin_pane` errors (e.g. this binary
+/// run outside an installed plugin, or the plugin isn't registered):
+/// `pane.split` spawns a plain shell (no command param in 0.9.0) and splits
+/// only right/down, so split right then exec the sidebar into the new shell
+/// by its *absolute path* — `feedr` alone is not guaranteed to be on PATH in
+/// that shell, which is exactly what made this path silently die before
+/// (the shell exited instantly and the pane closed under it).
+fn open_via_split_fallback(
+    runner: &mut dyn Runner,
+    target_pane: &str,
+    no_focus: bool,
+) -> Result<String> {
+    let mut split_args = vec![
+        "pane",
+        "split",
+        "--pane",
+        target_pane,
+        "--direction",
+        "right",
+    ];
+    if no_focus {
+        split_args.push("--no-focus");
+    }
+    let out = runner.run(&split_args)?;
+    let pane_id = crate::tui::socket::find_string_field(
+        &serde_json::from_str::<Value>(&out).unwrap_or(Value::Null),
+        "pane_id",
+    )
+    .context("no pane_id in `herdr pane split` output")?;
+    let exe = std::env::current_exe().context("cannot resolve this binary's own path")?;
+    // Single-quoted so a path containing spaces still execs correctly;
+    // `exe` is our own resolved path, not untrusted input.
+    let exec_cmd = format!("exec '{}' sidebar\n", exe.display());
+    // `herdr pane send-text --help` (0.9.0): positional `<PANE_ID> <TEXT>`,
+    // not the --pane/--text flags the plan assumed — adapted here.
+    if let Err(e) = runner.run(&["pane", "send-text", &pane_id, &exec_cmd]) {
+        // Best-effort cleanup: the split succeeded but the pane never got the
+        // sidebar exec'd into it, so it's an orphan empty shell pane. Ignore
+        // the close result (nothing more useful to do if it fails too) and
+        // propagate the original error.
+        let _ = runner.run(&["pane", "close", &pane_id]);
+        return Err(e);
+    }
+    Ok(pane_id)
+}
+
+/// The currently-focused pane's id, if any — the target the user-initiated
+/// `dock()` path splits beside (unlike `auto_dock_for_tab`, which already
+/// knows its target: the lone pane in the just-created tab).
+fn focused_pane_id(pane_list_stdout: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(pane_list_stdout).ok()?;
+    let result = v.get("result").unwrap_or(&v);
+    result_entries(result).into_iter().find_map(|e| {
+        if e.get("focused")?.as_bool()? {
+            e.get("pane_id")?.as_str().map(str::to_string)
+        } else {
+            None
+        }
+    })
 }
 
 fn find_sidebar_pane(pane_list_stdout: &str) -> Option<String> {
@@ -353,14 +443,18 @@ mod tests {
         assert_eq!(runner.calls, ["pane list"]); // idempotent: nothing opened
     }
 
+    /// A pane found via `focused: true` in `pane list`, to split beside.
+    fn focused_list() -> &'static str {
+        r#"{"id":"cli:pane:list","result":{"panes":[
+            {"pane_id":"w1:p1","terminal_title_stripped":"vim","focused":true}]}}"#
+    }
+
     #[test]
-    fn dock_opens_execs_sidebar_swap_walks_left_and_resizes() {
-        let empty = r#"{"id":"cli:pane:list","result":{"panes":[]}}"#;
-        let split = r#"{"id":"cli:pane:split","result":{"pane_id":"w1:p9"}}"#;
+    fn dock_opens_via_plugin_pane_swap_walks_left_and_resizes() {
+        let opened = r#"{"id":"cli:plugin","result":{"pane_id":"w1:p9"}}"#;
         let mut runner = FakeRunner::new(vec![
-            Ok(empty.into()),
-            Ok(split.into()),
-            Ok(String::new()),                   // send-text
+            Ok(focused_list().into()),
+            Ok(opened.into()),
             Ok(String::new()),                   // neighbor 1: one exists
             Ok(String::new()),                   // swap 1
             Err(anyhow::anyhow!("no neighbor")), // neighbor 2: at the edge
@@ -372,8 +466,8 @@ mod tests {
             runner.calls,
             [
                 "pane list",
-                "pane split --direction right",
-                "pane send-text w1:p9 exec feedr sidebar\n",
+                "plugin pane open --plugin herdr-feedr --entrypoint feedr-sidebar \
+                 --placement split --direction right --target-pane w1:p1",
                 "pane neighbor --direction left --pane w1:p9",
                 "pane swap --direction left --pane w1:p9",
                 "pane neighbor --direction left --pane w1:p9",
@@ -385,18 +479,79 @@ mod tests {
 
     #[test]
     fn dock_right_side_skips_swap_walk() {
-        let empty = r#"{"id":"cli:pane:list","result":{"panes":[]}}"#;
-        let split = r#"{"id":"cli:pane:split","result":{"pane_id":"w1:p9"}}"#;
-        let mut runner = FakeRunner::new(vec![Ok(empty.into()), Ok(split.into())]);
+        let opened = r#"{"id":"cli:plugin","result":{"pane_id":"w1:p9"}}"#;
+        let mut runner = FakeRunner::new(vec![Ok(focused_list().into()), Ok(opened.into())]);
         let mut herdr = FakeHerdr::default();
         dock(&mut runner, &mut herdr, &cfg(Side::Right)).unwrap();
         assert_eq!(
             runner.calls,
             [
                 "pane list",
-                "pane split --direction right",
-                "pane send-text w1:p9 exec feedr sidebar\n",
+                "plugin pane open --plugin herdr-feedr --entrypoint feedr-sidebar \
+                 --placement split --direction right --target-pane w1:p1",
                 "pane resize --direction right --amount 0.18 --pane w1:p9",
+            ]
+        );
+    }
+
+    #[test]
+    fn dock_errors_when_no_pane_is_focused() {
+        let list = r#"{"id":"x","result":{"panes":[
+            {"pane_id":"w1:p1","terminal_title_stripped":"vim"}]}}"#;
+        let mut runner = FakeRunner::new(vec![Ok(list.into())]);
+        let mut herdr = FakeHerdr::default();
+        let err = dock(&mut runner, &mut herdr, &cfg(Side::Left)).unwrap_err();
+        assert!(err.to_string().contains("focused"), "got: {err}");
+        assert_eq!(runner.calls, ["pane list"]); // nothing opened
+    }
+
+    /// Real herdr 0.9.0 nests the new pane's id under
+    /// `result.plugin_pane.pane.pane_id` (captured live against an installed
+    /// herdr-feedr plugin), unlike `pane split`'s flat `result.pane_id` — the
+    /// structural `find_string_field` search handles both without caring.
+    #[test]
+    fn open_via_plugin_pane_parses_the_real_nested_pane_id_shape() {
+        let out = r#"{"id":"cli:plugin","result":{"plugin_pane":{"entrypoint":"feedr-sidebar",
+            "pane":{"pane_id":"w3:pF","tab_id":"w3:t6"},"plugin_id":"herdr-feedr"},
+            "type":"plugin_pane_opened"}}"#;
+        let mut runner = FakeRunner::new(vec![Ok(out.into())]);
+        let pane_id = open_via_plugin_pane(&mut runner, "w3:pB", false).unwrap();
+        assert_eq!(pane_id, "w3:pF");
+        assert_eq!(
+            runner.calls,
+            [
+                "plugin pane open --plugin herdr-feedr --entrypoint feedr-sidebar \
+              --placement split --direction right --target-pane w3:pB"
+            ]
+        );
+    }
+
+    #[test]
+    fn dock_falls_back_to_absolute_path_exec_when_plugin_pane_open_fails() {
+        let split = r#"{"id":"y","result":{"pane_id":"w1:p9"}}"#;
+        let mut runner = FakeRunner::new(vec![
+            Ok(focused_list().into()),
+            Err(anyhow::anyhow!("plugin herdr-feedr not found")),
+            Ok(split.into()),
+            Ok(String::new()),                   // send-text
+            Err(anyhow::anyhow!("no neighbor")), // edge (single split)
+        ]);
+        let mut herdr = FakeHerdr::default();
+        let msg = dock(&mut runner, &mut herdr, &cfg(Side::Left)).unwrap();
+        assert!(msg.contains("opened sidebar pane w1:p9"), "got: {msg}");
+        let exe = std::env::current_exe().unwrap();
+        let expected_exec = format!("exec '{}' sidebar\n", exe.display());
+        assert_eq!(
+            runner.calls,
+            [
+                "pane list".to_string(),
+                "plugin pane open --plugin herdr-feedr --entrypoint feedr-sidebar \
+                 --placement split --direction right --target-pane w1:p1"
+                    .to_string(),
+                "pane split --pane w1:p1 --direction right".to_string(),
+                format!("pane send-text w1:p9 {expected_exec}"),
+                "pane neighbor --direction left --pane w1:p9".to_string(),
+                "pane resize --direction left --amount 0.18 --pane w1:p9".to_string(),
             ]
         );
     }
@@ -433,11 +588,10 @@ mod tests {
         let list = r#"{"id":"x","result":{"panes":[
             {"pane_id":"w1:p1","tab_id":"w1:t2","terminal_title_stripped":"feedr-sidebar"},
             {"pane_id":"w1:p9","tab_id":"w1:t9","terminal_title_stripped":"vim"}]}}"#;
-        let split = r#"{"id":"y","result":{"pane_id":"w1:p10"}}"#;
+        let opened = r#"{"id":"y","result":{"pane_id":"w1:p10"}}"#;
         let mut runner = FakeRunner::new(vec![
             Ok(list.into()),
-            Ok(split.into()),
-            Ok(String::new()),                   // send-text
+            Ok(opened.into()),
             Err(anyhow::anyhow!("no neighbor")), // neighbor: at the edge (single-pane new tab)
         ]);
         let msg = auto_dock_for_tab(&mut runner, &cfg(Side::Left), "w1:t9").unwrap();
@@ -446,10 +600,41 @@ mod tests {
             runner.calls,
             [
                 "pane list",
-                "pane split --pane w1:p9 --direction right --no-focus",
-                "pane send-text w1:p10 exec feedr sidebar\n",
+                "plugin pane open --plugin herdr-feedr --entrypoint feedr-sidebar \
+                 --placement split --direction right --target-pane w1:p9 --no-focus",
                 "pane neighbor --direction left --pane w1:p10",
                 "pane resize --direction left --amount 0.18 --pane w1:p10",
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_dock_for_tab_falls_back_to_absolute_path_exec_when_plugin_pane_open_fails() {
+        let list = r#"{"id":"x","result":{"panes":[
+            {"pane_id":"w1:p9","tab_id":"w1:t9","terminal_title_stripped":"vim"}]}}"#;
+        let split = r#"{"id":"y","result":{"pane_id":"w1:p10"}}"#;
+        let mut runner = FakeRunner::new(vec![
+            Ok(list.into()),
+            Err(anyhow::anyhow!("plugin herdr-feedr not found")),
+            Ok(split.into()),
+            Ok(String::new()),                   // send-text
+            Err(anyhow::anyhow!("no neighbor")), // edge (single-pane new tab)
+        ]);
+        let msg = auto_dock_for_tab(&mut runner, &cfg(Side::Left), "w1:t9").unwrap();
+        assert!(msg.contains("auto-docked"), "got: {msg}");
+        let exe = std::env::current_exe().unwrap();
+        let expected_exec = format!("exec '{}' sidebar\n", exe.display());
+        assert_eq!(
+            runner.calls,
+            [
+                "pane list".to_string(),
+                "plugin pane open --plugin herdr-feedr --entrypoint feedr-sidebar \
+                 --placement split --direction right --target-pane w1:p9 --no-focus"
+                    .to_string(),
+                "pane split --pane w1:p9 --direction right --no-focus".to_string(),
+                format!("pane send-text w1:p10 {expected_exec}"),
+                "pane neighbor --direction left --pane w1:p10".to_string(),
+                "pane resize --direction left --amount 0.18 --pane w1:p10".to_string(),
             ]
         );
     }
@@ -464,11 +649,14 @@ mod tests {
     }
 
     #[test]
-    fn dock_closes_orphan_pane_when_send_text_fails() {
-        let empty = r#"{"id":"cli:pane:list","result":{"panes":[]}}"#;
+    fn dock_closes_orphan_pane_when_fallback_send_text_fails() {
+        // Plugin pane open fails (falls back to split), the split succeeds,
+        // but the exec into it fails too: the orphan empty shell pane must
+        // still be cleaned up.
         let split = r#"{"id":"cli:pane:split","result":{"pane_id":"w1:p9"}}"#;
         let mut runner = FakeRunner::new(vec![
-            Ok(empty.into()),
+            Ok(focused_list().into()),
+            Err(anyhow::anyhow!("plugin herdr-feedr not found")),
             Ok(split.into()),
             Err(anyhow::anyhow!("send-text failed")),
             Ok(String::new()), // pane close — result ignored
@@ -476,15 +664,33 @@ mod tests {
         let mut herdr = FakeHerdr::default();
         let result = dock(&mut runner, &mut herdr, &cfg(Side::Left));
         assert!(result.is_err());
+        assert_eq!(runner.calls.len(), 5);
+        assert_eq!(runner.calls[0], "pane list");
         assert_eq!(
-            runner.calls,
-            [
-                "pane list",
-                "pane split --direction right",
-                "pane send-text w1:p9 exec feedr sidebar\n",
-                "pane close w1:p9",
-            ]
+            runner.calls[1],
+            "plugin pane open --plugin herdr-feedr --entrypoint feedr-sidebar \
+             --placement split --direction right --target-pane w1:p1"
         );
+        assert_eq!(runner.calls[2], "pane split --pane w1:p1 --direction right");
+        assert!(
+            runner.calls[3].starts_with("pane send-text w1:p9 exec '")
+                && runner.calls[3].ends_with("sidebar\n"),
+            "got: {}",
+            runner.calls[3]
+        );
+        assert_eq!(runner.calls[4], "pane close w1:p9");
+    }
+
+    #[test]
+    fn dock_errors_when_both_plugin_pane_open_and_fallback_split_fail() {
+        let mut runner = FakeRunner::new(vec![
+            Ok(focused_list().into()),
+            Err(anyhow::anyhow!("plugin herdr-feedr not found")),
+            Err(anyhow::anyhow!("split failed")),
+        ]);
+        let mut herdr = FakeHerdr::default();
+        let err = dock(&mut runner, &mut herdr, &cfg(Side::Left)).unwrap_err();
+        assert!(err.to_string().contains("split failed"), "got: {err}");
     }
 
     fn changed(v: bool) -> anyhow::Result<String> {

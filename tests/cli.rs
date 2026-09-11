@@ -280,9 +280,10 @@ fn auto_dock_hook_requires_a_tab_id_when_enabled() {
 
 /// End-to-end through the real binary (config read -> dock::auto_dock_for_tab
 /// -> herdr shell-out), with a fake `herdr` standing in via HERDR_BIN_PATH so
-/// no live herdr instance is touched.
+/// no live herdr instance is touched. Preferred path: `plugin pane open`
+/// succeeds, so `pane split`/`send-text` are never invoked at all.
 #[test]
-fn auto_dock_hook_docks_into_the_named_tab_when_enabled() {
+fn auto_dock_hook_docks_into_the_named_tab_via_plugin_pane_open() {
     let home = tempfile::tempdir().unwrap();
     let cfg_dir = sandboxed_config_dir(home.path());
     std::fs::create_dir_all(&cfg_dir).unwrap();
@@ -297,6 +298,63 @@ fn auto_dock_hook_docks_into_the_named_tab_when_enabled() {
 echo "$@" >> "{log}"
 case "$1 $2" in
   "pane list") echo '{{"result":{{"panes":[{{"pane_id":"w1:p1","tab_id":"w1:t9","terminal_title_stripped":"vim"}}]}}}}' ;;
+  "plugin pane") echo '{{"result":{{"plugin_pane":{{"pane":{{"pane_id":"w1:p10"}}}}}}}}' ;;
+  *) echo '{{}}' ;;
+esac
+"#,
+            log = log.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake_herdr, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cmd = Command::cargo_bin("feedr").unwrap();
+    cmd.env("HOME", home.path())
+        .env("HERDR_BIN_PATH", &fake_herdr)
+        .args(["auto-dock-hook", "--tab-id", "w1:t9"])
+        .assert()
+        .success()
+        .stdout(contains("auto-docked"));
+
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(calls.contains("pane list"), "got:\n{calls}");
+    assert!(
+        calls.contains(
+            "plugin pane open --plugin herdr-feedr --entrypoint feedr-sidebar --placement split \
+             --direction right --target-pane w1:p1 --no-focus"
+        ),
+        "must open via the plugin, beside the target tab's own pane, no-focus; got:\n{calls}"
+    );
+    assert!(
+        !calls.contains("pane split") && !calls.contains("send-text"),
+        "plugin pane open succeeded, so the split/exec fallback must not run; got:\n{calls}"
+    );
+}
+
+/// Same end-to-end path, but `plugin pane open` fails (e.g. the plugin isn't
+/// registered under this herdr instance) — must fall back to `pane split` +
+/// `send-text` execing *this binary's own absolute path*, not a bare
+/// `feedr` (the original bug: `feedr` is not guaranteed to be on PATH in the
+/// freshly split shell, so the shell exited instantly and the pane closed
+/// under it).
+#[test]
+fn auto_dock_hook_falls_back_to_split_and_absolute_exec_when_plugin_pane_open_fails() {
+    let home = tempfile::tempdir().unwrap();
+    let cfg_dir = sandboxed_config_dir(home.path());
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(cfg_dir.join("config.toml"), "[sidebar]\nauto_dock = true\n").unwrap();
+
+    let log = home.path().join("calls.log");
+    let fake_herdr = home.path().join("fake-herdr.sh");
+    std::fs::write(
+        &fake_herdr,
+        format!(
+            r#"#!/bin/sh
+echo "$@" >> "{log}"
+case "$1 $2" in
+  "pane list") echo '{{"result":{{"panes":[{{"pane_id":"w1:p1","tab_id":"w1:t9","terminal_title_stripped":"vim"}}]}}}}' ;;
+  "plugin pane") echo "plugin herdr-feedr not registered" >&2; exit 1 ;;
   "pane split") echo '{{"result":{{"pane_id":"w1:p10"}}}}' ;;
   *) echo '{{}}' ;;
 esac
@@ -319,12 +377,19 @@ esac
     let calls = std::fs::read_to_string(&log).unwrap();
     assert!(calls.contains("pane list"), "got:\n{calls}");
     assert!(
-        calls.contains("pane split --pane w1:p1 --direction right --no-focus"),
-        "must split beside the target tab's own pane, no-focus; got:\n{calls}"
+        calls.contains("plugin pane open"),
+        "must try the preferred plugin-pane-open path first; got:\n{calls}"
     );
     assert!(
-        calls.contains("pane send-text w1:p10 exec feedr sidebar"),
-        "got:\n{calls}"
+        calls.contains("pane split --pane w1:p1 --direction right --no-focus"),
+        "must fall back to split beside the target tab's own pane, no-focus; got:\n{calls}"
+    );
+    let feedr_exe = assert_cmd::cargo::cargo_bin("feedr");
+    let expected_exec = format!("exec '{}' sidebar", feedr_exe.display());
+    assert!(
+        calls.contains(&expected_exec),
+        "must exec this binary's own absolute path, not a bare `feedr` (not \
+         guaranteed to be on PATH); got:\n{calls}\nwant substring: {expected_exec}"
     );
 }
 

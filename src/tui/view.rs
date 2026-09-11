@@ -33,16 +33,33 @@ pub fn status_glyph(s: AgentStatus) -> Option<char> {
     }
 }
 
+/// Truncate `s` to fit within `width` terminal cells, appending `…` when it
+/// doesn't fit. Budgets by display width (via `unicode-width`), not char
+/// count — a char-count budget lets wide CJK/emoji glyphs overflow their
+/// cell budget and clips the `…` marker itself (Task 5 review carry-forward).
 pub fn ellipsize(s: &str, width: usize) -> String {
-    if s.chars().count() <= width {
-        s.to_string()
-    } else if width == 0 {
-        String::new()
-    } else {
-        let mut t: String = s.chars().take(width - 1).collect();
-        t.push('…');
-        t
+    use unicode_width::UnicodeWidthChar;
+    let total_width: usize = s.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if total_width <= width {
+        return s.to_string();
     }
+    if width == 0 {
+        return String::new();
+    }
+    // Reserve 1 cell for the ellipsis marker itself (width 1).
+    let budget = width - 1;
+    let mut acc = 0usize;
+    let mut t = String::new();
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(0);
+        if acc + cw > budget {
+            break;
+        }
+        acc += cw;
+        t.push(c);
+    }
+    t.push('…');
+    t
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -308,5 +325,25 @@ mod tests {
         assert_eq!(ellipsize("exactly-ten", 11), "exactly-ten");
         assert_eq!(ellipsize("exactly-eleven!", 11), "exactly-el…");
         assert_eq!(ellipsize("x", 0), "");
+    }
+
+    #[test]
+    fn ellipsize_budgets_by_display_width_not_char_count() {
+        use unicode_width::UnicodeWidthStr;
+        // CJK chars are 2 cells wide each; a char-count budget of 10 lets 9
+        // of them through (18 cells) plus the ellipsis — badly overflowing a
+        // 10-cell pane. The display-width budget must keep the whole result
+        // within `width` cells.
+        let cjk = "測試標題看看看看看看"; // 10 chars, 20 cells if unclipped
+        let out = ellipsize(cjk, 10);
+        assert!(
+            out.ends_with('…'),
+            "result should end with ellipsis: {out:?}"
+        );
+        assert!(
+            out.width() <= 10,
+            "result {out:?} has display width {} > budget 10",
+            out.width()
+        );
     }
 }

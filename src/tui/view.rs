@@ -70,14 +70,8 @@ pub fn ellipsize(s: &str, width: usize) -> String {
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
     if app.collapsed {
-        // ~3-col rail: click anywhere restores (input.rs). Round-4 item 2:
-        // the chevron renders on the BOTTOM row (native herdr's own
-        // position for it), not the top — the rest of the rail is blank.
-        let lines: Vec<Line> = (0..area.height.saturating_sub(1))
-            .map(|_| Line::from(""))
-            .chain(std::iter::once(Line::styled("»", theme::muted_row())))
-            .collect();
-        f.render_widget(Paragraph::new(lines).style(theme::muted_row()), area);
+        // ~3-col rail: click anywhere restores (input.rs).
+        render_collapsed_rail(f, area, app);
         return;
     }
     let [toolbar, list, done, status] = Layout::vertical([
@@ -107,6 +101,51 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_status_row(f, status, app);
 
     draw_modal(f, app);
+}
+
+/// Round-5 (Plan 3c): the collapsed rail is a vertical status strip, not
+/// blank space. Top to bottom in the ~1-cell inner column: the open-task
+/// count as stacked digits (normal text — this is the headline number, not
+/// chrome), a blank, a mauve `?` + stacked count when any `[?]` item exists,
+/// a blank, a red `!` when any linked agent is Blocked, then the `»` restore
+/// chevron pinned to the bottom row (unchanged from round-4 — click anywhere
+/// restores, input.rs). Indicators that don't apply are omitted outright
+/// (no reserved blank slot for them) — an all-clear feed shows just the open
+/// count and the chevron, with real blank space between.
+fn render_collapsed_rail(f: &mut Frame, area: Rect, app: &App) {
+    let mut lines: Vec<Line> = Vec::new();
+    for d in stacked_digits(app.open_task_count()) {
+        lines.push(Line::styled(d, theme::normal_text()));
+    }
+    let review = app.review_task_count();
+    if review > 0 {
+        let review_style = theme::item_glyph(crate::feed::State::Review); // mauve
+        lines.push(Line::from(""));
+        lines.push(Line::styled("?", review_style));
+        for d in stacked_digits(review) {
+            lines.push(Line::styled(d, review_style));
+        }
+    }
+    if app.any_linked_agent_blocked() {
+        lines.push(Line::from(""));
+        lines.push(Line::styled("!", theme::agent_status(AgentStatus::Blocked)));
+        // red
+    }
+    // Pad/truncate so the chevron always lands on the bottom row, same as
+    // the plain-blank rail before it.
+    let body_rows = area.height.saturating_sub(1) as usize;
+    while lines.len() < body_rows {
+        lines.push(Line::from(""));
+    }
+    lines.truncate(body_rows);
+    lines.push(Line::styled("»", theme::muted_row()));
+    f.render_widget(Paragraph::new(lines).style(theme::muted_row()), area);
+}
+
+/// A count's decimal digits, each as its own single-character string — one
+/// digit per rendered row (e.g. 12 -> ["1", "2"]).
+fn stacked_digits(n: usize) -> Vec<String> {
+    n.to_string().chars().map(|c| c.to_string()).collect()
 }
 
 /// Status row: the status message on the left, the collapse chevron pinned
@@ -465,17 +504,125 @@ mod tests {
         assert_eq!(rows[3], "  @claude"); // sub-line still shown, no glyph
     }
 
-    /// Round-4 item 2: the collapsed rail's `»` renders on the BOTTOM row
-    /// (matching native herdr), not the top — the rest of the rail is
-    /// blank.
+    /// The `»` restore chevron always renders on the bottom row (matching
+    /// native herdr), regardless of what status indicators sit above it.
     #[test]
-    fn collapsed_renders_rail() {
+    fn collapsed_rail_chevron_pinned_to_bottom_row() {
         let mut app = app_with(SAMPLE);
         app.collapsed = true;
         let rows = render_to_strings(&app, 3, 6);
-        let last = rows.len() - 1;
-        assert_eq!(rows[last], "»");
-        assert!(rows[..last].iter().all(|r| r.is_empty()));
+        assert_eq!(rows[rows.len() - 1], "»");
+    }
+
+    /// Round-5 (Plan 3c): with reviews present and no blocked agent, the
+    /// rail shows (top to bottom) the open-task count, a blank, the mauve
+    /// `?` review indicator, blank padding, then the chevron. SAMPLE has 2
+    /// open/in-progress items and 1 `[?]` item; no agent status is set, so
+    /// no `!` appears.
+    #[test]
+    fn collapsed_rail_shows_open_count_and_review_indicator() {
+        let mut app = app_with(SAMPLE);
+        app.collapsed = true;
+        let rows = render_to_strings(&app, 3, 6);
+        assert_eq!(rows[0], "2", "open-task count"); // Fix auth + Migrate CI
+        assert_eq!(rows[1], "", "blank separator");
+        assert_eq!(rows[2], "?", "review indicator");
+        assert_eq!(rows[3], "1", "review count");
+        assert_eq!(rows[5], "»");
+        assert!(!rows.contains(&"!".to_string()), "no blocked agent set");
+    }
+
+    /// No `[?]` items and no blocked agent: only the open count and the
+    /// chevron render — the review and blocked indicators are omitted
+    /// outright, not blanked-but-reserved.
+    #[test]
+    fn collapsed_rail_omits_review_and_blocked_indicators_when_absent() {
+        let mut app = app_with("# Feed\n\n- [ ] A\n- [~] B\n");
+        app.collapsed = true;
+        let rows = render_to_strings(&app, 3, 6);
+        assert_eq!(rows[0], "2");
+        assert_eq!(rows[rows.len() - 1], "»");
+        assert!(!rows.contains(&"?".to_string()));
+        assert!(!rows.contains(&"!".to_string()));
+    }
+
+    /// A linked agent reporting Blocked shows the red `!` indicator.
+    #[test]
+    fn collapsed_rail_shows_blocked_indicator_for_linked_blocked_agent() {
+        let mut app = app_with("- [~] Beta @agent(claude:abc)\n");
+        app.statuses.insert(
+            "abc".into(),
+            AgentInfo {
+                pane_id: "w1:p7".into(),
+                kind: "claude".into(),
+                session_id: "abc".into(),
+                status: AgentStatus::Blocked,
+            },
+        );
+        app.collapsed = true;
+        let rows = render_to_strings(&app, 3, 6);
+        assert!(rows.contains(&"!".to_string()), "got: {rows:?}");
+        assert_eq!(rows[rows.len() - 1], "»");
+    }
+
+    /// Both the review and blocked indicators present together, in the
+    /// documented top-to-bottom order: open count, blank, `?` + count,
+    /// blank, `!`, then the chevron.
+    #[test]
+    fn collapsed_rail_shows_both_review_and_blocked_indicators_together() {
+        let mut app = app_with("- [ ] A @agent(claude:abc)\n- [?] B @agent(claude:abc)\n- [ ] C\n");
+        app.statuses.insert(
+            "abc".into(),
+            AgentInfo {
+                pane_id: "w1:p7".into(),
+                kind: "claude".into(),
+                session_id: "abc".into(),
+                status: AgentStatus::Blocked,
+            },
+        );
+        app.collapsed = true;
+        let rows = render_to_strings(&app, 3, 9);
+        assert_eq!(rows[0], "2", "open count: A + C"); // B is [?], excluded
+        assert_eq!(rows[1], "");
+        assert_eq!(rows[2], "?");
+        assert_eq!(rows[3], "1");
+        assert_eq!(rows[4], "");
+        assert_eq!(rows[5], "!");
+        assert_eq!(rows[rows.len() - 1], "»");
+    }
+
+    /// Multi-digit counts stack one digit per row (spec example: "1","2" for
+    /// 12), not a single "12" cell.
+    #[test]
+    fn collapsed_rail_stacks_multi_digit_open_count() {
+        let items: String = (0..12).map(|i| format!("- [ ] Item {i}\n")).collect();
+        let mut app = app_with(&items);
+        app.collapsed = true;
+        let rows = render_to_strings(&app, 3, 14);
+        assert_eq!(rows[0], "1");
+        assert_eq!(rows[1], "2");
+    }
+
+    /// The open-task count renders in normal text; the review indicator (and
+    /// its count) in mauve; the blocked indicator in red — reusing the same
+    /// theme helpers the expanded list already uses for these states/statuses.
+    #[test]
+    fn collapsed_rail_indicators_use_themed_colors() {
+        let mut app = app_with("- [ ] A @agent(claude:abc)\n- [?] B @agent(claude:abc)\n");
+        app.statuses.insert(
+            "abc".into(),
+            AgentInfo {
+                pane_id: "w1:p7".into(),
+                kind: "claude".into(),
+                session_id: "abc".into(),
+                status: AgentStatus::Blocked,
+            },
+        );
+        app.collapsed = true;
+        let buf = render_buffer(&app, 3, 8);
+        assert_eq!(buf[(0, 0)].fg, theme::TEXT, "open count: normal text");
+        assert_eq!(buf[(0, 2)].fg, theme::MAUVE, "review indicator: mauve");
+        assert_eq!(buf[(0, 5)].fg, theme::RED, "blocked indicator: red");
     }
 
     #[test]

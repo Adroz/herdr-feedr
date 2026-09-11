@@ -3,7 +3,7 @@ use crate::feed::ops::{self, Authority, Zone};
 use crate::feed::write::save_atomic;
 use crate::feed::{AgentRef, Document, Item, Node, State};
 use crate::tui::modal::{EditModal, Modal, ModalStep};
-use crate::tui::socket::{AgentInfo, Herdr};
+use crate::tui::socket::{AgentInfo, AgentStatus, Herdr};
 use anyhow::Result;
 use crossterm::event::Event;
 use std::collections::HashMap;
@@ -492,6 +492,39 @@ impl App {
                 crate::tui::socket::resume_hint(&agent)
             ));
         }
+    }
+
+    /// Count of active items still to do — `[ ]` or `[~]` — the number shown
+    /// on the collapsed rail (Plan 3c). Deliberately excludes `[?]` (its own
+    /// indicator) and `[x]` (shown separately as `Done (n)` in the expanded
+    /// view; not "open" work).
+    pub fn open_task_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| {
+                matches!(r, Row::Item { key, .. } if matches!(key.state, State::Open | State::InProgress))
+            })
+            .count()
+    }
+
+    /// Count of active items awaiting review (`[?]`) — the collapsed rail's
+    /// mauve indicator.
+    pub fn review_task_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| matches!(r, Row::Item { key, .. } if key.state == State::Review))
+            .count()
+    }
+
+    /// Whether any agent linked to a visible `@agent` sub-line is currently
+    /// reported Blocked — the collapsed rail's red `!` indicator. Scoped to
+    /// agents actually referenced by the feed (rows), not every agent herdr
+    /// happens to know about.
+    pub fn any_linked_agent_blocked(&self) -> bool {
+        self.rows.iter().any(|r| {
+            matches!(r, Row::AgentLine { agent, .. }
+                if self.statuses.get(&agent.id).map(|i| i.status) == Some(AgentStatus::Blocked))
+        })
     }
 
     pub fn on_event(&mut self, ev: crate::tui::AppEvent) {
@@ -1198,6 +1231,60 @@ mod tests {
             fake.log.borrow().is_empty(),
             "no herdr calls when pane id absent"
         );
+    }
+
+    // --- Round-5: collapsed-rail status counts ------------------------------
+
+    #[test]
+    fn open_task_count_counts_open_and_in_progress_only() {
+        let (app, _fake, _dir) = app_on_disk(SAMPLE);
+        // SAMPLE: "Fix auth redirect loop" [ ], "Migrate CI" [~], "Evaluate
+        // pnpm catalogs" [ ] are open/in-progress; "Add retry..." is [?]
+        // (excluded — its own indicator); the two Done items are archived
+        // (excluded — never even reach `rows`).
+        assert_eq!(app.open_task_count(), 3);
+    }
+
+    #[test]
+    fn review_task_count_counts_only_question_state_items() {
+        let (app, _fake, _dir) = app_on_disk(SAMPLE);
+        assert_eq!(app.review_task_count(), 1);
+    }
+
+    #[test]
+    fn any_linked_agent_blocked_false_when_no_agent_statuses_known() {
+        let (app, _fake, _dir) = app_on_disk(SAMPLE);
+        assert!(!app.any_linked_agent_blocked());
+    }
+
+    #[test]
+    fn any_linked_agent_blocked_true_when_a_linked_agent_reports_blocked() {
+        let (mut app, _fake, _dir) = app_on_disk(SAMPLE);
+        app.statuses.insert(
+            "0198f3ab".into(),
+            AgentInfo {
+                pane_id: "w1:p7".into(),
+                kind: "claude".into(),
+                session_id: "0198f3ab".into(),
+                status: AgentStatus::Blocked,
+            },
+        );
+        assert!(app.any_linked_agent_blocked());
+    }
+
+    #[test]
+    fn any_linked_agent_blocked_false_when_linked_agent_is_merely_working() {
+        let (mut app, _fake, _dir) = app_on_disk(SAMPLE);
+        app.statuses.insert(
+            "0198f3ab".into(),
+            AgentInfo {
+                pane_id: "w1:p7".into(),
+                kind: "claude".into(),
+                session_id: "0198f3ab".into(),
+                status: AgentStatus::Working,
+            },
+        );
+        assert!(!app.any_linked_agent_blocked());
     }
 
     #[test]

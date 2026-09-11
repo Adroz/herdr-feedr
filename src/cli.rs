@@ -60,6 +60,16 @@ enum Cmd {
         #[arg(long)]
         dock: bool,
     },
+    /// Internal: herdr-plugin.toml's `tab.created` [[events]] hook entry
+    /// point (Plan 3 auto-dock). Run by scripts/on-tab-created.sh, not
+    /// meant for interactive use.
+    #[command(hide = true)]
+    AutoDockHook {
+        /// The tab that was just created. Defaults to $HERDR_TAB_ID (what
+        /// herdr sets in an event hook's environment) when omitted.
+        #[arg(long)]
+        tab_id: Option<String>,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -81,6 +91,23 @@ pub fn run() -> Result<()> {
             return Ok(());
         }
         return crate::tui::run(path, cfg);
+    }
+    if let Cmd::AutoDockHook { tab_id } = &cli.command {
+        let cfg = config::load_sidebar_config(&config::default_config_dir());
+        if !cfg.auto_dock {
+            return Ok(()); // feature disabled — silent no-op, not an error
+        }
+        let tab_id = tab_id
+            .clone()
+            .or_else(|| std::env::var("HERDR_TAB_ID").ok())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("auto-dock-hook: no tab id (pass --tab-id or set HERDR_TAB_ID)")
+            })?;
+        let mut runner = crate::tui::dock::HerdrCli::from_env();
+        let msg = crate::tui::dock::auto_dock_for_tab(&mut runner, &cfg, &tab_id)?;
+        println!("{msg}");
+        return Ok(());
     }
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -162,7 +189,7 @@ pub fn run() -> Result<()> {
             ops::sweep(&mut doc, &today);
             write::save_atomic(&doc, &path)?;
         }
-        Cmd::Sidebar { .. } => {
+        Cmd::Sidebar { .. } | Cmd::AutoDockHook { .. } => {
             unreachable!()
         }
     }

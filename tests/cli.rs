@@ -236,3 +236,103 @@ fn sidebar_subcommand_is_wired() {
         .success()
         .stdout(contains("--dock"));
 }
+
+// --- Plan 3: `auto-dock-hook` (herdr-plugin.toml's `tab.created` event
+// hook entry point) --------------------------------------------------------
+//
+// `config::default_config_dir()` is hardcoded to `dirs::config_dir()` (not
+// injectable like `--file`/`FEEDR_FEED`), so these tests sandbox it by
+// setting HOME for the child process to a fresh tempdir — on macOS
+// `dirs::config_dir()` resolves under `$HOME/Library/Application Support`,
+// so this never touches the real user config.
+
+fn sandboxed_config_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("Library/Application Support/herdr-feedr")
+}
+
+#[test]
+fn auto_dock_hook_is_noop_when_auto_dock_disabled() {
+    let home = tempfile::tempdir().unwrap();
+    // No config.toml at all -> auto_dock defaults to false (config.rs).
+    let mut cmd = Command::cargo_bin("feedr").unwrap();
+    cmd.env("HOME", home.path())
+        .args(["auto-dock-hook", "--tab-id", "w1:t9"])
+        .assert()
+        .success()
+        .stdout(""); // silent no-op — never even shells out to herdr
+}
+
+#[test]
+fn auto_dock_hook_requires_a_tab_id_when_enabled() {
+    let home = tempfile::tempdir().unwrap();
+    let cfg_dir = sandboxed_config_dir(home.path());
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(cfg_dir.join("config.toml"), "[sidebar]\nauto_dock = true\n").unwrap();
+
+    let mut cmd = Command::cargo_bin("feedr").unwrap();
+    cmd.env("HOME", home.path())
+        .env_remove("HERDR_TAB_ID")
+        .arg("auto-dock-hook")
+        .assert()
+        .failure()
+        .stderr(contains("no tab id"));
+}
+
+/// End-to-end through the real binary (config read -> dock::auto_dock_for_tab
+/// -> herdr shell-out), with a fake `herdr` standing in via HERDR_BIN_PATH so
+/// no live herdr instance is touched.
+#[test]
+fn auto_dock_hook_docks_into_the_named_tab_when_enabled() {
+    let home = tempfile::tempdir().unwrap();
+    let cfg_dir = sandboxed_config_dir(home.path());
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(cfg_dir.join("config.toml"), "[sidebar]\nauto_dock = true\n").unwrap();
+
+    let log = home.path().join("calls.log");
+    let fake_herdr = home.path().join("fake-herdr.sh");
+    std::fs::write(
+        &fake_herdr,
+        format!(
+            r#"#!/bin/sh
+echo "$@" >> "{log}"
+case "$1 $2" in
+  "pane list") echo '{{"result":{{"panes":[{{"pane_id":"w1:p1","tab_id":"w1:t9","terminal_title_stripped":"vim"}}]}}}}' ;;
+  "pane split") echo '{{"result":{{"pane_id":"w1:p10"}}}}' ;;
+  *) echo '{{}}' ;;
+esac
+"#,
+            log = log.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake_herdr, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cmd = Command::cargo_bin("feedr").unwrap();
+    cmd.env("HOME", home.path())
+        .env("HERDR_BIN_PATH", &fake_herdr)
+        .args(["auto-dock-hook", "--tab-id", "w1:t9"])
+        .assert()
+        .success()
+        .stdout(contains("auto-docked"));
+
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(calls.contains("pane list"), "got:\n{calls}");
+    assert!(
+        calls.contains("pane split --pane w1:p1 --direction right --no-focus"),
+        "must split beside the target tab's own pane, no-focus; got:\n{calls}"
+    );
+    assert!(
+        calls.contains("pane send-text w1:p10 exec feedr sidebar"),
+        "got:\n{calls}"
+    );
+}
+
+#[test]
+fn auto_dock_hook_subcommand_is_wired() {
+    let mut cmd = Command::cargo_bin("feedr").unwrap();
+    cmd.args(["auto-dock-hook", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--tab-id"));
+}

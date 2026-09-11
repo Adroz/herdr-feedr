@@ -54,7 +54,79 @@ pub fn dock(runner: &mut dyn Runner, herdr: &mut dyn Herdr, cfg: &SidebarConfig)
     // pane.split spawns a plain shell (no command param in 0.9.0) and splits
     // only right/down: split right, exec the sidebar into the new shell,
     // then swap-walk left.
-    let out = runner.run(&["pane", "split", "--direction", "right"])?;
+    let pane_id = open_split_dock(runner, cfg, &["pane", "split", "--direction", "right"])?;
+    Ok(format!("opened sidebar pane {pane_id}"))
+}
+
+/// Plan 3: idempotent auto-dock for herdr-plugin.toml's `tab.created`
+/// `[[events]]` hook. Scoped to the ONE tab named by `tab_id` (the just-
+/// created tab, per herdr's `HERDR_TAB_ID` event-hook context — see
+/// scripts/on-tab-created.sh) — a sidebar pane open in some OTHER tab does
+/// not satisfy this, unlike the workspace-wide `dock()` used by the
+/// open-feedr action. A pane already docked in this tab is left alone
+/// (no-op — this fires unattended, so it deliberately does not steal focus
+/// the way the user-initiated `dock()`/`herdr.focus_pane` path does).
+pub fn auto_dock_for_tab(
+    runner: &mut dyn Runner,
+    cfg: &SidebarConfig,
+    tab_id: &str,
+) -> Result<String> {
+    let list = runner.run(&["pane", "list"])?;
+    let v: Value = serde_json::from_str(&list).unwrap_or(Value::Null);
+    let result = v.get("result").unwrap_or(&v);
+    let entries = result_entries(result);
+
+    if let Some(pane_id) = entries
+        .iter()
+        .find_map(|e| sidebar_pane_id_in_tab(e, tab_id))
+    {
+        return Ok(format!(
+            "tab {tab_id} already has sidebar pane {pane_id}; no-op"
+        ));
+    }
+
+    // A pane already in the new tab to split beside (herdr's tab.create
+    // always spawns an initial shell pane — verified via socket.rs's
+    // create_tab/UnixSocketClient tests, which resolve exactly this way).
+    let target_pane = entries
+        .iter()
+        .find_map(|e| {
+            (e.get("tab_id").and_then(|t| t.as_str()) == Some(tab_id))
+                .then(|| e.get("pane_id")?.as_str().map(str::to_string))
+                .flatten()
+        })
+        .with_context(|| format!("no pane found in tab {tab_id} to dock the sidebar beside"))?;
+
+    // `--no-focus`: this hook fires unattended on every new tab, so it must
+    // not yank focus away from wherever the user (or another agent) already
+    // is — unlike the user-initiated `dock()` path above.
+    let pane_id = open_split_dock(
+        runner,
+        cfg,
+        &[
+            "pane",
+            "split",
+            "--pane",
+            &target_pane,
+            "--direction",
+            "right",
+            "--no-focus",
+        ],
+    )?;
+    Ok(format!(
+        "auto-docked sidebar pane {pane_id} in tab {tab_id}"
+    ))
+}
+
+/// Shared tail of both dock paths above: split (per `split_args`), exec the
+/// sidebar into the new pane, swap-walk it to `cfg.side`'s edge, then shrink
+/// it to `cfg.width`. Returns the new pane's id.
+fn open_split_dock(
+    runner: &mut dyn Runner,
+    cfg: &SidebarConfig,
+    split_args: &[&str],
+) -> Result<String> {
+    let out = runner.run(split_args)?;
     let pane_id = crate::tui::socket::find_string_field(
         &serde_json::from_str::<Value>(&out).unwrap_or(Value::Null),
         "pane_id",
@@ -108,27 +180,39 @@ pub fn dock(runner: &mut dyn Runner, herdr: &mut dyn Herdr, cfg: &SidebarConfig)
         "--pane",
         &pane_id,
     ])?;
-    Ok(format!("opened sidebar pane {pane_id}"))
+    Ok(pane_id)
 }
 
 fn find_sidebar_pane(pane_list_stdout: &str) -> Option<String> {
     let v: Value = serde_json::from_str(pane_list_stdout).ok()?;
     let result = v.get("result").unwrap_or(&v);
-    result_entries(result).into_iter().find_map(|e| {
-        let title = e
-            .get("terminal_title_stripped")
-            .or_else(|| e.get("terminal_title"))?
-            .as_str()?;
-        // Exact match, not `contains` — the running sidebar sets its title
-        // to exactly PANE_TITLE_MARKER (mod.rs's SetTitle call), so an exact
-        // check can't be fooled by e.g. an editor session on a file named
-        // "feedr-sidebar-notes.md" (Task 13 review rider).
-        if title == PANE_TITLE_MARKER {
-            Some(e.get("pane_id")?.as_str()?.to_string())
-        } else {
-            None
-        }
-    })
+    result_entries(result).into_iter().find_map(sidebar_pane_id)
+}
+
+/// A pane entry's id, if its title is exactly the running sidebar's marker.
+/// Exact match, not `contains` — the running sidebar sets its title to
+/// exactly PANE_TITLE_MARKER (mod.rs's SetTitle call), so an exact check
+/// can't be fooled by e.g. an editor session on a file named
+/// "feedr-sidebar-notes.md" (Task 13 review rider).
+fn sidebar_pane_id(e: &Value) -> Option<String> {
+    let title = e
+        .get("terminal_title_stripped")
+        .or_else(|| e.get("terminal_title"))?
+        .as_str()?;
+    if title == PANE_TITLE_MARKER {
+        Some(e.get("pane_id")?.as_str()?.to_string())
+    } else {
+        None
+    }
+}
+
+/// Same match as `sidebar_pane_id`, additionally scoped to one tab (Plan 3's
+/// per-tab auto-dock idempotency check).
+fn sidebar_pane_id_in_tab(e: &Value, tab_id: &str) -> Option<String> {
+    if e.get("tab_id").and_then(|t| t.as_str()) != Some(tab_id) {
+        return None;
+    }
+    sidebar_pane_id(e)
 }
 
 /// Bound on repeated-resize loops (both directions of the «/» toggle):
@@ -327,6 +411,56 @@ mod tests {
             {"pane_id":"w1:p1","terminal_title_stripped":"vim feedr-sidebar-notes.md"},
             {"pane_id":"w1:p2","terminal_title_stripped":"feedr-sidebar"}]}}"#;
         assert_eq!(find_sidebar_pane(list), Some("w1:p2".to_string()));
+    }
+
+    // --- Plan 3: auto_dock_for_tab (tab.created event hook) ----------------
+
+    #[test]
+    fn auto_dock_for_tab_is_a_noop_when_this_tab_already_has_a_sidebar_pane() {
+        let list = r#"{"id":"x","result":{"panes":[
+            {"pane_id":"w1:p1","tab_id":"w1:t2","terminal_title_stripped":"feedr-sidebar"},
+            {"pane_id":"w1:p2","tab_id":"w1:t9","terminal_title_stripped":"vim"}]}}"#;
+        let mut runner = FakeRunner::new(vec![Ok(list.into())]);
+        let msg = auto_dock_for_tab(&mut runner, &cfg(Side::Left), "w1:t2").unwrap();
+        assert!(msg.contains("no-op"), "got: {msg}");
+        assert_eq!(runner.calls, ["pane list"]); // nothing opened, nothing focused
+    }
+
+    /// A sidebar pane open in a DIFFERENT tab must not satisfy this tab's
+    /// idempotency check — auto-dock is scoped per-tab, unlike `dock()`.
+    #[test]
+    fn auto_dock_for_tab_docks_even_when_another_tab_already_has_a_sidebar_pane() {
+        let list = r#"{"id":"x","result":{"panes":[
+            {"pane_id":"w1:p1","tab_id":"w1:t2","terminal_title_stripped":"feedr-sidebar"},
+            {"pane_id":"w1:p9","tab_id":"w1:t9","terminal_title_stripped":"vim"}]}}"#;
+        let split = r#"{"id":"y","result":{"pane_id":"w1:p10"}}"#;
+        let mut runner = FakeRunner::new(vec![
+            Ok(list.into()),
+            Ok(split.into()),
+            Ok(String::new()),                   // send-text
+            Err(anyhow::anyhow!("no neighbor")), // neighbor: at the edge (single-pane new tab)
+        ]);
+        let msg = auto_dock_for_tab(&mut runner, &cfg(Side::Left), "w1:t9").unwrap();
+        assert!(msg.contains("auto-docked"), "got: {msg}");
+        assert_eq!(
+            runner.calls,
+            [
+                "pane list",
+                "pane split --pane w1:p9 --direction right --no-focus",
+                "pane send-text w1:p10 exec feedr sidebar\n",
+                "pane neighbor --direction left --pane w1:p10",
+                "pane resize --direction left --amount 0.18 --pane w1:p10",
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_dock_for_tab_errors_when_the_tab_has_no_panes() {
+        let list = r#"{"id":"x","result":{"panes":[
+            {"pane_id":"w1:p1","tab_id":"w1:t2","terminal_title_stripped":"vim"}]}}"#;
+        let mut runner = FakeRunner::new(vec![Ok(list.into())]);
+        let err = auto_dock_for_tab(&mut runner, &cfg(Side::Left), "w1:t9").unwrap_err();
+        assert!(err.to_string().contains("w1:t9"), "got: {err}");
     }
 
     #[test]

@@ -47,3 +47,16 @@ platforms = ["linux", "macos"]
 title = "Toggle feedr"
 description = "Close the feedr sidebar if it's open, otherwise open it."
 command = ["bash", "scripts/toggle-feedr.sh"]
+
+# Plan 3 auto-dock: when a user's own ~/Library/Application Support/herdr-feedr/config.toml
+# (macOS; ~/.config/herdr-feedr/ on Linux) has `[sidebar] auto_dock = true`, dock a
+# feedr-sidebar pane into every newly-created tab. herdr's manifest-level [[events]] hook
+# is the real mechanism for this in 0.9.0 -- verified live via `herdr api schema --json`
+# (InstalledPluginInfo.events / PluginManifestEventHook { on, command, platforms }) and
+# herdr.dev/docs/plugins (whose own worked example uses exactly this shape). The installed
+# herdr-file-viewer plugin's manifest comment ("there is no [[events]] hook (AC-N4)")
+# documents THAT plugin's choice not to use this mechanism -- not that it's unavailable.
+[[events]]
+on = "tab.created"
+platforms = ["linux", "macos"]
+command = ["bash", "scripts/on-tab-created.sh"]

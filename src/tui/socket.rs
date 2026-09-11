@@ -1,5 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -118,6 +122,178 @@ pub trait Herdr {
         );
         self.agent_start(&name, kind, &pane_id, &args)
     }
+}
+
+pub fn socket_path_from_env() -> PathBuf {
+    // Injected into plugin processes by herdr; default-session path otherwise
+    // (research doc: ~/.config/herdr/herdr.sock).
+    std::env::var_os("HERDR_SOCKET_PATH")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("herdr/herdr.sock")
+        })
+}
+
+pub fn herdr_bin_from_env() -> String {
+    std::env::var("HERDR_BIN_PATH")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "herdr".into())
+}
+
+/// First string value under `key` anywhere in a JSON value. Response
+/// envelopes vary between the socket and the CLI wrapper; the research doc
+/// pins fields, not nesting — so search structurally.
+pub(crate) fn find_string_field(v: &Value, key: &str) -> Option<String> {
+    match v {
+        Value::Object(map) => {
+            if let Some(Value::String(s)) = map.get(key) {
+                return Some(s.clone());
+            }
+            map.values().find_map(|v| find_string_field(v, key))
+        }
+        Value::Array(a) => a.iter().find_map(|v| find_string_field(v, key)),
+        _ => None,
+    }
+}
+
+pub struct UnixSocketClient {
+    pub socket_path: PathBuf,
+}
+
+impl UnixSocketClient {
+    pub fn from_env() -> Self {
+        UnixSocketClient {
+            socket_path: socket_path_from_env(),
+        }
+    }
+}
+
+/// One NDJSON request/response round-trip on a fresh connection.
+fn request(path: &Path, method: &str, params: serde_json::Value) -> anyhow::Result<Value> {
+    let mut stream = UnixStream::connect(path)
+        .with_context(|| format!("herdr socket unavailable at {}", path.display()))?;
+    let req = serde_json::json!({"id": "feedr", "method": method, "params": params});
+    stream.write_all(format!("{req}\n").as_bytes())?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    let resp: Value = serde_json::from_str(&line).context("bad NDJSON from herdr")?;
+    if let Some(err) = resp.get("error") {
+        anyhow::bail!(
+            "herdr: {}",
+            err.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error")
+        );
+    }
+    Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+}
+
+impl Herdr for UnixSocketClient {
+    fn list_agents(&mut self) -> Result<Vec<AgentInfo>> {
+        Ok(parse_agent_list(&request(
+            &self.socket_path,
+            "agent.list",
+            serde_json::json!({}),
+        )?))
+    }
+    fn focus_agent(&mut self, target: &str) -> Result<()> {
+        request(
+            &self.socket_path,
+            "agent.focus",
+            serde_json::json!({"target": target}),
+        )?;
+        Ok(())
+    }
+    fn focus_pane(&mut self, pane_id: &str) -> Result<()> {
+        request(
+            &self.socket_path,
+            "pane.focus",
+            serde_json::json!({"pane_id": pane_id}),
+        )?;
+        Ok(())
+    }
+    fn create_tab(&mut self, label: &str) -> Result<String> {
+        // tab.create spawns a shell pane (TabCreateParams has no command).
+        // Focus is intended here: resume is user-initiated navigation.
+        let result = request(
+            &self.socket_path,
+            "tab.create",
+            serde_json::json!({"label": label, "focus": true}),
+        )?;
+        if let Some(pane_id) = find_string_field(&result, "pane_id") {
+            return Ok(pane_id);
+        }
+        // Response named only the tab: resolve its pane via pane.list.
+        let tab_id =
+            find_string_field(&result, "tab_id").context("no tab_id in tab.create response")?;
+        let panes = request(&self.socket_path, "pane.list", serde_json::json!({}))?;
+        result_entries(&panes)
+            .into_iter()
+            .find(|e| e.get("tab_id").and_then(|t| t.as_str()) == Some(tab_id.as_str()))
+            .and_then(|e| Some(e.get("pane_id")?.as_str()?.to_string()))
+            .context("created tab has no pane")
+    }
+    fn agent_start(
+        &mut self,
+        name: &str,
+        kind: &str,
+        pane_id: &str,
+        args: &[String],
+    ) -> Result<()> {
+        request(
+            &self.socket_path,
+            "agent.start",
+            serde_json::json!({"name": name, "kind": kind, "pane_id": pane_id, "args": args}),
+        )?;
+        Ok(())
+    }
+    // open_resume_tab: the trait's provided create_tab + agent_start
+    // composition (Task 3) — no override needed.
+}
+
+/// Background subscriber: resync, stream events, resync again on every pane
+/// event; reconnect with a 5s backoff. Exits when the app drops the receiver.
+pub fn spawn_event_thread(socket_path: PathBuf, tx: mpsc::Sender<crate::tui::AppEvent>) {
+    std::thread::spawn(move || loop {
+        let _ = subscribe_loop(&socket_path, &tx);
+        if tx.send(crate::tui::AppEvent::SocketDown).is_err() {
+            return; // app gone
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    });
+}
+
+/// Blocks streaming events until the connection drops (or the app goes away).
+/// Subscription types per the research doc's recommended wiring.
+pub fn subscribe_loop(path: &Path, tx: &mpsc::Sender<crate::tui::AppEvent>) -> Result<()> {
+    let agents = parse_agent_list(&request(path, "agent.list", serde_json::json!({}))?);
+    tx.send(crate::tui::AppEvent::Agents(agents))
+        .map_err(|_| anyhow::anyhow!("app gone"))?;
+    let mut stream = UnixStream::connect(path)?;
+    let sub = serde_json::json!({"id": "sub", "method": "events.subscribe", "params": {"subscriptions": [
+        {"type": "pane.agent_status_changed"},
+        {"type": "pane.created"},
+        {"type": "pane.closed"},
+        {"type": "pane.agent_detected"}
+    ]}});
+    stream.write_all(format!("{sub}\n").as_bytes())?;
+    for line in BufReader::new(stream).lines() {
+        let line = line?;
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        // Pushed events carry "type"; the subscribe ack carries "id" — skip it.
+        if v.get("type").is_some() {
+            let agents = parse_agent_list(&request(path, "agent.list", serde_json::json!({}))?);
+            tx.send(crate::tui::AppEvent::Agents(agents))
+                .map_err(|_| anyhow::anyhow!("app gone"))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -255,5 +431,137 @@ mod tests {
         // Unknown kinds can't be resumed; failure surfaces before any call:
         assert!(fake.open_resume_tab("mystery", "x").is_err());
         assert_eq!(fake.log.borrow().len(), 2);
+    }
+
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::os::unix::net::UnixListener;
+
+    /// Sequential fake herdr: for each accepted connection, read one request
+    /// line (recorded for assertions), write the scripted response lines, close.
+    fn fake_server(
+        scripts: Vec<Vec<String>>,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        std::thread::spawn(move || {
+            for script in scripts {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                seen2.lock().unwrap().push(line.trim().to_string());
+                let mut w = stream;
+                for l in script {
+                    let _ = writeln!(w, "{l}");
+                }
+            }
+        });
+        (dir, path, seen)
+    }
+
+    #[test]
+    fn live_client_lists_agents_and_surfaces_errors() {
+        let ok = serde_json::json!({"id": "feedr", "result": {"agents": [
+            {"pane_id": "w1:p7", "agent": "claude", "agent_status": "blocked",
+             "agent_session": {"value": "abc"}}]}})
+        .to_string();
+        let err =
+            r#"{"id":"feedr","error":{"code":"not_found","message":"pane not found"}}"#.to_string();
+        let (_dir, path, _seen) = fake_server(vec![vec![ok], vec![err]]);
+        let mut c = UnixSocketClient { socket_path: path };
+        let agents = c.list_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].status, AgentStatus::Blocked);
+        assert_eq!(agents[0].session_id, "abc");
+        let e = c.focus_agent("w1:p9").unwrap_err();
+        assert!(e.to_string().contains("pane not found"), "got: {e}");
+    }
+
+    #[test]
+    fn absent_socket_fails_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = UnixSocketClient {
+            socket_path: dir.path().join("nope.sock"),
+        };
+        let e = c.list_agents().unwrap_err();
+        assert!(
+            e.to_string().contains("herdr socket unavailable"),
+            "got: {e}"
+        );
+    }
+
+    #[test]
+    fn live_resume_flow_creates_tab_then_starts_agent() {
+        let tab = r#"{"id":"feedr","result":{"tab_id":"w1:t9","pane_id":"w1:p9"}}"#.to_string();
+        let ok = r#"{"id":"feedr","result":{}}"#.to_string();
+        let (_dir, path, seen) = fake_server(vec![vec![tab], vec![ok]]);
+        let mut c = UnixSocketClient { socket_path: path };
+        c.open_resume_tab("claude", "abc-123").unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "wire: {seen:?}");
+        assert!(
+            seen[0].contains("\"method\":\"tab.create\""),
+            "got: {}",
+            seen[0]
+        );
+        assert!(seen[0].contains("\"label\":\"resume claude\""));
+        assert!(
+            seen[1].contains("\"method\":\"agent.start\""),
+            "got: {}",
+            seen[1]
+        );
+        assert!(seen[1].contains("\"kind\":\"claude\""));
+        assert!(seen[1].contains("\"pane_id\":\"w1:p9\""));
+        assert!(seen[1].contains("--resume"));
+    }
+
+    #[test]
+    fn create_tab_falls_back_to_pane_list_for_pane_id() {
+        // A tab.create response that names only the tab: resolve the pane
+        // via pane.list filtered to the new tab_id.
+        let tab = r#"{"id":"feedr","result":{"tab_id":"w1:t9"}}"#.to_string();
+        // Kept on one line deliberately: the client reads one NDJSON line per
+        // response (`request`'s `read_line`), so a literal newline embedded
+        // in this fixture (as a pretty-printed multi-line raw string would
+        // have) would truncate the parse mid-array.
+        let panes = r#"{"id":"feedr","result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t1"},{"pane_id":"w1:p9","tab_id":"w1:t9"}]}}"#.to_string();
+        let (_dir, path, _seen) = fake_server(vec![vec![tab], vec![panes]]);
+        let mut c = UnixSocketClient { socket_path: path };
+        assert_eq!(c.create_tab("resume claude").unwrap(), "w1:p9");
+    }
+
+    #[test]
+    fn subscribe_loop_resyncs_on_events() {
+        let list = serde_json::json!({"id": "feedr", "result": {"agents": [
+            {"pane_id": "w1:p7", "agent": "claude", "agent_status": "working",
+             "agent_session": {"value": "abc"}}]}})
+        .to_string();
+        let ack = r#"{"id":"sub","result":{}}"#.to_string();
+        let event =
+            r#"{"type":"pane_agent_status_changed","pane_id":"w1:p7","agent_status":"done"}"#
+                .to_string();
+        let (_dir, path, _seen) = fake_server(vec![
+            vec![list.clone()], // initial resync
+            vec![ack, event],   // subscription: ack (skipped), one event, EOF
+            vec![list],         // resync triggered by the event
+        ]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        subscribe_loop(&path, &tx).unwrap(); // returns at EOF
+        let mut agent_batches = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, crate::tui::AppEvent::Agents(_)) {
+                agent_batches += 1;
+            }
+        }
+        assert_eq!(agent_batches, 2);
     }
 }

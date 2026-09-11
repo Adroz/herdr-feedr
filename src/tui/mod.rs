@@ -49,7 +49,12 @@ pub fn run(feed_path: PathBuf, cfg: SidebarConfig) -> Result<()> {
     let (tx, rx) = mpsc::channel::<AppEvent>();
     let _watcher = watch::spawn(&feed_path, tx.clone())
         .map_err(|e| anyhow::anyhow!("cannot watch {}: {e}", feed_path.display()))?;
-    let mut app = App::new(feed_path, cfg, Box::new(NoHerdr));
+    socket::spawn_event_thread(socket::socket_path_from_env(), tx.clone());
+    let mut app = App::new(
+        feed_path,
+        cfg,
+        Box::new(socket::UnixSocketClient::from_env()),
+    );
     app.reload();
 
     let mut terminal = ratatui::init();
@@ -58,34 +63,6 @@ pub fn run(feed_path: PathBuf, cfg: SidebarConfig) -> Result<()> {
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res
-}
-
-/// Placeholder herdr client until the live one lands (Task 12): every call
-/// fails with the message the degraded UX shows. (`open_resume_tab` is the
-/// trait's provided method — it fails via `create_tab` here.)
-struct NoHerdr;
-impl socket::Herdr for NoHerdr {
-    fn list_agents(&mut self) -> Result<Vec<socket::AgentInfo>> {
-        anyhow::bail!("herdr socket unavailable")
-    }
-    fn focus_agent(&mut self, _target: &str) -> Result<()> {
-        anyhow::bail!("herdr socket unavailable")
-    }
-    fn focus_pane(&mut self, _pane_id: &str) -> Result<()> {
-        anyhow::bail!("herdr socket unavailable")
-    }
-    fn create_tab(&mut self, _label: &str) -> Result<String> {
-        anyhow::bail!("herdr socket unavailable")
-    }
-    fn agent_start(
-        &mut self,
-        _name: &str,
-        _kind: &str,
-        _pane_id: &str,
-        _args: &[String],
-    ) -> Result<()> {
-        anyhow::bail!("herdr socket unavailable")
-    }
 }
 
 /// Run $EDITOR (may carry args, e.g. "code -w") on the feed file.
@@ -104,6 +81,23 @@ pub fn spawn_editor(editor: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Drain every queued event without blocking. `FeedChanged` is coalesced —
+/// a burst (e.g. an atomic rename plus a watcher dedup miss) sets a flag
+/// instead of reloading per event; the caller reloads at most once per tick,
+/// after the drain. Every other event kind is still applied immediately, in
+/// order, via `App::on_event`.
+fn drain_events(app: &mut App, rx: &mpsc::Receiver<AppEvent>) -> bool {
+    let mut feed_changed = false;
+    while let Ok(ev) = rx.try_recv() {
+        if matches!(ev, AppEvent::FeedChanged) {
+            feed_changed = true;
+        } else {
+            app.on_event(ev);
+        }
+    }
+    feed_changed
+}
+
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
@@ -114,8 +108,8 @@ fn event_loop(
         if app.should_quit {
             return Ok(());
         }
-        while let Ok(ev) = rx.try_recv() {
-            app.on_event(ev);
+        if drain_events(app, rx) {
+            app.reload();
         }
         if let Some(path) = app.take_editor_request() {
             let editor = app.editor_cmd.clone().unwrap_or_default();
@@ -187,5 +181,58 @@ mod tests {
             .unwrap()
             .contains("From editor"));
         assert!(super::spawn_editor("/nonexistent-editor-binary", &target).is_err());
+    }
+
+    #[test]
+    fn drain_events_coalesces_feed_changed_and_applies_others_immediately() {
+        use crate::config::{Side, SidebarConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("feed.md");
+        std::fs::write(&path, "- [ ] A\n").unwrap();
+        let cfg = SidebarConfig {
+            side: Side::Left,
+            width: 0.18,
+            auto_dock: false,
+        };
+        let mut app = App::new(path.clone(), cfg, Box::new(socket::FakeHerdr::default()));
+        app.reload();
+        let initial_rows = app.rows.len();
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(AppEvent::FeedChanged).unwrap();
+        tx.send(AppEvent::Agents(vec![socket::AgentInfo {
+            pane_id: "w1:p1".into(),
+            kind: "claude".into(),
+            session_id: "abc".into(),
+            status: socket::AgentStatus::Working,
+        }]))
+        .unwrap();
+        tx.send(AppEvent::FeedChanged).unwrap();
+        tx.send(AppEvent::FeedChanged).unwrap();
+
+        // The burst these three FeedChanged events describe: the file
+        // changed on disk while they queued up.
+        std::fs::write(&path, "- [ ] A\n- [ ] B\n").unwrap();
+
+        let changed = drain_events(&mut app, &rx);
+        assert!(changed, "a queued FeedChanged must be reported");
+        // Non-FeedChanged events are applied immediately during the drain.
+        assert!(app.statuses.contains_key("abc"));
+        // Draining alone must never reload: three coalesced FeedChanged
+        // events collapse into one flag, not three reloads (or even one
+        // reload before the caller decides to).
+        assert_eq!(
+            app.rows.len(),
+            initial_rows,
+            "drain_events must not reload on its own"
+        );
+
+        app.reload();
+        assert_eq!(
+            app.rows.len(),
+            initial_rows + 1,
+            "the caller's single post-drain reload picks up the whole burst"
+        );
     }
 }

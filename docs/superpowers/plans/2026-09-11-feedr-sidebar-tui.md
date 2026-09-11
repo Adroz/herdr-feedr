@@ -1373,6 +1373,13 @@ git commit -m "feat: sidebar input translation with mouse hit-testing"
 
 ### Task 7: Actions and feed mutations + real event loop
 
+> **Carried-forward acceptance criteria (from Tasks 1-2 review):** (1) the real
+> event loop must reinstate the "fail loudly on unreadable feed" behavior —
+> NotFound → empty feed, any other read error → clean `feedr: cannot read ...`
+> error, never a silent blank sidebar; (2) `feedr sidebar` outside a tty must
+> return a clean error (check `crossterm::tty::IsTty` or equivalent before
+> `ratatui::init()`), not ratatui's internal panic.
+
 **Files:**
 - Modify: `src/tui/app.rs` (add `apply` and helpers), `src/tui/mod.rs` (real event loop)
 

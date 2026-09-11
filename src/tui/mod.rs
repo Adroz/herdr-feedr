@@ -1,4 +1,5 @@
 pub mod app;
+pub mod input;
 pub mod socket;
 #[cfg(test)]
 pub mod test_util;

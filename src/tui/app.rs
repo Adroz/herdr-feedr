@@ -105,6 +105,22 @@ pub enum SectionChoice {
     Agent,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    Quit,
+    ToggleCollapse,
+    Sweep,
+    OpenFileView,
+    OpenEditor,
+    Advance(ItemKey),
+    OpenEdit(ItemKey),
+    OpenCreate,
+    OpenDoneView,
+    AgentClick(ItemKey),
+    ScrollUp,
+    ScrollDown,
+}
+
 pub fn section_choices(doc: &Document) -> Vec<SectionChoice> {
     let mut v = vec![SectionChoice::FirstHuman];
     for (i, n) in doc.nodes.iter().enumerate() {

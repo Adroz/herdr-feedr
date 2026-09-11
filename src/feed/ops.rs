@@ -182,6 +182,7 @@ pub fn set_state(
     state: State,
     by: Authority,
 ) -> Result<(), OpError> {
+    debug_assert!(matches!(doc.nodes[index], Node::Item(_)));
     if state == State::Done && by == Authority::Agent && zone_of(doc, index) == Zone::Human {
         return Err(OpError::NotAuthorised);
     }
@@ -252,34 +253,48 @@ pub fn sweep(doc: &mut Document, today: &str) {
     });
 
     for (section, item) in archived {
-        let mut insert_at = doc.nodes.len();
-        let mut found = false;
-        let mut i = done_at + 1;
-        while i < doc.nodes.len() {
-            match &doc.nodes[i] {
-                Node::Heading { level: 2, text } if text.eq_ignore_ascii_case(&section) => {
-                    found = true;
-                    let mut j = i + 1;
-                    while j < doc.nodes.len() && !matches!(doc.nodes[j], Node::Heading { .. }) {
-                        j += 1;
-                    }
-                    insert_at = j;
-                    break;
-                }
-                _ => i += 1,
+        let insert_at = match archive_insertion_point(doc, done_at, &section) {
+            Some(at) => at,
+            None => {
+                doc.nodes.push(Node::Raw(String::new()));
+                doc.nodes.push(Node::Heading {
+                    level: 2,
+                    text: section,
+                });
+                doc.nodes.push(Node::Raw(String::new()));
+                doc.nodes.len()
             }
-        }
-        if !found {
-            doc.nodes.push(Node::Raw(String::new()));
-            doc.nodes.push(Node::Heading {
-                level: 2,
-                text: section,
-            });
-            doc.nodes.push(Node::Raw(String::new()));
-            insert_at = doc.nodes.len();
-        }
+        };
         doc.nodes.insert(insert_at, Node::Item(item));
     }
+}
+
+/// Index at which to insert a newly-archived item under the mirrored `##
+/// <section>` heading inside `# Done` (whose own heading sits at `done_at`).
+/// Stops at the next level-1 heading so a later `# Heading` reusing the same
+/// `##` name is never mistaken for the archive section. Returns `None` when
+/// no such subsection exists yet within `# Done`.
+fn archive_insertion_point(doc: &Document, done_at: usize, section: &str) -> Option<usize> {
+    let mut i = done_at + 1;
+    while i < doc.nodes.len() {
+        match &doc.nodes[i] {
+            Node::Heading { level: 1, .. } => break,
+            Node::Heading { level: 2, text } if text.eq_ignore_ascii_case(section) => {
+                let mut j = i + 1;
+                while j < doc.nodes.len() && !matches!(doc.nodes[j], Node::Heading { .. }) {
+                    j += 1;
+                }
+                // Don't glue the new item after trailing blank lines; insert
+                // right after the last real (non-blank) line of the section.
+                while j > i + 1 && matches!(&doc.nodes[j - 1], Node::Raw(s) if s.is_empty()) {
+                    j -= 1;
+                }
+                return Some(j);
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -453,5 +468,98 @@ mod tests {
         assert!(out.contains("- [?] Awaiting review"));
         assert!(!out.contains("Agent chore"));
         assert!(out.contains("@done(2026-09-01)"));
+    }
+
+    #[test]
+    fn sweep_creates_done_when_absent() {
+        let mut doc = parse("# Feed\n\n- [x] Ship it\n- [ ] Keep\n");
+        sweep(&mut doc, "2026-09-11");
+        let out = render(&doc);
+        assert!(out.contains("# Done"));
+        assert!(out.contains("- [x] Ship it @done(2026-09-11)"));
+        assert!(out.find("Ship it").unwrap() > out.find("# Done").unwrap());
+    }
+
+    #[test]
+    fn sweep_creates_missing_mirrored_section() {
+        let mut doc = parse(
+            "\
+# Feed
+
+## Work
+
+- [x] W done
+
+# Done
+
+## Feed
+
+- [x] Old @done(2026-09-01)
+",
+        );
+        sweep(&mut doc, "2026-09-11");
+        let out = render(&doc);
+        let done = out.find("# Done").unwrap();
+        let work_hdr = out.rfind("## Work").unwrap();
+        assert!(
+            work_hdr > done,
+            "mirrored ## Work must be created inside Done"
+        );
+        assert!(out.contains("- [x] W done @done(2026-09-11)"));
+    }
+
+    #[test]
+    fn sweep_is_idempotent_after_round_trip() {
+        let text = "\
+# Feed
+
+- [x] A
+
+## Work
+
+- [x] B
+
+# Done
+
+## Feed
+
+- [x] Old @done(2026-09-01)
+
+## Other
+
+- [x] Elsewhere @done(2026-08-01)
+";
+        let mut doc = parse(text);
+        sweep(&mut doc, "2026-09-11");
+        let once = render(&doc);
+        let mut doc2 = parse(&once);
+        sweep(&mut doc2, "2026-09-12");
+        assert_eq!(render(&doc2), once);
+    }
+
+    #[test]
+    fn sweep_insertion_keeps_blank_before_next_section() {
+        let text = "\
+# Feed
+
+- [x] New thing
+
+# Done
+
+## Feed
+
+- [x] Old @done(2026-09-01)
+
+## Other
+
+- [x] Elsewhere @done(2026-08-01)
+";
+        let mut doc = parse(text);
+        sweep(&mut doc, "2026-09-11");
+        let out = render(&doc);
+        assert!(
+            out.contains("- [x] Old @done(2026-09-01)\n- [x] New thing @done(2026-09-11)\n\n## Other"),
+            "item must append directly after the last archive item, blank line preserved before ## Other; got:\n{out}"
+        );
     }
 }

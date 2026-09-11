@@ -1559,7 +1559,7 @@ Expected: FAIL — `App::apply` not defined.
             Action::ToggleCollapse => self.collapsed = !self.collapsed,
             Action::ScrollUp => self.scroll = self.scroll.saturating_sub(1),
             Action::ScrollDown => {
-                if self.scroll + 1 < self.rows.len() {
+                if self.scroll.saturating_add(1) < self.rows.len() {
                     self.scroll += 1;
                 }
             }
@@ -2534,7 +2534,7 @@ In `handle_modal_event`, add the viewer arms to the `match modal`:
 ```rust
             Modal::DoneView { scroll } => match ev {
                 Event::Key(k) if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) => Modal::None,
-                Event::Key(k) if k.code == KeyCode::Down => Modal::DoneView { scroll: scroll + 1 },
+                Event::Key(k) if k.code == KeyCode::Down => Modal::DoneView { scroll: scroll.saturating_add(1) },
                 Event::Key(k) if k.code == KeyCode::Up => {
                     Modal::DoneView { scroll: scroll.saturating_sub(1) }
                 }
@@ -2546,7 +2546,7 @@ In `handle_modal_event`, add the viewer arms to the `match modal`:
                     self.request_editor();
                     Modal::None
                 }
-                Event::Key(k) if k.code == KeyCode::Down => Modal::FileView { scroll: scroll + 1 },
+                Event::Key(k) if k.code == KeyCode::Down => Modal::FileView { scroll: scroll.saturating_add(1) },
                 Event::Key(k) if k.code == KeyCode::Up => {
                     Modal::FileView { scroll: scroll.saturating_sub(1) }
                 }

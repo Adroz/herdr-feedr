@@ -3424,6 +3424,11 @@ git commit -m "feat: idempotent --dock launcher (beads split/swap/resize pattern
 
 ### Task 14: Wrap-up
 
+> **Carried-forward from Task 5 review:** `ellipsize` budgets by char count,
+> not display width — CJK/emoji titles overflow their cell budget and ratatui
+> clips the `…` marker. Fix here with the `unicode-width` crate (already in the
+> tree transitively via ratatui) or record as a known v1 limitation.
+
 **Files:**
 - Modify: `README.md`
 

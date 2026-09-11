@@ -146,6 +146,12 @@ pub struct App {
     editor_request: Option<PathBuf>,
     /// Our own herdr pane id (env HERDR_PANE_ID), when running inside herdr.
     pub herdr_pane_id: Option<String>,
+    /// Number of resize steps `dock::collapse_pane` actually applied on the
+    /// last collapse — `dock::expand_pane` undoes exactly this many on the
+    /// next expand (Plan 3b: an inverse count, not a fixed single-step
+    /// guess), so a pane driven to herdr's minimum over several iterations
+    /// still returns to its original width.
+    collapse_resize_steps: usize,
 }
 
 impl App {
@@ -168,6 +174,7 @@ impl App {
             herdr_pane_id: std::env::var("HERDR_PANE_ID")
                 .ok()
                 .filter(|p| !p.is_empty()),
+            collapse_resize_steps: 0,
         }
     }
 
@@ -252,12 +259,18 @@ impl App {
                 // pane id and the rendered rail alone carries the collapse.
                 if let Some(pane) = self.herdr_pane_id.clone() {
                     let mut runner = crate::tui::dock::HerdrCli::from_env();
-                    let _ = crate::tui::dock::resize_for_collapse(
-                        &mut runner,
-                        &self.cfg,
-                        self.collapsed,
-                        &pane,
-                    );
+                    if self.collapsed {
+                        self.collapse_resize_steps =
+                            crate::tui::dock::collapse_pane(&mut runner, &self.cfg, &pane);
+                    } else {
+                        crate::tui::dock::expand_pane(
+                            &mut runner,
+                            &self.cfg,
+                            &pane,
+                            self.collapse_resize_steps,
+                        );
+                        self.collapse_resize_steps = 0;
+                    }
                 }
             }
             Action::ScrollUp => self.scroll = self.scroll.saturating_sub(1),

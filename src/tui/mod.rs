@@ -1,5 +1,8 @@
 pub mod app;
 pub mod socket;
+#[cfg(test)]
+pub mod test_util;
+pub mod view;
 
 use crate::config::SidebarConfig;
 use anyhow::Result;

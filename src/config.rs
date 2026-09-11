@@ -6,6 +6,12 @@ struct FileConfig {
     feed_path: Option<PathBuf>,
 }
 
+pub fn default_config_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("herdr-feedr")
+}
+
 pub fn resolve_feed_path(
     cli_file: Option<PathBuf>,
     env_file: Option<PathBuf>,
@@ -21,7 +27,9 @@ pub fn resolve_feed_path(
         .ok()
         .and_then(|s| toml::from_str(&s).ok())
         .unwrap_or_default();
-    cfg.feed_path.unwrap_or_else(|| config_dir.join("feed.md"))
+    cfg.feed_path
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| config_dir.join("feed.md"))
 }
 
 #[cfg(test)]
@@ -59,6 +67,12 @@ mod tests {
                 dir.path()
             ),
             PathBuf::from("/tmp/cli.md")
+        );
+        // Empty feed_path treated as unset:
+        std::fs::write(dir.path().join("config.toml"), "feed_path = \"\"\n").unwrap();
+        assert_eq!(
+            resolve_feed_path(None, None, dir.path()),
+            dir.path().join("feed.md")
         );
     }
 }

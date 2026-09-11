@@ -2,8 +2,10 @@ use crate::config::SidebarConfig;
 use crate::feed::ops::{self, Authority, Zone};
 use crate::feed::write::save_atomic;
 use crate::feed::{AgentRef, Document, Item, Node, State};
+use crate::tui::modal::{EditModal, Modal, ModalStep};
 use crate::tui::socket::{AgentInfo, Herdr};
 use anyhow::Result;
+use crossterm::event::Event;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -159,6 +161,7 @@ pub struct App {
     pub status_msg: Option<String>,
     pub should_quit: bool,
     pub herdr: Box<dyn Herdr>,
+    pub modal: Modal,
 }
 
 impl App {
@@ -175,6 +178,7 @@ impl App {
             status_msg: None,
             should_quit: false,
             herdr,
+            modal: Modal::None,
         }
     }
 
@@ -261,13 +265,85 @@ impl App {
                 });
             }
             Action::AgentClick(key) => self.agent_click(key),
-            // Wired in later tasks (modal: Task 9; viewers/editor: Task 10):
-            Action::OpenEdit(_)
-            | Action::OpenCreate
-            | Action::OpenDoneView
-            | Action::OpenFileView
-            | Action::OpenEditor => {}
+            Action::OpenEdit(key) => {
+                if let Some(i) = relocate(&self.doc, &key) {
+                    if let Node::Item(it) = &self.doc.nodes[i] {
+                        self.modal = Modal::Edit(EditModal::edit(key, it));
+                    }
+                }
+            }
+            Action::OpenCreate => self.modal = Modal::Edit(EditModal::create(&self.doc)),
+            // Wired in Task 10:
+            Action::OpenDoneView | Action::OpenFileView | Action::OpenEditor => {}
         }
+    }
+
+    pub fn modal_active(&self) -> bool {
+        !matches!(self.modal, Modal::None)
+    }
+
+    /// Route an input event into the active modal (main-list input is
+    /// bypassed while a modal is open). The pure transition logic lives in
+    /// `modal::step`; this is just the glue for the two outcomes that need
+    /// filesystem access (`Save`, `Delete`), which only `App` can provide
+    /// (`with_feed` is private to this module).
+    pub fn handle_modal_event(&mut self, ev: Event) {
+        let modal = std::mem::replace(&mut self.modal, Modal::None);
+        self.modal = match crate::tui::modal::step(modal, ev) {
+            ModalStep::Continue(m) => m,
+            ModalStep::Save(m) => self.save_modal(m),
+            ModalStep::Delete(key) => {
+                self.delete_item(key);
+                Modal::None
+            }
+        };
+    }
+
+    fn save_modal(&mut self, m: EditModal) -> Modal {
+        let title = m.title_text();
+        if title.is_empty() {
+            self.status_msg = Some("title required".into());
+            return Modal::Edit(m);
+        }
+        let body = m.body_lines();
+        match &m.original {
+            Some(key) => {
+                let key = key.clone();
+                self.with_feed(move |doc| match relocate(doc, &key) {
+                    Some(i) => {
+                        ops::edit(doc, i, &title, &body);
+                        Ok(Outcome::Changed(None))
+                    }
+                    None => Ok(Outcome::Unchanged(Some(
+                        "item changed on disk — edit dropped".into(),
+                    ))),
+                });
+            }
+            None => {
+                let choice = m.choices[m.choice_idx].clone();
+                self.with_feed(move |doc| {
+                    match choice {
+                        SectionChoice::FirstHuman => ops::add(doc, &title, &body, Zone::Human),
+                        SectionChoice::Agent => ops::add(doc, &title, &body, Zone::Agent),
+                        SectionChoice::Named(s) => ops::add_in_section(doc, &title, &body, &s)?,
+                    }
+                    Ok(Outcome::Changed(None))
+                });
+            }
+        }
+        Modal::None
+    }
+
+    fn delete_item(&mut self, key: ItemKey) {
+        self.with_feed(move |doc| match relocate(doc, &key) {
+            Some(i) => {
+                ops::remove(doc, i);
+                Ok(Outcome::Changed(Some("deleted".into())))
+            }
+            None => Ok(Outcome::Unchanged(Some(
+                "item changed on disk — delete dropped".into(),
+            ))),
+        });
     }
 
     /// Checkbox click state-advance (spec §3): [ ]→[~]→[x]→[ ]; on [?] the
@@ -708,5 +784,106 @@ mod tests {
             msg.contains("missing") || msg.contains("dropped"),
             "expected a dropped-action status message, got: {msg}"
         );
+    }
+
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_modal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    fn press_ctrl(app: &mut App, c: char) {
+        app.handle_modal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::CONTROL,
+        )));
+    }
+
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn create_modal_adds_item_to_picked_section() {
+        let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n\n## Later\n\n- [ ] L1\n");
+        app.apply(Action::OpenCreate);
+        assert!(app.modal_active());
+        // Section field focused first; cycle FirstHuman → Later:
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Tab); // → Title
+        type_str(&mut app, "L2");
+        press(&mut app, KeyCode::Enter); // → Body
+        type_str(&mut app, "ctx");
+        press_ctrl(&mut app, 's');
+        assert!(!app.modal_active());
+        assert!(feed_text(&app).contains("- [ ] L1\n- [ ] L2\n  ctx\n"));
+    }
+
+    #[test]
+    fn create_modal_agent_section_and_empty_title_rejected() {
+        let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n");
+        app.apply(Action::OpenCreate);
+        press_ctrl(&mut app, 's'); // empty title
+        assert!(app.modal_active());
+        assert_eq!(app.status_msg.as_deref(), Some("title required"));
+        // Choices are [FirstHuman, Agent] (no named sections): pick Agent.
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Tab);
+        type_str(&mut app, "Agent chore");
+        press_ctrl(&mut app, 's');
+        assert!(feed_text(&app).contains("## Agent\n\n- [ ] Agent chore\n"));
+    }
+
+    #[test]
+    fn edit_modal_updates_title_and_body() {
+        let (mut app, _fake, _dir) = app_on_disk("- [~] Old @agent(claude:abc)\n  old body\n");
+        app.apply(Action::OpenEdit(ItemKey {
+            title: "Old".into(),
+            state: State::InProgress,
+        }));
+        let Modal::Edit(m) = &app.modal else {
+            panic!("expected edit modal")
+        };
+        assert_eq!(m.title_text(), "Old");
+        assert_eq!(m.body_lines(), vec!["old body"]);
+        type_str(&mut app, "er"); // cursor starts in the title
+        press_ctrl(&mut app, 's');
+        let text = feed_text(&app);
+        assert!(
+            text.contains("Older") && text.contains("@agent(claude:abc)"),
+            "got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn delete_requires_confirm() {
+        let (mut app, _fake, _dir) = app_on_disk("- [ ] Doomed\n  ctx\n- [ ] Keeper\n");
+        app.apply(Action::OpenEdit(ItemKey {
+            title: "Doomed".into(),
+            state: State::Open,
+        }));
+        press_ctrl(&mut app, 'd');
+        assert!(matches!(app.modal, Modal::ConfirmDelete(_)));
+        press(&mut app, KeyCode::Char('n')); // back out
+        assert!(matches!(app.modal, Modal::Edit(_)));
+        press_ctrl(&mut app, 'd');
+        press(&mut app, KeyCode::Char('y'));
+        assert!(!app.modal_active());
+        assert_eq!(feed_text(&app), "- [ ] Keeper\n");
+    }
+
+    #[test]
+    fn esc_cancels_without_writing() {
+        let (mut app, _fake, _dir) = app_on_disk("- [ ] A\n");
+        app.apply(Action::OpenEdit(ItemKey {
+            title: "A".into(),
+            state: State::Open,
+        }));
+        type_str(&mut app, "bc");
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.modal_active());
+        assert_eq!(feed_text(&app), "- [ ] A\n");
     }
 }

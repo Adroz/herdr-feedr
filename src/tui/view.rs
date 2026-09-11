@@ -1,10 +1,11 @@
 use crate::feed::State;
 use crate::tui::app::{App, Row};
+use crate::tui::modal::{EditFocus, Modal};
 use crate::tui::socket::AgentStatus;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 /// Toolbar text; the click spans in input.rs must match these columns:
@@ -79,6 +80,83 @@ pub fn draw(f: &mut Frame, app: &App) {
         Paragraph::new(app.status_msg.clone().unwrap_or_default()),
         status,
     );
+
+    draw_modal(f, app);
+}
+
+fn draw_modal(f: &mut Frame, app: &App) {
+    match &app.modal {
+        Modal::None => {}
+        Modal::Edit(m) => {
+            let area = centered(f.area(), 90, 80);
+            f.render_widget(Clear, area);
+            let outer = Block::bordered().title(if m.original.is_some() {
+                "Edit item"
+            } else {
+                "New item"
+            });
+            let inner = outer.inner(area);
+            f.render_widget(outer, area);
+            let [section, title, body, hints] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(3),
+                Constraint::Min(3),
+                Constraint::Length(1),
+            ])
+            .areas(inner);
+            if m.original.is_none() {
+                let marker = if m.focus == EditFocus::Section {
+                    "*"
+                } else {
+                    ""
+                };
+                f.render_widget(
+                    Paragraph::new(format!("Section{marker}: ‹ {} ›", m.choice_label())),
+                    section,
+                );
+            }
+            f.render_widget(&m.title, title);
+            f.render_widget(&m.body, body);
+            let hint = if m.original.is_some() {
+                "Tab field · ^S save · ^D delete · Esc cancel"
+            } else {
+                "Tab field · ^S save · Esc cancel"
+            };
+            f.render_widget(Paragraph::new(hint), hints);
+        }
+        Modal::ConfirmDelete(m) => {
+            let area = centered(f.area(), 80, 20);
+            f.render_widget(Clear, area);
+            let outer = Block::bordered().title("Confirm delete");
+            let inner = outer.inner(area);
+            f.render_widget(outer, area);
+            let title = m
+                .original
+                .as_ref()
+                .map(|k| k.title.clone())
+                .unwrap_or_default();
+            f.render_widget(
+                Paragraph::new(format!("Delete \"{title}\"? [y]es / [n]o")),
+                inner,
+            );
+        }
+    }
+}
+
+fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
+    let [_, mid_v, _] = Layout::vertical([
+        Constraint::Percentage((100 - pct_y) / 2),
+        Constraint::Percentage(pct_y),
+        Constraint::Percentage((100 - pct_y) / 2),
+    ])
+    .areas(area);
+    let [_, mid, _] = Layout::horizontal([
+        Constraint::Percentage((100 - pct_x) / 2),
+        Constraint::Percentage(pct_x),
+        Constraint::Percentage((100 - pct_x) / 2),
+    ])
+    .areas(mid_v);
+    mid
 }
 
 fn row_line(app: &App, row: &Row, w: usize) -> Line<'static> {

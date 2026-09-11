@@ -40,7 +40,10 @@ impl AgentRef {
         if kind.is_empty() || id.is_empty() {
             return None;
         }
-        Some(AgentRef { kind: kind.to_string(), id: id.to_string() })
+        Some(AgentRef {
+            kind: kind.to_string(),
+            id: id.to_string(),
+        })
     }
 }
 
@@ -64,7 +67,10 @@ pub struct Item {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Node {
     /// `# Title` (level 1) or `## Title` (level 2), text without the hashes.
-    Heading { level: u8, text: String },
+    Heading {
+        level: u8,
+        text: String,
+    },
     Item(Item),
     /// Any line the parser doesn't own — re-emitted verbatim.
     Raw(String),
@@ -85,7 +91,12 @@ mod tests {
 
     #[test]
     fn state_char_round_trip() {
-        for (c, s) in [(' ', State::Open), ('~', State::InProgress), ('?', State::Review), ('x', State::Done)] {
+        for (c, s) in [
+            (' ', State::Open),
+            ('~', State::InProgress),
+            ('?', State::Review),
+            ('x', State::Done),
+        ] {
             assert_eq!(State::from_char(c), Some(s));
             assert_eq!(s.to_char(), c);
         }
@@ -99,5 +110,7 @@ mod tests {
         assert_eq!(a.id, "0198f3ab-7c2e");
         assert_eq!(a.to_string(), "claude:0198f3ab-7c2e");
         assert!(AgentRef::parse("no-colon").is_none());
+        assert!(AgentRef::parse(":id").is_none());
+        assert!(AgentRef::parse("kind:").is_none());
     }
 }

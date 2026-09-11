@@ -1,3 +1,4 @@
+pub mod app;
 pub mod socket;
 
 use crate::config::SidebarConfig;

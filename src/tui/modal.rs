@@ -180,6 +180,21 @@ pub(crate) fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
 /// One cell of inner padding (round-3 item 1) — the same padding
 /// `view::draw_edit_modal`'s `Block` is drawn with, so the visual panel and
 /// this hit-tested geometry can never drift apart.
+///
+/// Crash fix: the button row lays out Save/Cancel/Delete by walking an
+/// x-cursor across their raw label widths + gaps. At the ~30-col width
+/// herdr docks a sidebar pane at, that sum (32 cells) can exceed not just
+/// the modal panel but the terminal itself — the button `Rect`s must never
+/// be allowed past `term_area`'s own right edge, because `view::draw_edit_modal`
+/// hands them straight to `Paragraph::render`, which indexes the frame's
+/// buffer directly rather than clipping. Every button rect is therefore
+/// intersected with `term_area` before being returned: on a wide-enough
+/// terminal this is a no-op (the intersection equals the original rect); at
+/// a narrow one it clamps (or, for a button that starts entirely past the
+/// edge, zeroes) the rect so it can never escape the buffer that's actually
+/// being drawn into — the same rect that's later used to hit-test clicks
+/// (`edit_click`), so a clipped-away button also becomes unclickable rather
+/// than clickable-but-invisible.
 pub fn edit_layout(term_area: Rect, is_edit: bool) -> EditLayout {
     let outer = centered(term_area, 90, 80);
     let inner = Block::bordered().padding(Padding::uniform(1)).inner(outer);
@@ -192,11 +207,16 @@ pub fn edit_layout(term_area: Rect, is_edit: bool) -> EditLayout {
     .areas(inner);
 
     let mut x = buttons.x;
-    let save = Rect::new(x, buttons.y, SAVE_LABEL.len() as u16, 1);
-    x += SAVE_LABEL.len() as u16 + BUTTON_GAP;
-    let cancel = Rect::new(x, buttons.y, CANCEL_LABEL.len() as u16, 1);
-    x += CANCEL_LABEL.len() as u16 + BUTTON_GAP;
-    let delete = is_edit.then(|| Rect::new(x, buttons.y, DELETE_LABEL.len() as u16, 1));
+    let save = Rect::new(x, buttons.y, SAVE_LABEL.len() as u16, 1).intersection(term_area);
+    x = x
+        .saturating_add(SAVE_LABEL.len() as u16)
+        .saturating_add(BUTTON_GAP);
+    let cancel = Rect::new(x, buttons.y, CANCEL_LABEL.len() as u16, 1).intersection(term_area);
+    x = x
+        .saturating_add(CANCEL_LABEL.len() as u16)
+        .saturating_add(BUTTON_GAP);
+    let delete = is_edit
+        .then(|| Rect::new(x, buttons.y, DELETE_LABEL.len() as u16, 1).intersection(term_area));
 
     EditLayout {
         outer,
@@ -473,6 +493,43 @@ mod tests {
     fn edit_layout_has_no_delete_button_in_create_mode_and_one_in_edit_mode() {
         assert!(edit_layout(TEST_AREA, false).delete.is_none());
         assert!(edit_layout(TEST_AREA, true).delete.is_some());
+    }
+
+    /// Crash regression: at narrow widths (e.g. the ~30-col pane herdr docks
+    /// a sidebar into) the button row's raw `x`-cursor arithmetic — Save
+    /// width + gap + Cancel width + gap + Delete width, added up with no
+    /// bound check — placed the Delete (and sometimes Cancel) button's Rect
+    /// entirely past the right edge of the terminal itself, not just the
+    /// modal panel. `view::draw_edit_modal` then handed that Rect straight
+    /// to `Paragraph::render`, which indexes the frame's buffer directly and
+    /// panics ("index outside of buffer") the instant `x >= buffer width` —
+    /// killing the whole pane. Every button rect must stay within the
+    /// terminal area at every width, not just the ones wide enough for all
+    /// three labels to fit comfortably. A rect clipped down to zero width is
+    /// exempt — `Rect::right()` on an empty rect can still report a large
+    /// `x`, but an empty rect is never actually drawn into or clickable
+    /// (`Paragraph::render_paragraph` and `rect_contains` both treat
+    /// zero-width as a no-op), so it can't cause the out-of-buffer write.
+    #[test]
+    fn edit_layout_buttons_never_escape_the_terminal_at_any_width() {
+        for width in 1..=120u16 {
+            let area = Rect::new(0, 0, width, 40);
+            for is_edit in [false, true] {
+                let layout = edit_layout(area, is_edit);
+                for (name, r) in [("save", layout.save), ("cancel", layout.cancel)] {
+                    assert!(
+                        r.is_empty() || r.right() <= area.width,
+                        "{name} button {r:?} escapes terminal width {width}"
+                    );
+                }
+                if let Some(d) = layout.delete {
+                    assert!(
+                        d.is_empty() || d.right() <= area.width,
+                        "delete button {d:?} escapes terminal width {width}"
+                    );
+                }
+            }
+        }
     }
 
     /// Round-2 item 5: the section picker is gone, so create mode focuses

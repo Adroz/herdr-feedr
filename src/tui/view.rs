@@ -733,6 +733,31 @@ mod tests {
         assert!(!joined.contains(modal::DELETE_LABEL), "got:\n{joined}");
     }
 
+    /// Crash regression (production panic): `feedr::tui::run`'s draw loop
+    /// panicked with "index outside of buffer" inside `Paragraph::render`
+    /// when a task was clicked (opening the edit modal, which has a Delete
+    /// button) while the sidebar pane was a narrow ~30 columns — the width
+    /// herdr docks a sidebar pane at. Root cause: `modal::edit_layout`'s
+    /// button row placed the Delete button's `Rect` past the right edge of
+    /// the terminal itself (not just the modal panel) via unbounded
+    /// x-cursor arithmetic; `render_button` then handed that Rect straight
+    /// to `Paragraph::render`, which panics instead of clipping. This drives
+    /// the exact failing path end-to-end through a real `TestBackend` draw
+    /// at the reproducing size (30x40, matching the field crash) rather than
+    /// just checking geometry, so a future regression anywhere in the render
+    /// path — not only the layout math `edit_layout_buttons_never_escape_
+    /// the_terminal_at_any_width` in modal.rs guards — is caught too.
+    #[test]
+    fn edit_modal_survives_narrow_pane_render_without_panicking() {
+        let mut app = app_with(SAMPLE);
+        app.apply(Action::OpenEdit(ItemKey {
+            title: "Fix auth redirect loop".into(),
+            state: State::Open,
+        }));
+        let rows = render_to_strings(&app, 30, 40);
+        assert!(!rows.is_empty());
+    }
+
     #[test]
     fn edit_modal_shows_delete_button() {
         let mut app = app_with(SAMPLE);

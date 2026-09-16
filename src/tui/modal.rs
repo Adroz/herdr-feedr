@@ -13,7 +13,7 @@ use crate::feed::Item;
 use crate::tui::app::ItemKey;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Padding};
 use tui_textarea::{CursorMove, TextArea};
 
@@ -130,11 +130,23 @@ impl EditModal {
     }
 
     /// Mark the focused field's border title with `*` so focus is visible,
-    /// and neutralize the textareas' own cursor styling — tui-textarea
-    /// renders a reverse-video cell at its cursor position regardless of
-    /// focus, but the only cursor that should ever be visible is the real
-    /// terminal cursor the focused field gets from `frame.set_cursor_position`
-    /// (round-2 feedback item 1).
+    /// and set each textarea's own cursor styling to match focus.
+    ///
+    /// Round-2 feedback item 1 neutralized every field's cursor style and
+    /// relied on the real terminal cursor (placed by
+    /// `view::draw_edit_modal` via `frame.set_cursor_position`) as the only
+    /// visible cursor. That decision is reversed here: the real terminal
+    /// cursor was placed from the textarea's LOGICAL cursor column, which
+    /// drifts from the drawn text whenever tui-textarea has scrolled its
+    /// viewport horizontally (any line longer than the field's width) —
+    /// tui-textarea 0.7 exposes no viewport offset to correct by.
+    ///
+    /// The focused field shows tui-textarea's own rendered cursor cell
+    /// instead — it is always viewport-correct, unlike a real terminal
+    /// cursor placed from the LOGICAL cursor column (which drifts whenever
+    /// the textarea has scrolled horizontally; tui-textarea 0.7 exposes no
+    /// viewport offset to correct by). Unfocused fields get an invisible
+    /// cursor style so only one cursor shows.
     pub fn sync_blocks(&mut self) {
         let c = if self.focus == EditFocus::Category {
             "Category*"
@@ -154,9 +166,26 @@ impl EditModal {
         self.category.set_block(Block::bordered().title(c));
         self.title.set_block(Block::bordered().title(t));
         self.body.set_block(Block::bordered().title(b));
-        self.category.set_cursor_style(Style::default());
-        self.title.set_cursor_style(Style::default());
-        self.body.set_cursor_style(Style::default());
+        let visible = Style::default().add_modifier(Modifier::REVERSED);
+        let invisible = Style::default();
+        self.category
+            .set_cursor_style(if self.focus == EditFocus::Category {
+                visible
+            } else {
+                invisible
+            });
+        self.title
+            .set_cursor_style(if self.focus == EditFocus::Title {
+                visible
+            } else {
+                invisible
+            });
+        self.body
+            .set_cursor_style(if self.focus == EditFocus::Body {
+                visible
+            } else {
+                invisible
+            });
     }
 
     pub fn category_text(&self) -> String {
@@ -836,27 +865,30 @@ mod tests {
         ));
     }
 
-    /// Round-2 item 1: tui-textarea renders its own reverse-video cursor
-    /// cell regardless of focus; the only cursor that should ever be
-    /// visible is the real terminal cursor `view::draw_edit_modal` places
-    /// via `frame.set_cursor_position` on the focused field. All three
-    /// textareas' internal cursor style must be neutralized at all times —
-    /// on construction and after every focus change.
+    /// Cursor fix: tui-textarea renders its own cursor cell using whatever
+    /// `cursor_style` is set — always at the viewport-correct position,
+    /// unlike a real terminal cursor placed from the logical column. Only
+    /// the FOCUSED field should get a visible (reversed) cursor style; the
+    /// other two must stay invisible, on construction and after every focus
+    /// change.
     #[test]
-    fn textareas_never_render_their_own_cursor_style() {
-        let m = create_modal();
-        assert_eq!(m.category.cursor_style(), Style::default());
-        assert_eq!(m.title.cursor_style(), Style::default());
-        assert_eq!(m.body.cursor_style(), Style::default());
+    fn focused_field_gets_reversed_cursor_style_others_stay_invisible() {
+        let visible = Style::default().add_modifier(Modifier::REVERSED);
+        let invisible = Style::default();
 
-        let mut m = edit_modal();
-        assert_eq!(m.category.cursor_style(), Style::default());
-        assert_eq!(m.title.cursor_style(), Style::default());
-        assert_eq!(m.body.cursor_style(), Style::default());
+        let m = create_modal(); // focus starts on Category
+        assert_eq!(m.category.cursor_style(), visible);
+        assert_eq!(m.title.cursor_style(), invisible);
+        assert_eq!(m.body.cursor_style(), invisible);
+
+        let mut m = edit_modal(); // focus also starts on Category
+        assert_eq!(m.category.cursor_style(), visible);
+        assert_eq!(m.title.cursor_style(), invisible);
+        assert_eq!(m.body.cursor_style(), invisible);
         m.cycle_focus(); // Category -> Title
-        assert_eq!(m.category.cursor_style(), Style::default());
-        assert_eq!(m.title.cursor_style(), Style::default());
-        assert_eq!(m.body.cursor_style(), Style::default());
+        assert_eq!(m.category.cursor_style(), invisible);
+        assert_eq!(m.title.cursor_style(), visible);
+        assert_eq!(m.body.cursor_style(), invisible);
     }
 
     #[test]

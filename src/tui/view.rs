@@ -2,7 +2,7 @@ use crate::tui::app::{App, Row};
 use crate::tui::modal::{self, EditFocus, Modal};
 use crate::tui::socket::AgentStatus;
 use crate::tui::theme;
-use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph};
@@ -239,10 +239,13 @@ fn dim_backdrop(f: &mut Frame) {
 
 /// Draw the edit/create modal from its shared pure geometry (`modal::edit_layout`
 /// — the same function `modal::step`'s mouse handling hit-tests against, so
-/// the drawn boxes and the clickable ones can never drift apart), render the
-/// Save/Cancel/Delete buttons, and — when a textarea is focused — place the
-/// real terminal cursor there so the terminal's own blink applies (spec:
-/// replace the static styled cursor cell).
+/// the drawn boxes and the clickable ones can never drift apart) and render
+/// the Save/Cancel/Delete buttons. The focused textarea's own cursor cell
+/// (styled reversed by `modal::EditModal::sync_blocks`) is the only cursor
+/// shown — the real terminal cursor is never placed, because it would be
+/// positioned from the textarea's logical cursor column, which drifts from
+/// the drawn text whenever tui-textarea has scrolled its viewport
+/// horizontally (see `sync_blocks` for the full rationale).
 fn draw_edit_modal(f: &mut Frame, m: &modal::EditModal) {
     let is_edit = m.original.is_some();
     let layout = modal::edit_layout(f.area(), is_edit, m.dropdown_rows());
@@ -306,35 +309,10 @@ fn draw_edit_modal(f: &mut Frame, m: &modal::EditModal) {
             layout.dropdown,
         );
     }
-
-    match m.focus {
-        EditFocus::Category => {
-            f.set_cursor_position(cursor_screen_pos(layout.category, m.category.cursor()))
-        }
-        EditFocus::Title => {
-            f.set_cursor_position(cursor_screen_pos(layout.title, m.title.cursor()))
-        }
-        EditFocus::Body => f.set_cursor_position(cursor_screen_pos(layout.body, m.body.cursor())),
-        _ => {}
-    }
 }
 
 fn render_button(f: &mut Frame, area: Rect, label: &str, focused: bool) {
     f.render_widget(Paragraph::new(label).style(theme::button(focused)), area);
-}
-
-/// Screen position of a textarea's cursor, given the bordered `Rect` it was
-/// rendered into. tui-textarea 0.7 doesn't expose its internal scroll
-/// viewport publicly, so this clamps into the visible inner rect rather than
-/// tracking exact horizontal/vertical scroll offsets — acceptable for these
-/// modal fields (title is a single line; body is short).
-fn cursor_screen_pos(area: Rect, cursor: (usize, usize)) -> Position {
-    let inner = Block::bordered().inner(area);
-    let (row, col) = cursor;
-    Position {
-        x: inner.x + (col as u16).min(inner.width.saturating_sub(1)),
-        y: inner.y + (row as u16).min(inner.height.saturating_sub(1)),
-    }
 }
 
 fn draw_viewer(f: &mut Frame, title: &str, text: &str, scroll: u16) {
@@ -690,69 +668,77 @@ mod tests {
     }
 
     #[test]
-    fn cursor_screen_pos_clamps_within_inner_rect() {
-        let area = Rect::new(5, 5, 10, 3); // bordered rect; inner is (6,6,8,1)
-        assert_eq!(cursor_screen_pos(area, (0, 0)), Position { x: 6, y: 6 });
-        // Cursor past the visible inner rect clamps to its last cell rather
-        // than escaping the modal or panicking.
-        assert_eq!(cursor_screen_pos(area, (50, 50)), Position { x: 13, y: 6 });
-    }
-
-    #[test]
     fn cursor_hidden_when_no_modal_active() {
         let app = app_with(SAMPLE);
         assert_eq!(render_cursor(&app, 40, 12), None);
     }
 
+    /// Cursor fix: the real terminal cursor is never placed for the edit
+    /// modal any more — the focused textarea renders its own viewport-correct
+    /// cursor cell instead (`sync_blocks`). `render_cursor` (which reports
+    /// the real terminal cursor) must stay `None` even while a field is
+    /// focused; the visible cursor is a REVERSED buffer cell at the focused
+    /// field's (viewport-corrected) cursor position.
+    ///
     /// Task 9: Category is now drawn (previously only Title/Body were), so
-    /// the real terminal cursor must land there when it's the focused field
+    /// this checks the reversed cell lands there when it's the focused field
     /// — create mode opens with Category already focused (spec
-    /// 2026-09-16 §2), fixing the interim UX gap left by Task 6/7 where
-    /// Category had no visible cursor at all.
+    /// 2026-09-16 §2).
     #[test]
-    fn cursor_visible_at_category_when_create_modal_opens() {
+    fn reversed_cursor_cell_at_category_when_create_modal_opens() {
         let mut app = app_with(SAMPLE);
         app.apply(Action::OpenCreate);
-        let pos =
-            render_cursor(&app, 40, 12).expect("cursor must be visible when Category is focused");
-        let layout = modal::edit_layout(Rect::new(0, 0, 40, 12), false, 0);
-        let inner = Block::bordered().inner(layout.category);
         assert_eq!(
-            pos,
-            Position {
-                x: inner.x,
-                y: inner.y
-            }
+            render_cursor(&app, 60, 20),
+            None,
+            "no real terminal cursor is ever placed any more"
+        );
+        let buf = render_buffer(&app, 60, 20);
+        let layout = modal::edit_layout(Rect::new(0, 0, 60, 20), false, 0);
+        let inner = Block::bordered().inner(layout.category);
+        assert!(
+            buf[(inner.x, inner.y)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "focused Category field must show tui-textarea's own reversed cursor cell"
         );
     }
 
     #[test]
-    fn cursor_at_title_after_tab_from_category() {
+    fn reversed_cursor_cell_at_title_after_tab_from_category() {
         let mut app = app_with(SAMPLE);
         app.apply(Action::OpenCreate);
         // Category is focused first (spec 2026-09-16 §2); Tab past it.
         app.handle_modal_event(
             Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-            (40, 12),
+            (60, 20),
         );
-        let pos =
-            render_cursor(&app, 40, 12).expect("cursor must be visible when Title is focused");
-        let layout = modal::edit_layout(Rect::new(0, 0, 40, 12), false, 0);
-        let inner = Block::bordered().inner(layout.title);
+        assert_eq!(render_cursor(&app, 60, 20), None);
+        let buf = render_buffer(&app, 60, 20);
+        let layout = modal::edit_layout(Rect::new(0, 0, 60, 20), false, 0);
         // Untouched textarea: cursor still at its origin (row 0, col 0).
-        assert_eq!(
-            pos,
-            Position {
-                x: inner.x,
-                y: inner.y
-            }
+        let title_inner = Block::bordered().inner(layout.title);
+        assert!(
+            buf[(title_inner.x, title_inner.y)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "focused Title field must show the reversed cursor cell"
+        );
+        // Category lost focus — its own cursor cell must go invisible again.
+        let category_inner = Block::bordered().inner(layout.category);
+        assert!(
+            !buf[(category_inner.x, category_inner.y)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "unfocused Category must not show a reversed cursor cell"
         );
     }
 
     /// Round-2 item 5: the "Add to: <section>" picker row is gone entirely —
     /// sidebar-created items always land in the first human section.
-    /// Round-2 item 1: `frame.set_cursor_position` must fire only when
-    /// focus is on a textarea (Category/Title/Body) — never on a button.
+    /// A button focus (e.g. Save) shows no reversed cursor cell anywhere —
+    /// none of the three textareas are focused, so `sync_blocks` leaves all
+    /// three with the invisible cursor style.
     #[test]
     fn cursor_hidden_when_focus_on_save_button() {
         let mut app = app_with(SAMPLE);
@@ -772,6 +758,66 @@ mod tests {
             render_cursor(&app, 40, 12),
             None,
             "no real terminal cursor when a button is focused"
+        );
+        let buf = render_buffer(&app, 40, 12);
+        let layout = modal::edit_layout(Rect::new(0, 0, 40, 12), false, 0);
+        for field in [layout.category, layout.title, layout.body] {
+            let inner = Block::bordered().inner(field);
+            assert!(
+                !buf[(inner.x, inner.y)]
+                    .modifier
+                    .contains(Modifier::REVERSED),
+                "no field's cursor cell should be reversed when a button is focused"
+            );
+        }
+    }
+
+    /// Regression test for the actual bug: tui-textarea 0.7 exposes no
+    /// viewport getter, so placing the REAL terminal cursor from the LOGICAL
+    /// cursor column drifted from the drawn text whenever the textarea had
+    /// scrolled horizontally (a body line longer than the field's width).
+    /// Rendering the focused field's OWN cursor cell sidesteps this — it is
+    /// always wherever tui-textarea actually drew the cursor, viewport scroll
+    /// included. Render a narrow terminal with a body line far longer than
+    /// the field width, focus on Body, and confirm the reversed cell lands
+    /// inside the body field's inner rect (the old logical-column code could
+    /// place the terminal cursor off-rect or past the visible text here).
+    #[test]
+    fn reversed_cursor_cell_stays_inside_body_when_line_exceeds_field_width() {
+        let mut app = app_with(SAMPLE);
+        app.apply(Action::OpenCreate);
+        let (w, h) = (30, 20); // narrow — the herdr docked-sidebar width
+        app.handle_modal_event(
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            (w, h),
+        );
+        app.handle_modal_event(
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            (w, h),
+        );
+        let Modal::Edit(m) = &mut app.modal else {
+            panic!("expected edit modal")
+        };
+        assert_eq!(m.focus, EditFocus::Body);
+        let long_line = "a".repeat(200);
+        m.body.insert_str(&long_line);
+
+        let buf = render_buffer(&app, w, h);
+        let layout = modal::edit_layout(Rect::new(0, 0, w, h), false, 0);
+        let inner = Block::bordered().inner(layout.body);
+
+        let mut found = None;
+        for y in inner.y..inner.y + inner.height {
+            for x in inner.x..inner.x + inner.width {
+                if buf[(x, y)].modifier.contains(Modifier::REVERSED) {
+                    found = Some((x, y));
+                }
+            }
+        }
+        let (x, y) = found.expect("a reversed cursor cell must render inside the body field");
+        assert!(
+            x >= inner.x && x < inner.x + inner.width && y >= inner.y && y < inner.y + inner.height,
+            "reversed cell ({x},{y}) must fall within body's inner rect {inner:?}"
         );
     }
 

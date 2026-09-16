@@ -199,6 +199,42 @@ fn named_section_end(doc: &Document, name: &str) -> Option<usize> {
     Some(end)
 }
 
+/// Section names that can never be categories: "Agent" is the agents' zone,
+/// "Done" the archive, "Feed" the archive's mirror name for uncategorized
+/// items (spec 2026-09-16 §1).
+/// Not yet called outside tests — wired up by the category feature's later
+/// tasks (category validation, modal suggestions).
+#[allow(dead_code)]
+const RESERVED_SECTIONS: [&str; 3] = ["agent", "done", "feed"];
+
+#[allow(dead_code)]
+pub fn is_reserved_section(name: &str) -> bool {
+    RESERVED_SECTIONS
+        .iter()
+        .any(|r| name.eq_ignore_ascii_case(r))
+}
+
+/// Category suggestions for the modal: every `##` heading in the file —
+/// active sections plus the `# Done` archive's mirrored names ("categories
+/// used in the past") — first-seen casing, case-insensitively deduplicated,
+/// reserved names excluded.
+/// Not yet called outside tests — wired up by a later task.
+#[allow(dead_code)]
+pub fn section_names(doc: &Document) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for n in &doc.nodes {
+        if let Node::Heading { level: 2, text } = n {
+            if is_reserved_section(text) {
+                continue;
+            }
+            if !names.iter().any(|s| s.eq_ignore_ascii_case(text)) {
+                names.push(text.clone());
+            }
+        }
+    }
+    names
+}
+
 /// Replace an item's title and body in place; state, agent tag, and done
 /// stamp are untouched. Body goes through the same blank-edge trimming as add.
 pub fn edit(doc: &mut Document, index: usize, title: &str, body: &[String]) {
@@ -776,5 +812,24 @@ Some prose.
             add_in_section(&mut doc, "X", &[], "Feed"), // only exists under # Done
             Err(OpError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn section_names_collects_active_and_archive_dedup_case_insensitive() {
+        let doc = parse(
+            "# Feed\n\n- [ ] A\n\n## Work\n\n- [ ] W\n\n## Later\n\n## Agent\n\n- [ ] G\n\n# Done\n\n## work\n\n- [x] Old @done(2026-09-01)\n\n## Chores\n\n- [x] C @done(2026-09-01)\n",
+        );
+        // First-seen casing wins; "Agent" excluded; archive "Chores" included.
+        assert_eq!(section_names(&doc), vec!["Work", "Later", "Chores"]);
+    }
+
+    #[test]
+    fn section_names_excludes_reserved() {
+        let doc = parse("# Feed\n\n## Agent\n\n# Done\n\n## Feed\n\n- [x] Old @done(2026-09-01)\n");
+        assert!(section_names(&doc).is_empty());
+        assert!(is_reserved_section("agent"));
+        assert!(is_reserved_section("DONE"));
+        assert!(is_reserved_section("Feed"));
+        assert!(!is_reserved_section("Work"));
     }
 }

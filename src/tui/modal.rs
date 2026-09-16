@@ -205,6 +205,16 @@ impl EditModal {
             0
         }
     }
+
+    /// Accept suggestion `i` from `filtered()` — shared by the keyboard
+    /// (Enter on a highlighted row) and mouse (click on a row) accept paths
+    /// (B4 review follow-up) so they can never drift apart.
+    pub fn accept_suggestion(&mut self, i: usize) {
+        if let Some(name) = self.filtered().get(i).cloned() {
+            self.set_category(&name);
+        }
+        self.dropdown = None;
+    }
 }
 
 /// Drawn geometry of the edit/create modal — the single source of truth for
@@ -270,8 +280,14 @@ pub(crate) fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
 pub fn edit_layout(term_area: Rect, is_edit: bool, dropdown_rows: u16) -> EditLayout {
     let outer = centered(term_area, 90, 80);
     let inner = Block::bordered().padding(Padding::uniform(1)).inner(outer);
+    // Review follow-up (B1): at inner heights below 9 the constraint solver
+    // starves Title (title height 0-2 = invisible text) if Category keeps
+    // its full 3-row height. Collapsing Category to 0 rows on short panes
+    // keeps Title usable — the Category field is still reachable, it just
+    // isn't drawn at this size.
+    let category_len = if inner.height < 9 { 0 } else { 3 };
     let [category, title, body, buttons, hints] = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(category_len),
         Constraint::Length(3),
         Constraint::Min(3),
         Constraint::Length(1),
@@ -453,7 +469,15 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                 return ModalStep::Continue(Modal::ConfirmDelete(m));
             }
             (KeyCode::Down, _) if m.focus == EditFocus::Category => {
-                let n = m.filtered().len().min(MAX_DROPDOWN_ROWS);
+                // Clamp against the ROWS ACTUALLY DRAWN, not just the cap: at
+                // a degenerate terminal size the dropdown rect is clipped by
+                // `.intersection(term_area)`, and the highlight must never
+                // point at a row the user cannot see (Enter would accept an
+                // invisible suggestion).
+                let visible = edit_layout(area, m.original.is_some(), m.dropdown_rows())
+                    .dropdown
+                    .height as usize;
+                let n = m.filtered().len().min(MAX_DROPDOWN_ROWS).min(visible);
                 if n > 0 {
                     m.dropdown = Some(m.dropdown.map_or(0, |i| (i + 1).min(n - 1)));
                 }
@@ -468,10 +492,7 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
             }
             (KeyCode::Enter, _) if m.focus == EditFocus::Category => {
                 if let Some(i) = m.dropdown {
-                    if let Some(name) = m.filtered().get(i).cloned() {
-                        m.set_category(&name);
-                    }
-                    m.dropdown = None;
+                    m.accept_suggestion(i);
                 } else {
                     m.focus = EditFocus::Title;
                     m.sync_blocks();
@@ -502,10 +523,7 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
             let layout = edit_layout(area, is_edit, m.dropdown_rows());
             return match edit_click(&layout, is_edit, mev.column, mev.row) {
                 Some(EditClickTarget::Suggestion(row)) => {
-                    if let Some(name) = m.filtered().get(row as usize).cloned() {
-                        m.set_category(&name);
-                    }
-                    m.dropdown = None;
+                    m.accept_suggestion(row as usize);
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Category) => {
@@ -516,11 +534,13 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                 }
                 Some(EditClickTarget::Title) => {
                     m.focus = EditFocus::Title;
+                    m.dropdown = None;
                     m.sync_blocks();
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Body) => {
                     m.focus = EditFocus::Body;
+                    m.dropdown = None;
                     m.sync_blocks();
                     ModalStep::Continue(Modal::Edit(m))
                 }
@@ -667,23 +687,38 @@ mod tests {
     /// `x`, but an empty rect is never actually drawn into or clickable
     /// (`Paragraph::render_paragraph` and `rect_contains` both treat
     /// zero-width as a no-op), so it can't cause the out-of-buffer write.
+    ///
+    /// B2 review follow-up: extended past the original width-only sweep to
+    /// also vary `dropdown_rows` (0 and the max 5) and a couple of short
+    /// heights (10, 12 — the B1 short-pane collapse range), asserting the
+    /// `dropdown` rect itself stays within the terminal's right/bottom edges
+    /// too, the same way the buttons already were.
     #[test]
     fn edit_layout_buttons_never_escape_the_terminal_at_any_width() {
         for width in 1..=120u16 {
-            let area = Rect::new(0, 0, width, 40);
-            for is_edit in [false, true] {
-                let layout = edit_layout(area, is_edit, 0);
-                for (name, r) in [("save", layout.save), ("cancel", layout.cancel)] {
-                    assert!(
-                        r.is_empty() || r.right() <= area.width,
-                        "{name} button {r:?} escapes terminal width {width}"
-                    );
-                }
-                if let Some(d) = layout.delete {
-                    assert!(
-                        d.is_empty() || d.right() <= area.width,
-                        "delete button {d:?} escapes terminal width {width}"
-                    );
+            for height in [10u16, 12, 40] {
+                let area = Rect::new(0, 0, width, height);
+                for is_edit in [false, true] {
+                    for dropdown_rows in [0u16, 5] {
+                        let layout = edit_layout(area, is_edit, dropdown_rows);
+                        for (name, r) in [("save", layout.save), ("cancel", layout.cancel)] {
+                            assert!(
+                                r.is_empty() || r.right() <= area.width,
+                                "{name} button {r:?} escapes terminal width {width}"
+                            );
+                        }
+                        if let Some(d) = layout.delete {
+                            assert!(
+                                d.is_empty() || d.right() <= area.width,
+                                "delete button {d:?} escapes terminal width {width}"
+                            );
+                        }
+                        let d = layout.dropdown;
+                        assert!(
+                            d.is_empty() || (d.right() <= area.width && d.bottom() <= area.height),
+                            "dropdown {d:?} escapes terminal {width}x{height}"
+                        );
+                    }
                 }
             }
         }
@@ -831,6 +866,39 @@ mod tests {
         assert_eq!(m.category_text(), "Chores");
     }
 
+    /// Review follow-up (B1): at very short pane heights the constraint
+    /// solver starves Title if Category keeps its full 3-row height —
+    /// collapsing Category to 0 when the inner area is too short keeps Title
+    /// usable instead.
+    ///
+    /// Height 14 (not the plan's illustrative 12) is the boundary the test
+    /// actually needs: at inner height 8 (this rect's inner area), Category
+    /// collapsing to 0 frees exactly enough room for Title(3) + Body's own
+    /// Min(3) + the button/hint rows(1+1) to all fit. At inner heights below
+    /// 8 (e.g. height 12, giving inner 6) there simply isn't enough room for
+    /// Title to reach 3 rows *and* Body to keep its Min(3) floor no matter
+    /// what Category does — ratatui's solver shrinks Title's `Length(3)`
+    /// before it violates Body's `Min(3)`, so Title can only ever be made
+    /// "usable" down to this floor, not below it.
+    #[test]
+    fn short_pane_collapses_category_keeps_title_usable() {
+        let l = edit_layout(Rect::new(0, 0, 30, 14), false, 0);
+        assert_eq!(l.category.height, 0, "category collapses on short panes");
+        assert!(
+            l.title.height >= 3,
+            "title must stay usable, got {}",
+            l.title.height
+        );
+    }
+
+    /// Tall enough panes keep Category at its full height — the collapse is
+    /// a short-pane-only concession.
+    #[test]
+    fn tall_pane_keeps_category_at_full_height() {
+        let l = edit_layout(TEST_AREA, false, 0);
+        assert_eq!(l.category.height, 3);
+    }
+
     #[test]
     fn layout_stacks_category_above_title_and_sizes_dropdown() {
         let l = edit_layout(TEST_AREA, false, 3);
@@ -880,6 +948,42 @@ mod tests {
         let m = EditModal::edit(key, &item, None, vec![]);
         assert_eq!(m.category_text(), "");
         assert_eq!(m.original_category, None);
+    }
+
+    /// Spec review follow-up: at a degenerate terminal size the dropdown
+    /// rect is clipped by `.intersection(term_area)` in `edit_layout` to
+    /// fewer rows than `filtered().len().min(MAX_DROPDOWN_ROWS)`. Keyboard
+    /// Down must clamp against what's actually drawn, not just the cap —
+    /// otherwise the highlight can point at a row that never renders, and
+    /// Enter silently accepts a suggestion the user never saw.
+    #[test]
+    fn down_never_highlights_a_clipped_off_row() {
+        // 15x5 terminal: the dropdown rect is clipped to fewer rows than the
+        // filtered list — the highlight must stay within what is drawn.
+        let tiny = Rect::new(0, 0, 15, 5);
+        let names: Vec<String> = ["A", "B", "C", "D", "E", "F"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut m = EditModal::create(names);
+        let visible = edit_layout(tiny, false, m.dropdown_rows()).dropdown.height as usize;
+        assert!(
+            visible < m.filtered().len().min(MAX_DROPDOWN_ROWS),
+            "fixture must actually clip"
+        );
+        for _ in 0..5 {
+            m = match step(Modal::Edit(m), key(KeyCode::Down), tiny) {
+                ModalStep::Continue(Modal::Edit(m)) => m,
+                _ => panic!("expected Continue(Edit)"),
+            };
+        }
+        match m.dropdown {
+            Some(i) => assert!(
+                i < visible,
+                "highlight {i} points past {visible} drawn rows"
+            ),
+            None => assert_eq!(visible, 0, "None only acceptable when nothing is drawn"),
+        }
     }
 
     #[test]
@@ -938,18 +1042,26 @@ mod tests {
         assert_eq!(m.focus, EditFocus::Title);
     }
 
+    /// B3 review follow-up: a click that moves focus off Category (to Title
+    /// or Body) must also clear a stale dropdown highlight — Tab already did
+    /// this, but a focus-moving click didn't.
+    #[test]
+    fn clicking_title_or_body_clears_stale_dropdown_highlight() {
+        let m = EditModal::create(vec!["Work".into(), "Chores".into()]);
+        let m = step_edit(m, key(KeyCode::Down)); // dropdown open
+        assert_eq!(m.dropdown, Some(0));
+        let layout = edit_layout(TEST_AREA, false, m.dropdown_rows());
+        let m = step_edit(m, click(layout.title.x, layout.title.y));
+        assert_eq!(m.focus, EditFocus::Title);
+        assert_eq!(m.dropdown, None);
+    }
+
     #[test]
     fn click_on_suggestion_accepts_it() {
         let m = EditModal::create(vec!["Work".into(), "Chores".into()]);
         let m = step_edit(m, key(KeyCode::Down)); // dropdown open (2 rows)
         let l = edit_layout(TEST_AREA, false, m.dropdown_rows());
-        let ev = Event::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: l.dropdown.x + 1,
-            row: l.dropdown.y + 1,
-            modifiers: KeyModifiers::NONE,
-        });
-        let m = step_edit(m, ev);
+        let m = step_edit(m, click(l.dropdown.x + 1, l.dropdown.y + 1));
         assert_eq!(m.category_text(), "Chores");
         assert_eq!(m.dropdown, None);
     }

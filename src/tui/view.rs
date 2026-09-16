@@ -245,7 +245,7 @@ fn dim_backdrop(f: &mut Frame) {
 /// replace the static styled cursor cell).
 fn draw_edit_modal(f: &mut Frame, m: &modal::EditModal) {
     let is_edit = m.original.is_some();
-    let layout = modal::edit_layout(f.area(), is_edit, 0); // dropdown rendering lands in Task 9
+    let layout = modal::edit_layout(f.area(), is_edit, m.dropdown_rows());
 
     f.render_widget(Clear, layout.outer);
     let outer = Block::bordered()
@@ -256,6 +256,7 @@ fn draw_edit_modal(f: &mut Frame, m: &modal::EditModal) {
         .padding(Padding::uniform(1));
     f.render_widget(outer, layout.outer);
 
+    f.render_widget(&m.category, layout.category);
     f.render_widget(&m.title, layout.title);
     f.render_widget(&m.body, layout.body);
 
@@ -282,7 +283,34 @@ fn draw_edit_modal(f: &mut Frame, m: &modal::EditModal) {
     };
     f.render_widget(Paragraph::new(hint).style(theme::muted_row()), layout.hints);
 
+    // Dropdown last so it overlays the title/body area (mirrors
+    // `edit_click`'s hit-test order in modal.rs).
+    if layout.dropdown.height > 0 {
+        f.render_widget(Clear, layout.dropdown);
+        let rows: Vec<Line> = m
+            .filtered()
+            .iter()
+            .take(layout.dropdown.height as usize)
+            .enumerate()
+            .map(|(i, s)| {
+                let style = if m.dropdown == Some(i) {
+                    theme::normal_text().add_modifier(Modifier::REVERSED)
+                } else {
+                    theme::normal_text()
+                };
+                Line::styled(s.clone(), style)
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(rows).style(theme::modal_panel_style()),
+            layout.dropdown,
+        );
+    }
+
     match m.focus {
+        EditFocus::Category => {
+            f.set_cursor_position(cursor_screen_pos(layout.category, m.category.cursor()))
+        }
         EditFocus::Title => {
             f.set_cursor_position(cursor_screen_pos(layout.title, m.title.cursor()))
         }
@@ -676,8 +704,30 @@ mod tests {
         assert_eq!(render_cursor(&app, 40, 12), None);
     }
 
+    /// Task 9: Category is now drawn (previously only Title/Body were), so
+    /// the real terminal cursor must land there when it's the focused field
+    /// — create mode opens with Category already focused (spec
+    /// 2026-09-16 §2), fixing the interim UX gap left by Task 6/7 where
+    /// Category had no visible cursor at all.
     #[test]
-    fn cursor_visible_at_title_when_create_modal_focuses_title() {
+    fn cursor_visible_at_category_when_create_modal_opens() {
+        let mut app = app_with(SAMPLE);
+        app.apply(Action::OpenCreate);
+        let pos =
+            render_cursor(&app, 40, 12).expect("cursor must be visible when Category is focused");
+        let layout = modal::edit_layout(Rect::new(0, 0, 40, 12), false, 0);
+        let inner = Block::bordered().inner(layout.category);
+        assert_eq!(
+            pos,
+            Position {
+                x: inner.x,
+                y: inner.y
+            }
+        );
+    }
+
+    #[test]
+    fn cursor_at_title_after_tab_from_category() {
         let mut app = app_with(SAMPLE);
         app.apply(Action::OpenCreate);
         // Category is focused first (spec 2026-09-16 §2); Tab past it.
@@ -702,9 +752,7 @@ mod tests {
     /// Round-2 item 5: the "Add to: <section>" picker row is gone entirely —
     /// sidebar-created items always land in the first human section.
     /// Round-2 item 1: `frame.set_cursor_position` must fire only when
-    /// focus is on a textarea (Title/Body) — never on a button (and never
-    /// on Category, spec 2026-09-16 §2, since it isn't drawn as a cursor
-    /// target until Tasks 7/9).
+    /// focus is on a textarea (Category/Title/Body) — never on a button.
     #[test]
     fn cursor_hidden_when_focus_on_save_button() {
         let mut app = app_with(SAMPLE);
@@ -762,6 +810,32 @@ mod tests {
         }));
         let rows = render_to_strings(&app, 30, 40);
         assert!(!rows.is_empty());
+    }
+
+    /// Task 9: the category field and its suggestion dropdown must actually
+    /// render, not just exist in the layout geometry (Tasks 6-8 wired the
+    /// geometry and state; this is the first test to draw them).
+    #[test]
+    fn edit_modal_draws_category_field_and_dropdown() {
+        let mut m = modal::EditModal::create(vec!["Work".into(), "Chores".into()]);
+        m.dropdown = Some(0); // open the dropdown so both field and list render
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw_edit_modal(f, &m)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..24)
+            .map(|y| {
+                (0..80)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Category"), "category field must render");
+        assert!(
+            text.contains("Work") && text.contains("Chores"),
+            "suggestions must render"
+        );
     }
 
     #[test]

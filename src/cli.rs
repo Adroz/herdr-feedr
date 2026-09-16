@@ -39,7 +39,7 @@ enum Cmd {
         /// Put it in the reserved "## Agent" section (agent-initiated work)
         #[arg(long)]
         agent_owned: bool,
-        /// Target a named human section instead of the first one
+        /// Target a named section, creating it if missing (reserved: Agent, Done, Feed)
         #[arg(long, conflicts_with = "agent_owned")]
         section: Option<String>,
     },

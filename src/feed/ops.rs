@@ -24,6 +24,8 @@ pub enum OpError {
     NotAuthorised,
     #[error("\"{0}\" is a reserved section")]
     Reserved(String),
+    #[error("section name required")]
+    EmptyName,
 }
 
 pub fn zone_of(doc: &Document, index: usize) -> Zone {
@@ -242,6 +244,10 @@ pub fn section_names(doc: &Document) -> Vec<String> {
 /// `## Agent` if present, else before `# Done`, else at EOF. Returns the
 /// insertion index for a new item at the section's end.
 pub fn ensure_section(doc: &mut Document, name: &str) -> Result<usize, OpError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(OpError::EmptyName);
+    }
     if is_reserved_section(name) {
         return Err(OpError::Reserved(name.to_string()));
     }
@@ -335,6 +341,24 @@ pub fn set_state(
         it.state = state;
     }
     Ok(())
+}
+
+/// The `##` section an item sits under, or None when it's uncategorized
+/// (directly under a `#` heading). Prefills the modal's Category field —
+/// unlike the private `section_name` (archive mirroring), this does not
+/// fall back to the level-1 heading's name.
+/// Not yet called outside tests — wired up in a later task.
+#[allow(dead_code)]
+pub fn item_section(doc: &Document, index: usize) -> Option<String> {
+    let mut current: Option<String> = None;
+    for node in &doc.nodes[..index] {
+        match node {
+            Node::Heading { level: 1, .. } => current = None,
+            Node::Heading { level: 2, text } => current = Some(text.clone()),
+            _ => {}
+        }
+    }
+    current
 }
 
 /// Section name an item sits under, for mirroring in the Done archive.
@@ -939,6 +963,17 @@ Some prose.
     }
 
     #[test]
+    fn item_section_names_the_enclosing_level2_heading() {
+        let doc = parse("# Feed\n\n- [ ] A\n\n## Work\n\n- [ ] W\n\n## Agent\n\n- [ ] G\n");
+        let a = find(&doc, "A").unwrap();
+        let w = find(&doc, "W").unwrap();
+        let g = find(&doc, "G").unwrap();
+        assert_eq!(item_section(&doc, a), None); // uncategorized
+        assert_eq!(item_section(&doc, w).as_deref(), Some("Work"));
+        assert_eq!(item_section(&doc, g).as_deref(), Some("Agent"));
+    }
+
+    #[test]
     fn ensure_section_rejects_reserved_and_ignores_archive_sections() {
         let mut doc = parse("# Feed\n\n# Done\n\n## Chores\n\n- [x] C @done(2026-09-01)\n");
         assert!(matches!(
@@ -952,5 +987,16 @@ Some prose.
             out.find("## Chores").unwrap() < out.find("# Done").unwrap(),
             "got:\n{out}"
         );
+    }
+
+    #[test]
+    fn ensure_section_rejects_empty_name() {
+        let mut doc = parse("# Feed\n\n- [ ] A\n");
+        let before = render(&doc);
+        assert!(matches!(
+            ensure_section(&mut doc, "  "),
+            Err(OpError::EmptyName)
+        ));
+        assert_eq!(render(&doc), before);
     }
 }

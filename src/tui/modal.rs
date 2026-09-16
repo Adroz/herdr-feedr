@@ -483,6 +483,31 @@ pub fn step(modal: Modal, ev: Event, area: Rect) -> ModalStep {
     }
 }
 
+/// Click-to-position: map the click to a cursor location. Coordinates are
+/// viewport-relative under the assumption the field isn't horizontally
+/// scrolled — with the focused-field cursor fix the common case — and
+/// `CursorMove::Jump` clamps past-end coordinates to the line/text end
+/// (`tui-textarea` 0.7 `cursor.rs`'s `Jump` arm: row clamps to the last
+/// line, col clamps to that line's length via `fit_col`).
+///
+/// `field_rect` is the field's full bordered `Rect` (as drawn); a click
+/// inside the border but outside the text-bearing inner rect (i.e. on the
+/// border itself) focuses the field without moving its cursor — there is no
+/// clicked character to jump to there.
+///
+/// Caveat: if the field IS horizontally scrolled (its current line is
+/// longer than the field's width), the jump is offset by the hidden
+/// scroll — the same unexposed-viewport limitation the cursor-rendering fix
+/// works around for the focused field's own cursor cell. This is an
+/// acceptable degradation: the click still lands inside the right field,
+/// just not necessarily on the exact character under the mouse.
+fn jump_cursor_to_click(ta: &mut TextArea<'static>, field_rect: Rect, x: u16, y: u16) {
+    let inner = Block::bordered().inner(field_rect);
+    if rect_contains(inner, x, y) {
+        ta.move_cursor(CursorMove::Jump(y - inner.y, x - inner.x));
+    }
+}
+
 fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
     if let Event::Key(k) = &ev {
         match (k.code, k.modifiers) {
@@ -575,18 +600,21 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                     m.focus = EditFocus::Category;
                     m.dropdown = None;
                     m.sync_blocks();
+                    jump_cursor_to_click(&mut m.category, layout.category, mev.column, mev.row);
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Title) => {
                     m.focus = EditFocus::Title;
                     m.dropdown = None;
                     m.sync_blocks();
+                    jump_cursor_to_click(&mut m.title, layout.title, mev.column, mev.row);
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Body) => {
                     m.focus = EditFocus::Body;
                     m.dropdown = None;
                     m.sync_blocks();
+                    jump_cursor_to_click(&mut m.body, layout.body, mev.column, mev.row);
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Save) => ModalStep::Save(m),
@@ -1158,5 +1186,120 @@ mod tests {
         let m = step_edit(m, click(l.dropdown.x + 1, l.dropdown.y + 1));
         assert_eq!(m.category_text(), "Chores");
         assert_eq!(m.dropdown, None);
+    }
+
+    /// Task 2: word-by-word navigation. `edit_step` doesn't intercept
+    /// Left/Right with any modifier, so a Ctrl+Right/Ctrl+Left reaches
+    /// tui-textarea's `input()` unchanged, which maps it to
+    /// `CursorMove::WordForward`/`WordBack` (verified against the vendored
+    /// source: `~/.cargo/registry/src/index.crates.io-*/tui-textarea-0.7.0/
+    /// src/textarea.rs`, the `Key::Right, ctrl: true, alt: false` arm of
+    /// `input()`, mirrored by `Key::Left` for `WordBack`; also reachable via
+    /// Alt+f/Alt+b). `WordForward` (`cursor.rs`, via
+    /// `word::find_word_start_forward`) lands on the START of the NEXT word,
+    /// not the end of the current one — observed and pinned here: from Head
+    /// on "alpha beta gamma", Ctrl+Right lands at column 6, the `b` of
+    /// "beta" ("alpha " is 6 columns: a-l-p-h-a-space).
+    #[test]
+    fn ctrl_right_jumps_forward_a_word_in_body() {
+        let mut m = edit_modal();
+        m.focus = EditFocus::Body;
+        m.body = TextArea::new(vec!["alpha beta gamma".to_string()]);
+        m.body.move_cursor(CursorMove::Head);
+        m.sync_blocks();
+        let ev = Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        let m = step_edit(m, ev);
+        assert_eq!(
+            m.body.cursor(),
+            (0, 6),
+            "Ctrl+Right must land at the start of \"beta\""
+        );
+    }
+
+    /// Same check once for Category (single-line) to prove none of the
+    /// Category-only key arms (Down/Up for the dropdown, Enter) shadow
+    /// Ctrl+Right — it must still reach tui-textarea's word-forward
+    /// unshadowed.
+    #[test]
+    fn ctrl_right_jumps_forward_a_word_in_category() {
+        let mut m = create_modal(); // focus starts on Category
+        m.category = TextArea::new(vec!["alpha beta gamma".to_string()]);
+        m.category.move_cursor(CursorMove::Head);
+        m.sync_blocks();
+        let ev = Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        let m = step_edit(m, ev);
+        assert_eq!(
+            m.category.cursor(),
+            (0, 6),
+            "Ctrl+Right must reach tui-textarea's word-forward unshadowed by Category's own key arms"
+        );
+    }
+
+    // --- Task 3: click-to-position cursor -----------------------------------
+
+    #[test]
+    fn clicking_body_text_places_cursor_at_the_clicked_character() {
+        let mut m = create_modal();
+        m.body = TextArea::new(vec!["hello world".to_string()]);
+        let layout = edit_layout(TEST_AREA, false, 0);
+        let inner = Block::bordered().inner(layout.body);
+        // Column 6 is the 'w' of "world" ("hello " is 6 columns wide).
+        let m = step_edit(m, click(inner.x + 6, inner.y));
+        assert_eq!(m.focus, EditFocus::Body);
+        assert_eq!(m.body.cursor(), (0, 6));
+    }
+
+    #[test]
+    fn clicking_past_end_of_body_text_clamps_cursor_to_line_end() {
+        let mut m = create_modal();
+        m.body = TextArea::new(vec!["hello world".to_string()]);
+        let layout = edit_layout(TEST_AREA, false, 0);
+        let inner = Block::bordered().inner(layout.body);
+        // Last column of the (much wider than the text) inner rect — well
+        // past "hello world"'s 11 characters, but still inside the field so
+        // the click actually lands on Body rather than missing it.
+        let m = step_edit(m, click(inner.x + inner.width - 1, inner.y));
+        assert_eq!(m.focus, EditFocus::Body);
+        assert_eq!(
+            m.body.cursor(),
+            (0, "hello world".chars().count()),
+            "CursorMove::Jump clamps a past-end column to the line's end"
+        );
+    }
+
+    /// Clicking the field's own BORDER (not its inner text area) must still
+    /// move focus there like today, but must NOT jump the cursor — there is
+    /// no clicked character to jump to.
+    #[test]
+    fn clicking_body_border_moves_focus_but_leaves_cursor_unchanged() {
+        let mut m = create_modal();
+        m.body = TextArea::new(vec!["hello world".to_string()]);
+        m.body.move_cursor(CursorMove::Jump(0, 5));
+        let layout = edit_layout(TEST_AREA, false, 0);
+        // layout.body's own (x, y) is the top-left corner of its border.
+        let m = step_edit(m, click(layout.body.x, layout.body.y));
+        assert_eq!(m.focus, EditFocus::Body);
+        assert_eq!(
+            m.body.cursor(),
+            (0, 5),
+            "a border click must not move the cursor"
+        );
+    }
+
+    #[test]
+    fn clicking_category_text_places_cursor_and_resets_dropdown() {
+        let mut m = create_modal();
+        m.category = TextArea::new(vec!["alpha beta".to_string()]);
+        m.dropdown = Some(0); // simulate an open dropdown highlight
+        let layout = edit_layout(TEST_AREA, false, 0);
+        let inner = Block::bordered().inner(layout.category);
+        // Column 6 is the 'b' of "beta" ("alpha " is 6 columns wide).
+        let m = step_edit(m, click(inner.x + 6, inner.y));
+        assert_eq!(m.focus, EditFocus::Category);
+        assert_eq!(m.category.cursor(), (0, 6));
+        assert_eq!(
+            m.dropdown, None,
+            "existing behavior preserved: a field click resets the dropdown highlight"
+        );
     }
 }

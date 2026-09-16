@@ -385,6 +385,7 @@ mod tests {
         SidebarConfig {
             side: Side::Left,
             width: 0.18,
+            max_width: 46,
             auto_dock: false,
         }
     }

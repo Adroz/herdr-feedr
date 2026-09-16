@@ -11,6 +11,7 @@
 
 use crate::feed::Item;
 use crate::tui::app::ItemKey;
+use crate::tui::theme;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -66,6 +67,12 @@ pub struct EditModal {
     /// Keyboard highlight into `filtered()`; None = not in the list.
     pub dropdown: Option<usize>,
     pub focus: EditFocus,
+    /// Text yanked by a Ctrl+C/Ctrl+X on the focused field, waiting to be
+    /// pushed to the SYSTEM clipboard. `edit_step` stays pure (no process
+    /// spawning), so it only records the text here; `App::handle_modal_event`
+    /// drains it after every `step` call and does the actual spawn (mirrors
+    /// `App`'s `editor_request`/`take_editor_request` one-shot pattern).
+    pub pending_clipboard: Option<String>,
 }
 
 impl EditModal {
@@ -82,6 +89,7 @@ impl EditModal {
             suggestions,
             dropdown: None,
             focus: EditFocus::Category,
+            pending_clipboard: None,
         };
         m.sync_blocks();
         m
@@ -102,6 +110,7 @@ impl EditModal {
             suggestions,
             dropdown: None,
             focus: EditFocus::Category,
+            pending_clipboard: None,
         };
         // TextArea::new leaves the cursor at (0,0); appending is the common
         // edit, so park it at the end deterministically.
@@ -166,6 +175,13 @@ impl EditModal {
         self.category.set_block(Block::bordered().title(c));
         self.title.set_block(Block::bordered().title(t));
         self.body.set_block(Block::bordered().title(b));
+        // Selection highlight: reapplied here (not just at construction)
+        // because `set_category` replaces `self.category` with a brand new
+        // `TextArea`, which would otherwise fall back to tui-textarea's own
+        // default (light blue) selection style.
+        self.category.set_selection_style(theme::selection());
+        self.title.set_selection_style(theme::selection());
+        self.body.set_selection_style(theme::selection());
         let visible = Style::default().add_modifier(Modifier::REVERSED);
         let invisible = Style::default();
         self.category
@@ -508,10 +524,74 @@ fn jump_cursor_to_click(ta: &mut TextArea<'static>, field_rect: Rect, x: u16, y:
     }
 }
 
+/// The textarea backing whichever field currently has focus — `None` when
+/// focus is on a button (Save/Cancel/Delete), which has no textarea.
+/// Shared by the selection-clipboard key arms, the Esc selection-cancel
+/// layer, and mouse-drag selection, so they can't drift on which field
+/// "focused" means.
+fn focused_textarea_mut(m: &mut EditModal) -> Option<&mut TextArea<'static>> {
+    match m.focus {
+        EditFocus::Category => Some(&mut m.category),
+        EditFocus::Title => Some(&mut m.title),
+        EditFocus::Body => Some(&mut m.body),
+        EditFocus::Save | EditFocus::Cancel | EditFocus::Delete => None,
+    }
+}
+
+/// Ctrl+C: copy the focused field's selection into tui-textarea's own yank
+/// buffer (`TextArea::copy`, native — a no-op without a selection) and
+/// report the yanked text so the caller can also push it to the SYSTEM
+/// clipboard via `EditModal::pending_clipboard`. Returns `None` — leaving
+/// `pending_clipboard` untouched — when there's nothing to copy: no field
+/// focused, or no active (non-empty) selection. Gated on `selection_range()`
+/// rather than `is_selecting()` so a degenerate zero-length selection
+/// (cursor back at its anchor) doesn't falsely report a copy.
+fn copy_focused(m: &mut EditModal) -> Option<String> {
+    let ta = focused_textarea_mut(m)?;
+    let had_selection = ta.selection_range().is_some();
+    ta.copy();
+    had_selection.then(|| ta.yank_text())
+}
+
+/// Ctrl+X: same gating as `copy_focused`, via `TextArea::cut` (native —
+/// removes the selected text and moves the cursor to its start).
+fn cut_focused(m: &mut EditModal) -> Option<String> {
+    let ta = focused_textarea_mut(m)?;
+    let had_selection = ta.selection_range().is_some();
+    ta.cut();
+    had_selection.then(|| ta.yank_text())
+}
+
+/// Ctrl+V: paste tui-textarea's own internal yank buffer (`TextArea::paste`)
+/// into the focused field — NOT the system clipboard (approved scope: Ctrl+V
+/// is internal-yank-only). Explicitly intercepted rather than left to
+/// `TextArea::input()`: tui-textarea 0.7 maps native Ctrl+V to
+/// `Scrolling::PageDown`, not paste (its paste binding is emacs-style
+/// Ctrl+Y) — see `native_ctrl_v_binding_is_page_down_scroll_not_paste`
+/// for the pinned source citation.
+fn paste_focused(m: &mut EditModal) {
+    if let Some(ta) = focused_textarea_mut(m) {
+        ta.paste();
+    }
+}
+
 fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
     if let Event::Key(k) = &ev {
         match (k.code, k.modifiers) {
+            // Esc layering: an active selection in the focused field cancels
+            // first; only once there's no selection left does Esc fall
+            // through to the next layer (dropdown, then the modal itself).
+            // Gated on `is_selecting()` (not `selection_range()`) — even a
+            // degenerate zero-length selection (cursor back at its anchor)
+            // is still a selection *process* worth Esc-cancelling, though
+            // there's nothing visibly highlighted to show for it.
             (KeyCode::Esc, _) => {
+                if let Some(ta) = focused_textarea_mut(&mut m) {
+                    if ta.is_selecting() {
+                        ta.cancel_selection();
+                        return ModalStep::Continue(Modal::Edit(m));
+                    }
+                }
                 if m.focus == EditFocus::Category && m.dropdown.is_some() {
                     m.dropdown = None;
                     return ModalStep::Continue(Modal::Edit(m));
@@ -530,6 +610,30 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                 if mods.contains(KeyModifiers::CONTROL) && m.original.is_some() =>
             {
                 return ModalStep::Continue(Modal::ConfirmDelete(m));
+            }
+            // Ctrl+C/Ctrl+X: native `TextArea::copy`/`cut` do the in-memory
+            // work (selection → yank buffer); we additionally stash the
+            // yanked text in `pending_clipboard` so `App::handle_modal_event`
+            // can push it to the SYSTEM clipboard (`edit_step` stays pure —
+            // no process spawning here). Ctrl+V is handled separately below
+            // (native binding doesn't do what we want — see `paste_focused`).
+            (KeyCode::Char('c'), mods) if mods.contains(KeyModifiers::CONTROL) => {
+                m.pending_clipboard = copy_focused(&mut m);
+                return ModalStep::Continue(Modal::Edit(m));
+            }
+            (KeyCode::Char('x'), mods) if mods.contains(KeyModifiers::CONTROL) => {
+                m.pending_clipboard = cut_focused(&mut m);
+                if m.focus == EditFocus::Category {
+                    m.dropdown = None; // cut can change the category text
+                }
+                return ModalStep::Continue(Modal::Edit(m));
+            }
+            (KeyCode::Char('v'), mods) if mods.contains(KeyModifiers::CONTROL) => {
+                paste_focused(&mut m);
+                if m.focus == EditFocus::Category {
+                    m.dropdown = None; // paste can change the category text
+                }
+                return ModalStep::Continue(Modal::Edit(m));
             }
             (KeyCode::Down, _) if m.focus == EditFocus::Category => {
                 // Clamp against the ROWS ACTUALLY DRAWN, not just the cap: at
@@ -600,6 +704,15 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                     m.focus = EditFocus::Category;
                     m.dropdown = None;
                     m.sync_blocks();
+                    // A plain click always clears any existing selection
+                    // first — otherwise `jump_cursor_to_click`'s
+                    // `move_cursor(Jump(..))` would inherit
+                    // `shift = selection_start.is_some()` and EXTEND the
+                    // stale selection to the click point instead of just
+                    // repositioning the cursor there (normal editor
+                    // behavior: a non-shift click always replaces the
+                    // selection).
+                    m.category.cancel_selection();
                     jump_cursor_to_click(&mut m.category, layout.category, mev.column, mev.row);
                     ModalStep::Continue(Modal::Edit(m))
                 }
@@ -607,6 +720,7 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                     m.focus = EditFocus::Title;
                     m.dropdown = None;
                     m.sync_blocks();
+                    m.title.cancel_selection();
                     jump_cursor_to_click(&mut m.title, layout.title, mev.column, mev.row);
                     ModalStep::Continue(Modal::Edit(m))
                 }
@@ -614,6 +728,7 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                     m.focus = EditFocus::Body;
                     m.dropdown = None;
                     m.sync_blocks();
+                    m.body.cancel_selection();
                     jump_cursor_to_click(&mut m.body, layout.body, mev.column, mev.row);
                     ModalStep::Continue(Modal::Edit(m))
                 }
@@ -622,6 +737,38 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                 Some(EditClickTarget::Delete) => ModalStep::Continue(Modal::ConfirmDelete(m)),
                 None => ModalStep::Continue(Modal::Edit(m)),
             };
+        }
+        // Mouse drag selection: only the FOCUSED field's own drag extends a
+        // selection (a drag that wanders outside it is ignored, not
+        // redirected — dragging into a different field shouldn't steal
+        // focus or start a second selection there). Reuses
+        // `jump_cursor_to_click`'s math and its horizontal-scroll caveat.
+        // Lazily starts the anchor at the CURRENT cursor position (which the
+        // preceding Down click already placed) the first time a Drag arrives
+        // with no active (non-empty) selection yet — `selection_range()`,
+        // not `is_selecting()`, so a same-cell first Drag frame re-anchors
+        // rather than being mistaken for an already-extending selection.
+        if mev.kind == MouseEventKind::Drag(MouseButton::Left) {
+            let is_edit = m.original.is_some();
+            let layout = edit_layout(area, is_edit, m.dropdown_rows());
+            let field_rect = match m.focus {
+                EditFocus::Category => Some(layout.category),
+                EditFocus::Title => Some(layout.title),
+                EditFocus::Body => Some(layout.body),
+                EditFocus::Save | EditFocus::Cancel | EditFocus::Delete => None,
+            };
+            if let Some(rect) = field_rect {
+                let inner = Block::bordered().inner(rect);
+                if rect_contains(inner, mev.column, mev.row) {
+                    if let Some(ta) = focused_textarea_mut(&mut m) {
+                        if ta.selection_range().is_none() {
+                            ta.start_selection();
+                        }
+                        jump_cursor_to_click(ta, rect, mev.column, mev.row);
+                    }
+                }
+            }
+            return ModalStep::Continue(Modal::Edit(m));
         }
     }
     match m.focus {
@@ -669,6 +816,23 @@ mod tests {
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn shift_key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::SHIFT))
+    }
+
+    fn ctrl_key(c: char) -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+    }
+
+    fn drag(x: u16, y: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        })
     }
 
     fn step_edit(m: EditModal, ev: Event) -> EditModal {
@@ -1301,5 +1465,199 @@ mod tests {
             m.dropdown, None,
             "existing behavior preserved: a field click resets the dropdown highlight"
         );
+    }
+
+    // --- Text selection: keyboard, mouse drag, clipboard -------------------
+
+    /// tui-textarea 0.7's native `input()` already maps Shift+Right to
+    /// `move_cursor_with_shift(CursorMove::Forward, true)`, which lazily
+    /// calls `start_selection()` the first time shift is held — nothing in
+    /// `edit_step` intercepts Right with any modifier, so this reaches
+    /// tui-textarea unshadowed and needs no new code, only this pin.
+    #[test]
+    fn shift_right_three_times_selects_three_chars_in_body() {
+        let mut m = create_modal();
+        m.focus = EditFocus::Body;
+        m.body = TextArea::new(vec!["hello".to_string()]);
+        m.sync_blocks();
+        for _ in 0..3 {
+            m = step_edit(m, shift_key(KeyCode::Right));
+        }
+        assert_eq!(m.body.selection_range(), Some(((0, 0), (0, 3))));
+        m.body.cut();
+        assert_eq!(m.body.yank_text(), "hel");
+    }
+
+    #[test]
+    fn ctrl_c_sets_pending_clipboard_only_when_something_is_selected() {
+        let mut m = create_modal();
+        m.focus = EditFocus::Body;
+        m.body = TextArea::new(vec!["hello world".to_string()]);
+        m.sync_blocks();
+
+        // No selection: Ctrl+C must leave pending_clipboard untouched.
+        let m = step_edit(m, ctrl_key('c'));
+        assert_eq!(m.pending_clipboard, None);
+
+        // Select "hello" (Shift+Right x5 from Head) then Ctrl+C.
+        let mut m = m;
+        for _ in 0..5 {
+            m = step_edit(m, shift_key(KeyCode::Right));
+        }
+        assert!(m.body.selection_range().is_some());
+        let m = step_edit(m, ctrl_key('c'));
+        assert_eq!(m.pending_clipboard.as_deref(), Some("hello"));
+        assert_eq!(m.body.lines(), ["hello world"], "copy never mutates text");
+    }
+
+    #[test]
+    fn ctrl_x_cuts_selection_and_sets_pending_clipboard() {
+        let mut m = create_modal();
+        m.focus = EditFocus::Body;
+        m.body = TextArea::new(vec!["hello world".to_string()]);
+        m.sync_blocks();
+        for _ in 0..5 {
+            m = step_edit(m, shift_key(KeyCode::Right));
+        }
+        let m = step_edit(m, ctrl_key('x'));
+        assert_eq!(m.pending_clipboard.as_deref(), Some("hello"));
+        assert_eq!(m.body.lines(), [" world"]);
+        assert_eq!(
+            m.body.selection_range(),
+            None,
+            "cut clears the selection it consumed"
+        );
+    }
+
+    /// Ctrl+V is explicitly intercepted (`paste_focused`) rather than left
+    /// to `TextArea::input()`, because tui-textarea 0.7's native binding for
+    /// Ctrl+V is `Scrolling::PageDown` (`textarea.rs`'s `Key::Char('v'),
+    /// ctrl: true` arm) — its paste key is emacs-style Ctrl+Y instead. This
+    /// test pins that native (surprising) mapping as the reason the
+    /// interception exists: fed straight through `.input()`, Ctrl+V must NOT
+    /// paste — proving `edit_step` really does need its own arm for it.
+    #[test]
+    fn native_ctrl_v_binding_is_page_down_scroll_not_paste() {
+        let mut ta = TextArea::new(vec!["world".to_string()]);
+        ta.set_yank_text("hello ");
+        ta.move_cursor(CursorMove::Head);
+        ta.input(ctrl_key('v'));
+        assert_eq!(
+            ta.lines(),
+            ["world"],
+            "native Ctrl+V must not paste — edit_step must intercept it itself"
+        );
+    }
+
+    #[test]
+    fn ctrl_v_pastes_the_internal_yank_buffer() {
+        let mut m = create_modal();
+        m.focus = EditFocus::Body;
+        m.body = TextArea::new(vec!["world".to_string()]);
+        m.body.set_yank_text("hello ");
+        m.body.move_cursor(CursorMove::Head);
+        m.sync_blocks();
+        let m = step_edit(m, ctrl_key('v'));
+        assert_eq!(m.body.lines(), ["hello world"]);
+    }
+
+    #[test]
+    fn dragging_in_body_selects_the_dragged_span() {
+        let mut m = create_modal();
+        m.body = TextArea::new(vec!["hello world".to_string()]);
+        let layout = edit_layout(TEST_AREA, false, 0);
+        let inner = Block::bordered().inner(layout.body);
+        // Down at col 0 focuses Body and anchors the (not-yet-started)
+        // cursor at (0, 0).
+        let m = step_edit(m, click(inner.x, inner.y));
+        assert_eq!(m.focus, EditFocus::Body);
+        assert_eq!(
+            m.body.selection_range(),
+            None,
+            "a plain click selects nothing yet"
+        );
+        // Drag to col 5 ('w' of "world") lazily starts the selection at the
+        // anchor and extends it to the drag point.
+        let m = step_edit(m, drag(inner.x + 5, inner.y));
+        assert_eq!(m.body.selection_range(), Some(((0, 0), (0, 5))));
+    }
+
+    #[test]
+    fn down_click_clears_an_existing_selection() {
+        let mut m = create_modal();
+        m.focus = EditFocus::Body;
+        m.body = TextArea::new(vec!["hello world".to_string()]);
+        m.sync_blocks();
+        m.body.start_selection();
+        m.body.move_cursor(CursorMove::Forward);
+        assert!(m.body.selection_range().is_some());
+
+        let layout = edit_layout(TEST_AREA, false, 0);
+        let inner = Block::bordered().inner(layout.body);
+        let m = step_edit(m, click(inner.x + 3, inner.y));
+        assert_eq!(
+            m.body.selection_range(),
+            None,
+            "a plain click always clears any existing selection first"
+        );
+    }
+
+    /// Esc layering (extends `esc_closes_dropdown_first_then_cancels`):
+    /// selection cancels first, THEN dropdown, THEN the modal. Category can
+    /// have both a selection and an open dropdown at once.
+    #[test]
+    fn esc_cancels_selection_before_dropdown_before_modal_on_category() {
+        let mut m = EditModal::create(vec!["Work".into()]);
+        m.category = TextArea::new(vec!["alpha beta".to_string()]);
+        m.sync_blocks();
+        m.category.start_selection();
+        m.category.move_cursor(CursorMove::Forward);
+        m.dropdown = Some(0);
+        assert!(m.category.selection_range().is_some());
+
+        let m = step_edit(m, key(KeyCode::Esc)); // 1st: selection only
+        assert_eq!(m.category.selection_range(), None);
+        assert_eq!(
+            m.dropdown,
+            Some(0),
+            "dropdown untouched by the selection-cancel Esc"
+        );
+
+        let m = step_edit(m, key(KeyCode::Esc)); // 2nd: dropdown
+        assert_eq!(m.dropdown, None);
+
+        match step(Modal::Edit(m), key(KeyCode::Esc), TEST_AREA) {
+            ModalStep::Continue(Modal::None) => {} // 3rd: modal cancels
+            _ => panic!("third Esc must cancel the modal"),
+        }
+    }
+
+    /// Same layering on Body, which has no dropdown at all: selection Esc,
+    /// then straight to modal-cancel.
+    #[test]
+    fn esc_cancels_body_selection_before_cancelling_modal() {
+        let mut m = create_modal();
+        m.focus = EditFocus::Body;
+        m.body = TextArea::new(vec!["hello".to_string()]);
+        m.sync_blocks();
+        m.body.start_selection();
+        m.body.move_cursor(CursorMove::Forward);
+        assert!(m.body.selection_range().is_some());
+
+        let m = step_edit(m, key(KeyCode::Esc)); // 1st: selection
+        assert_eq!(m.body.selection_range(), None);
+
+        match step(Modal::Edit(m), key(KeyCode::Esc), TEST_AREA) {
+            ModalStep::Continue(Modal::None) => {} // 2nd: modal cancels
+            _ => panic!("second Esc must cancel the modal when there's no dropdown"),
+        }
+    }
+
+    #[test]
+    fn selection_style_is_set_on_all_three_fields() {
+        let mut m = create_modal();
+        assert_eq!(m.category.selection_style(), theme::selection());
+        assert_eq!(m.title.selection_style(), theme::selection());
+        assert_eq!(m.body.selection_style(), theme::selection());
     }
 }

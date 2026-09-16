@@ -110,6 +110,17 @@ pub fn backdrop() -> Style {
     Style::default().bg(BASE).add_modifier(Modifier::DIM)
 }
 
+/// Selected-text highlight for the edit modal's `TextArea` fields
+/// (`modal::EditModal::sync_blocks`'s `set_selection_style` call). Reuses
+/// `SURFACE1` — already the modal border color — as a background tint
+/// rather than introducing a new palette color: it's lighter than the
+/// panel's own `MANTLE` background so a selection reads clearly, without
+/// competing with the focused field's `REVERSED` cursor cell (a dynamic
+/// invert, not a static tint) or the louder `REVERSED` buttons.
+pub fn selection() -> Style {
+    Style::default().bg(SURFACE1)
+}
+
 /// Edit/create modal `[ Save ]` / `[ Cancel ]` / `[ Delete ]` buttons —
 /// reversed when focused (mouse click is the primary way to activate them;
 /// Tab + Enter reaches them too, cheaply).
@@ -149,5 +160,10 @@ mod tests {
             backdrop(),
             Style::default().bg(BASE).add_modifier(Modifier::DIM)
         );
+    }
+
+    #[test]
+    fn selection_uses_surface1_background() {
+        assert_eq!(selection(), Style::default().bg(SURFACE1));
     }
 }

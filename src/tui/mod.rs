@@ -1,4 +1,5 @@
 pub mod app;
+pub mod clipboard;
 pub mod dock;
 pub mod input;
 pub mod modal;
@@ -236,6 +237,7 @@ mod tests {
         let cfg = SidebarConfig {
             side: Side::Left,
             width: 0.18,
+            max_width: 46,
             auto_dock: false,
         };
         let mut app = App::new(path.clone(), cfg, Box::new(socket::FakeHerdr::default()));

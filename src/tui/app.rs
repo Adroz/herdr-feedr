@@ -152,6 +152,14 @@ pub struct App {
     /// guess), so a pane driven to herdr's minimum over several iterations
     /// still returns to its original width.
     collapse_resize_steps: usize,
+    /// System-clipboard write for the edit modal's Ctrl+C/Ctrl+X
+    /// (`handle_modal_event` drains `EditModal::pending_clipboard` through
+    /// this after every `modal::step`). Injectable in tests — mirrors
+    /// `editor_cmd`'s "avoid a real process/env dependency in tests"
+    /// pattern, here avoiding spawning a real `pbcopy`/`xclip`/`wl-copy` (and
+    /// touching the developer's actual clipboard) on every `cargo test` run.
+    /// Defaults to `clipboard::copy`.
+    pub clipboard_copy: fn(&str) -> anyhow::Result<()>,
 }
 
 impl App {
@@ -175,6 +183,7 @@ impl App {
                 .ok()
                 .filter(|p| !p.is_empty()),
             collapse_resize_steps: 0,
+            clipboard_copy: crate::tui::clipboard::copy,
         }
     }
 
@@ -397,6 +406,20 @@ impl App {
                 Modal::None
             }
         };
+        // `edit_step` stays pure — no process spawning there — so a
+        // Ctrl+C/Ctrl+X only records the yanked text in
+        // `EditModal::pending_clipboard`. Drain it here (one-shot, mirroring
+        // `editor_request`/`take_editor_request`) and do the actual spawn,
+        // via the injectable `clipboard_copy` so tests never touch a real
+        // clipboard tool. Best-effort: a failure becomes a status message,
+        // never a crash or a dropped edit.
+        if let Modal::Edit(m) = &mut self.modal {
+            if let Some(text) = m.pending_clipboard.take() {
+                if let Err(e) = (self.clipboard_copy)(&text) {
+                    self.status_msg = Some(format!("clipboard: {e}"));
+                }
+            }
+        }
         // Round-2 item 4: the modal fully closed this step (Save/Cancel/Esc/
         // viewer close/confirmed delete) — unzoom. A transition that stays
         // inside the modal lifecycle (e.g. ConfirmDelete <-> Edit) must not
@@ -663,6 +686,7 @@ mod tests {
         SidebarConfig {
             side: Side::Left,
             width: 0.18,
+            max_width: 46,
             auto_dock: false,
         }
     }
@@ -1016,6 +1040,85 @@ mod tests {
         for c in s.chars() {
             press(app, KeyCode::Char(c));
         }
+    }
+
+    fn press_shift(app: &mut App, code: KeyCode) {
+        app.handle_modal_event(
+            Event::Key(KeyEvent::new(code, KeyModifiers::SHIFT)),
+            TEST_SIZE,
+        );
+    }
+
+    // --- Text selection: system-clipboard drain -----------------------------
+    //
+    // `edit_step` (modal.rs) stays pure — it only records the yanked text in
+    // `EditModal::pending_clipboard` on Ctrl+C/Ctrl+X. These tests cover the
+    // drain wiring in `handle_modal_event` (pending_clipboard -> the
+    // injectable `clipboard_copy` -> status_msg on failure), NOT the real
+    // `clipboard::copy` spawn (that would shell out to a real `pbcopy` and
+    // touch the developer's actual clipboard on every `cargo test` run —
+    // `clipboard::choose_command`'s own unit tests in clipboard.rs cover the
+    // platform-tool choice instead). The injected sink below deliberately
+    // fails, embedding the received text in the error, so asserting on
+    // `status_msg` proves both that the drain fired AND what text it passed.
+    fn fake_clipboard_sink(text: &str) -> anyhow::Result<()> {
+        anyhow::bail!("test-sink:{text}")
+    }
+
+    #[test]
+    fn copy_step_drains_pending_clipboard_through_the_injected_sink() {
+        let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n");
+        app.clipboard_copy = fake_clipboard_sink;
+        app.apply(Action::OpenCreate);
+        press(&mut app, KeyCode::Tab); // Category -> Title
+        press(&mut app, KeyCode::Tab); // Title -> Body
+        type_str(&mut app, "hello");
+        for _ in 0..5 {
+            press_shift(&mut app, KeyCode::Left); // select "hello" back from the end
+        }
+        press_ctrl(&mut app, 'c');
+
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some("clipboard: test-sink:hello"),
+            "the drain must call the injected sink with the copied text"
+        );
+        let Modal::Edit(m) = &app.modal else {
+            panic!("expected edit modal")
+        };
+        assert_eq!(
+            m.pending_clipboard, None,
+            "pending_clipboard must be drained (one-shot), not left set"
+        );
+    }
+
+    #[test]
+    fn copy_step_leaves_status_untouched_when_the_sink_succeeds() {
+        let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n");
+        app.clipboard_copy = |_| Ok(());
+        app.apply(Action::OpenCreate);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        type_str(&mut app, "hi");
+        press_shift(&mut app, KeyCode::Left);
+        press_shift(&mut app, KeyCode::Left);
+        press_ctrl(&mut app, 'c');
+        assert_eq!(app.status_msg, None);
+    }
+
+    #[test]
+    fn no_selection_ctrl_c_never_touches_the_sink() {
+        let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n");
+        app.clipboard_copy = fake_clipboard_sink;
+        app.apply(Action::OpenCreate);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        type_str(&mut app, "hi");
+        press_ctrl(&mut app, 'c'); // nothing selected
+        assert_eq!(
+            app.status_msg, None,
+            "no selection means no copy, so the sink is never called"
+        );
     }
 
     /// Scope change (round-2 feedback item 5): the create modal's section

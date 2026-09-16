@@ -22,6 +22,8 @@ pub enum OpError {
     Ambiguous(String, Vec<String>),
     #[error("only the human closes human-created items (use review, or --as-human)")]
     NotAuthorised,
+    #[error("\"{0}\" is a reserved section")]
+    Reserved(String),
 }
 
 pub fn zone_of(doc: &Document, index: usize) -> Zone {
@@ -233,6 +235,47 @@ pub fn section_names(doc: &Document) -> Vec<String> {
         }
     }
     names
+}
+
+/// Find the active `## name` section (case-insensitive; archive subsections
+/// never match) or create it at the end of the human zone — before
+/// `## Agent` if present, else before `# Done`, else at EOF. Returns the
+/// insertion index for a new item at the section's end.
+/// Not yet called outside tests — wired up in a later task.
+#[allow(dead_code)]
+pub fn ensure_section(doc: &mut Document, name: &str) -> Result<usize, OpError> {
+    if is_reserved_section(name) {
+        return Err(OpError::Reserved(name.to_string()));
+    }
+    if let Some(end) = named_section_end(doc, name) {
+        return Ok(end);
+    }
+    let mut at = doc
+        .nodes
+        .iter()
+        .position(|n| match n {
+            Node::Heading { level: 2, text } => text.eq_ignore_ascii_case("Agent"),
+            Node::Heading { level: 1, text } => text.eq_ignore_ascii_case("Done"),
+            _ => false,
+        })
+        .unwrap_or(doc.nodes.len());
+    // Step back over a single blank preceding the boundary (the same dance as
+    // end_of_first_human_section) so the new section slots between the last
+    // item's blank and the boundary's own blank — otherwise the file gains a
+    // double blank line and the first item glues against the boundary heading.
+    if at > 0 && matches!(&doc.nodes[at - 1], Node::Raw(s) if s.is_empty()) {
+        at -= 1;
+    }
+    doc.nodes.insert(at, Node::Raw(String::new()));
+    doc.nodes.insert(
+        at,
+        Node::Heading {
+            level: 2,
+            text: name.to_string(),
+        },
+    );
+    doc.nodes.insert(at, Node::Raw(String::new()));
+    Ok(at + 3)
 }
 
 /// Replace an item's title and body in place; state, agent tag, and done
@@ -831,5 +874,83 @@ Some prose.
         assert!(is_reserved_section("DONE"));
         assert!(is_reserved_section("Feed"));
         assert!(!is_reserved_section("Work"));
+    }
+
+    #[test]
+    fn ensure_section_finds_existing_case_insensitive() {
+        let mut doc = parse("# Feed\n\n## Work\n\n- [ ] W\n\n## Agent\n");
+        let at = ensure_section(&mut doc, "work").unwrap();
+        doc.nodes.insert(
+            at,
+            Node::Item(Item {
+                state: State::Open,
+                title: "New".into(),
+                agent: None,
+                done_date: None,
+                body: Vec::new(),
+            }),
+        );
+        assert!(
+            render(&doc).contains("- [ ] W\n- [ ] New\n"),
+            "got:\n{}",
+            render(&doc)
+        );
+    }
+
+    #[test]
+    fn ensure_section_creates_before_agent_then_done_then_eof() {
+        // Before ## Agent — and an item inserted at the returned index renders
+        // with single blank lines on both sides (no double blank, no gluing):
+        let mut doc = parse("# Feed\n\n- [ ] A\n\n## Agent\n\n- [ ] G\n");
+        let at = ensure_section(&mut doc, "Work").unwrap();
+        doc.nodes.insert(
+            at,
+            Node::Item(Item {
+                state: State::Open,
+                title: "X".into(),
+                agent: None,
+                done_date: None,
+                body: Vec::new(),
+            }),
+        );
+        let out = render(&doc);
+        assert!(
+            out.contains("- [ ] A\n\n## Work\n\n- [ ] X\n\n## Agent\n"),
+            "got:\n{out}"
+        );
+        // No ## Agent — before # Done:
+        let mut doc =
+            parse("# Feed\n\n- [ ] A\n\n# Done\n\n## Feed\n\n- [x] Old @done(2026-09-01)\n");
+        ensure_section(&mut doc, "Work").unwrap();
+        let out = render(&doc);
+        assert!(
+            out.find("## Work").unwrap() < out.find("# Done").unwrap(),
+            "got:\n{out}"
+        );
+        // Neither — end of file:
+        let mut doc = parse("# Feed\n\n- [ ] A\n");
+        let at = ensure_section(&mut doc, "Work").unwrap();
+        assert_eq!(at, doc.nodes.len());
+        assert!(
+            render(&doc).ends_with("## Work\n\n"),
+            "got:\n{}",
+            render(&doc)
+        );
+    }
+
+    #[test]
+    fn ensure_section_rejects_reserved_and_ignores_archive_sections() {
+        let mut doc = parse("# Feed\n\n# Done\n\n## Chores\n\n- [x] C @done(2026-09-01)\n");
+        assert!(matches!(
+            ensure_section(&mut doc, "Agent"),
+            Err(OpError::Reserved(_))
+        ));
+        // "Chores" exists only in the archive → a NEW active section is created:
+        ensure_section(&mut doc, "Chores").unwrap();
+        let out = render(&doc);
+        assert!(
+            out.find("## Chores").unwrap() < out.find("# Done").unwrap(),
+            "got:\n{out}"
+        );
     }
 }

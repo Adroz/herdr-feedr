@@ -1116,6 +1116,30 @@ mod tests {
     }
 
     #[test]
+    fn edit_clearing_category_moves_item_to_uncategorized() {
+        let (mut app, _fake, _dir) =
+            app_on_disk("# Feed\n\n- [ ] A\n\n## Work\n\n- [ ] T\n  ctx\n");
+        app.apply(Action::OpenEdit(ItemKey {
+            title: "T".into(),
+            state: State::Open,
+        }));
+        let Modal::Edit(m) = &app.modal else {
+            panic!("expected edit modal")
+        };
+        assert_eq!(m.category_text(), "Work"); // prefilled
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Backspace); // clear "Work"
+        }
+        press_ctrl(&mut app, 's');
+        let out = feed_text(&app);
+        assert!(
+            out.contains("- [ ] A\n- [ ] T\n  ctx\n"),
+            "cleared item must join the uncategorized region with body intact, got:\n{out}"
+        );
+        assert!(out.contains("## Work"), "emptied heading kept:\n{out}");
+    }
+
+    #[test]
     fn edit_keeping_category_does_not_move_and_stays_byte_stable() {
         let text = "# Feed\n\n## Work\n\n- [ ] First\n- [ ] Second\n";
         let (mut app, _fake, _dir) = app_on_disk(text);

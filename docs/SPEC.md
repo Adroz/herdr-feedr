@@ -66,7 +66,13 @@ Interactions:
 
 - **Checkbox click** advances state: `[ ]`→`[~]`→`[x]`→`[ ]`. On a `[?]` item, click = accept → `[x]`. Clicks never produce `[?]` (that's the agent's signal).
 - **Title click** opens an edit modal (TUI overlay): title and body both editable.
-- **`+` row / `a`** opens the same modal empty — pick section, type title, optional body. Delete lives in the modal, with confirm.
+- **`+` row / `a`** opens the same modal empty — Category (topmost, with a suggestion
+  dropdown over existing and archived section names; free text creates a new `##`
+  section), title, optional body. An empty Category lands the item at the end of the
+  first human section. Editing an item's Category moves it to the end of the target
+  section; clearing it moves the item to the uncategorized region. Reserved names
+  (Agent, Done, Feed) are rejected. Delete lives in the modal, with confirm. See
+  `docs/superpowers/specs/2026-09-16-category-field-design.md`.
 - **`e`** opens the feed file in `$EDITOR` for bulk edits and reordering.
 - **`@agent` sub-line click**: pane open → focus it (`agent.focus`); pane gone → open a new tab resuming that session (kind prefix selects the command, e.g. `claude --resume <id>`).
 - **`«` button** collapses to a ~3-col rail showing `»`; click restores the previous width (implemented as resize — no hide-without-close in plugin v1). Native drag-resize works as on any pane.

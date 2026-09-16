@@ -680,7 +680,11 @@ mod tests {
     fn cursor_visible_at_title_when_create_modal_focuses_title() {
         let mut app = app_with(SAMPLE);
         app.apply(Action::OpenCreate);
-        // Round-2 item 5: no section picker — Title is focused immediately.
+        // Category is focused first (spec 2026-09-16 §2); Tab past it.
+        app.handle_modal_event(
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            (40, 12),
+        );
         let pos =
             render_cursor(&app, 40, 12).expect("cursor must be visible when Title is focused");
         let layout = modal::edit_layout(Rect::new(0, 0, 40, 12), false);
@@ -698,13 +702,15 @@ mod tests {
     /// Round-2 item 5: the "Add to: <section>" picker row is gone entirely —
     /// sidebar-created items always land in the first human section.
     /// Round-2 item 1: `frame.set_cursor_position` must fire only when
-    /// focus is on a textarea (Title/Body) — never on a button.
+    /// focus is on a textarea (Title/Body) — never on a button (and never
+    /// on Category, spec 2026-09-16 §2, since it isn't drawn as a cursor
+    /// target until Tasks 7/9).
     #[test]
     fn cursor_hidden_when_focus_on_save_button() {
         let mut app = app_with(SAMPLE);
         app.apply(Action::OpenCreate);
-        // Title -> Body -> Save.
-        for _ in 0..2 {
+        // Category -> Title -> Body -> Save.
+        for _ in 0..3 {
             app.handle_modal_event(
                 Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
                 (40, 12),

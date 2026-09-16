@@ -33,6 +33,7 @@ pub enum Modal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditFocus {
+    Category,
     Title,
     Body,
     Save,
@@ -46,40 +47,67 @@ pub const CANCEL_LABEL: &str = "[ Cancel ]";
 pub const DELETE_LABEL: &str = "[ Delete ]";
 const BUTTON_GAP: u16 = 2;
 
+/// Visible dropdown rows are capped; the keyboard highlight is clamped to
+/// the same cap so it can never point at an invisible row.
+pub const MAX_DROPDOWN_ROWS: usize = 5;
+
 pub struct EditModal {
     /// `Some(key)` = editing an existing item; `None` = creating.
     pub original: Option<ItemKey>,
+    /// Edit mode: the section the item was in when the modal opened (None =
+    /// uncategorized). Compared with `category_text()` on save to decide
+    /// whether the item moves. Always None in create mode.
+    #[allow(dead_code)] // wired up in Task 10 (save path)
+    pub original_category: Option<String>,
+    pub category: TextArea<'static>,
     pub title: TextArea<'static>,
     pub body: TextArea<'static>,
+    /// Category suggestions captured at open (`ops::section_names`).
+    pub suggestions: Vec<String>,
+    /// Keyboard highlight into `filtered()`; None = not in the list.
+    #[allow(dead_code)] // wired up in Task 8
+    pub dropdown: Option<usize>,
     pub focus: EditFocus,
 }
 
 impl EditModal {
-    /// Sidebar-created items are always the human's, and always land at the
-    /// end of the first human section (spec §3 review, round 2 item 5) —
-    /// agents create their own items via the CLI into `## Agent`, and can
-    /// relocate items later by editing the feed. So there is no section
-    /// picker to focus first; Title is focused immediately.
-    pub fn create() -> Self {
+    /// Sidebar-created items are always the human's. Category is the topmost
+    /// field (spec 2026-09-16 §2): empty keeps the pre-category behavior
+    /// (end of first human section), anything else names a section.
+    pub fn create(suggestions: Vec<String>) -> Self {
         let mut m = EditModal {
             original: None,
+            original_category: None,
+            category: TextArea::default(),
             title: TextArea::default(),
             body: TextArea::default(),
-            focus: EditFocus::Title,
+            suggestions,
+            dropdown: None,
+            focus: EditFocus::Category,
         };
         m.sync_blocks();
         m
     }
 
-    pub fn edit(key: ItemKey, item: &Item) -> Self {
+    pub fn edit(
+        key: ItemKey,
+        item: &Item,
+        section: Option<String>,
+        suggestions: Vec<String>,
+    ) -> Self {
         let mut m = EditModal {
             original: Some(key),
+            category: TextArea::new(vec![section.clone().unwrap_or_default()]),
+            original_category: section,
             title: TextArea::new(vec![item.title.clone()]),
             body: TextArea::new(item.body.clone()),
-            focus: EditFocus::Title,
+            suggestions,
+            dropdown: None,
+            focus: EditFocus::Category,
         };
         // TextArea::new leaves the cursor at (0,0); appending is the common
         // edit, so park it at the end deterministically.
+        m.category.move_cursor(CursorMove::End);
         m.title.move_cursor(CursorMove::End);
         m.body.move_cursor(CursorMove::Bottom);
         m.body.move_cursor(CursorMove::End);
@@ -87,28 +115,34 @@ impl EditModal {
         m
     }
 
-    /// Tab order: Title → Body → Save → Cancel → (Delete →) back to the
-    /// start. Create mode has no item to delete.
+    /// Tab order: Category → Title → Body → Save → Cancel → (Delete →) back
+    /// to the start. Create mode has no item to delete.
     pub fn cycle_focus(&mut self) {
         let is_edit = self.original.is_some();
         self.focus = match (self.focus, is_edit) {
+            (EditFocus::Category, _) => EditFocus::Title,
             (EditFocus::Title, _) => EditFocus::Body,
             (EditFocus::Body, _) => EditFocus::Save,
             (EditFocus::Save, _) => EditFocus::Cancel,
             (EditFocus::Cancel, true) => EditFocus::Delete,
-            (EditFocus::Cancel, false) => EditFocus::Title,
-            (EditFocus::Delete, _) => EditFocus::Title,
+            (EditFocus::Cancel, false) => EditFocus::Category,
+            (EditFocus::Delete, _) => EditFocus::Category,
         };
         self.sync_blocks();
     }
 
     /// Mark the focused field's border title with `*` so focus is visible,
-    /// and neutralize both textareas' own cursor styling — tui-textarea
+    /// and neutralize the textareas' own cursor styling — tui-textarea
     /// renders a reverse-video cell at its cursor position regardless of
     /// focus, but the only cursor that should ever be visible is the real
     /// terminal cursor the focused field gets from `frame.set_cursor_position`
     /// (round-2 feedback item 1).
     pub fn sync_blocks(&mut self) {
+        let c = if self.focus == EditFocus::Category {
+            "Category*"
+        } else {
+            "Category"
+        };
         let t = if self.focus == EditFocus::Title {
             "Title*"
         } else {
@@ -119,10 +153,16 @@ impl EditModal {
         } else {
             "Body"
         };
+        self.category.set_block(Block::bordered().title(c));
         self.title.set_block(Block::bordered().title(t));
         self.body.set_block(Block::bordered().title(b));
+        self.category.set_cursor_style(Style::default());
         self.title.set_cursor_style(Style::default());
         self.body.set_cursor_style(Style::default());
+    }
+
+    pub fn category_text(&self) -> String {
+        self.category.lines().join(" ").trim().to_string()
     }
 
     pub fn title_text(&self) -> String {
@@ -135,6 +175,37 @@ impl EditModal {
             Vec::new() // an untouched textarea is one empty line, not a body
         } else {
             lines
+        }
+    }
+
+    /// Suggestions matching the field, case-insensitive substring.
+    pub fn filtered(&self) -> Vec<String> {
+        let q = self.category_text().to_lowercase();
+        self.suggestions
+            .iter()
+            .filter(|s| s.to_lowercase().contains(&q))
+            .cloned()
+            .collect()
+    }
+
+    /// Replace the field content with an accepted suggestion.
+    #[allow(dead_code)] // wired up in Task 8
+    pub fn set_category(&mut self, name: &str) {
+        self.category = TextArea::new(vec![name.to_string()]);
+        self.category.move_cursor(CursorMove::End);
+        self.sync_blocks();
+    }
+
+    /// Rows the suggestion dropdown occupies (0 when Category unfocused or
+    /// nothing matches) — the single source for both `view::draw_edit_modal`
+    /// and `edit_step`'s hit-testing, so drawn and clickable rows can never
+    /// drift apart.
+    #[allow(dead_code)] // wired up in Task 7/8
+    pub fn dropdown_rows(&self) -> u16 {
+        if self.focus == EditFocus::Category {
+            self.filtered().len().min(MAX_DROPDOWN_ROWS) as u16
+        } else {
+            0
         }
     }
 }
@@ -394,6 +465,12 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
         }
     }
     match m.focus {
+        EditFocus::Category => {
+            m.category.input(ev);
+            // Typing refilters the list, so a stale highlight must not
+            // survive.
+            m.dropdown = None;
+        }
         EditFocus::Title => {
             m.title.input(ev);
         }
@@ -431,7 +508,7 @@ mod tests {
     }
 
     fn create_modal() -> EditModal {
-        EditModal::create()
+        EditModal::create(vec![])
     }
 
     fn edit_modal() -> EditModal {
@@ -447,6 +524,8 @@ mod tests {
                 done_date: None,
                 body: vec![],
             },
+            None,
+            vec![],
         )
     }
 
@@ -532,12 +611,14 @@ mod tests {
         }
     }
 
-    /// Round-2 item 5: the section picker is gone, so create mode focuses
-    /// Title immediately (no Section field to click into or through).
+    /// Category is the topmost field (spec 2026-09-16 §2), focused first on
+    /// create; clicking Title or Body moves focus there directly.
     #[test]
     fn clicking_title_or_body_moves_focus_there() {
         let layout = edit_layout(TEST_AREA, false);
-        let m = create_modal();
+        let mut m = create_modal();
+        assert_eq!(m.focus, EditFocus::Category);
+        m.cycle_focus(); // -> Title
         assert_eq!(m.focus, EditFocus::Title);
 
         let m = as_edit(step(
@@ -593,9 +674,9 @@ mod tests {
 
     #[test]
     fn tab_reaches_save_cancel_and_delete_and_enter_activates_them() {
-        // Create mode: Title -> Body -> Save -> Cancel -> Title.
+        // Create mode: Category -> Title -> Body -> Save -> Cancel -> Category.
         let mut m = create_modal();
-        for _ in 0..2 {
+        for _ in 0..3 {
             m.cycle_focus();
         }
         assert_eq!(m.focus, EditFocus::Save);
@@ -605,7 +686,7 @@ mod tests {
         ));
 
         let mut m = create_modal();
-        for _ in 0..3 {
+        for _ in 0..4 {
             m.cycle_focus();
         }
         assert_eq!(m.focus, EditFocus::Cancel);
@@ -614,9 +695,9 @@ mod tests {
             ModalStep::Continue(Modal::None)
         ));
 
-        // Edit mode: Title -> Body -> Save -> Cancel -> Delete.
+        // Edit mode: Category -> Title -> Body -> Save -> Cancel -> Delete.
         let mut m = edit_modal();
-        for _ in 0..4 {
+        for _ in 0..5 {
             m.cycle_focus();
         }
         assert_eq!(m.focus, EditFocus::Delete);
@@ -629,20 +710,68 @@ mod tests {
     /// Round-2 item 1: tui-textarea renders its own reverse-video cursor
     /// cell regardless of focus; the only cursor that should ever be
     /// visible is the real terminal cursor `view::draw_edit_modal` places
-    /// via `frame.set_cursor_position` on the focused field. Both
+    /// via `frame.set_cursor_position` on the focused field. All three
     /// textareas' internal cursor style must be neutralized at all times —
     /// on construction and after every focus change.
     #[test]
     fn textareas_never_render_their_own_cursor_style() {
         let m = create_modal();
+        assert_eq!(m.category.cursor_style(), Style::default());
         assert_eq!(m.title.cursor_style(), Style::default());
         assert_eq!(m.body.cursor_style(), Style::default());
 
         let mut m = edit_modal();
+        assert_eq!(m.category.cursor_style(), Style::default());
         assert_eq!(m.title.cursor_style(), Style::default());
         assert_eq!(m.body.cursor_style(), Style::default());
-        m.cycle_focus(); // Title -> Body
+        m.cycle_focus(); // Category -> Title
+        assert_eq!(m.category.cursor_style(), Style::default());
         assert_eq!(m.title.cursor_style(), Style::default());
         assert_eq!(m.body.cursor_style(), Style::default());
+    }
+
+    #[test]
+    fn create_focuses_category_first_and_cycles_through_it() {
+        let mut m = EditModal::create(vec!["Work".into()]);
+        assert_eq!(m.focus, EditFocus::Category);
+        m.cycle_focus();
+        assert_eq!(m.focus, EditFocus::Title);
+        m.cycle_focus(); // Body
+        m.cycle_focus(); // Save
+        m.cycle_focus(); // Cancel
+        m.cycle_focus(); // back to Category (create mode: no Delete)
+        assert_eq!(m.focus, EditFocus::Category);
+    }
+
+    #[test]
+    fn filtered_matches_substring_case_insensitive() {
+        let mut m = EditModal::create(vec!["Work".into(), "Chores".into(), "Homework".into()]);
+        assert_eq!(m.filtered(), vec!["Work", "Chores", "Homework"]); // empty query = all
+        m.category.insert_str("ork");
+        assert_eq!(m.filtered(), vec!["Work", "Homework"]);
+        m.set_category("Chores");
+        assert_eq!(m.category_text(), "Chores");
+    }
+
+    #[test]
+    fn edit_prefills_category_from_section() {
+        let item = Item {
+            state: State::Open,
+            title: "T".into(),
+            agent: None,
+            done_date: None,
+            body: Vec::new(),
+        };
+        let key = ItemKey {
+            title: "T".into(),
+            state: State::Open,
+        };
+        let m = EditModal::edit(key.clone(), &item, Some("Work".into()), vec!["Work".into()]);
+        assert_eq!(m.category_text(), "Work");
+        assert_eq!(m.original_category.as_deref(), Some("Work"));
+        assert_eq!(m.focus, EditFocus::Category);
+        let m = EditModal::edit(key, &item, None, vec![]);
+        assert_eq!(m.category_text(), "");
+        assert_eq!(m.original_category, None);
     }
 }

@@ -294,11 +294,16 @@ impl App {
             Action::OpenEdit(key) => {
                 if let Some(i) = relocate(&self.doc, &key) {
                     if let Node::Item(it) = &self.doc.nodes[i] {
-                        self.set_modal(Modal::Edit(EditModal::edit(key, it)));
+                        let section = ops::item_section(&self.doc, i);
+                        let suggestions = ops::section_names(&self.doc);
+                        self.set_modal(Modal::Edit(EditModal::edit(key, it, section, suggestions)));
                     }
                 }
             }
-            Action::OpenCreate => self.set_modal(Modal::Edit(EditModal::create())),
+            Action::OpenCreate => {
+                let suggestions = ops::section_names(&self.doc);
+                self.set_modal(Modal::Edit(EditModal::create(suggestions)))
+            }
             Action::OpenDoneView => self.set_modal(Modal::DoneView { scroll: 0 }),
             Action::OpenFileView => self.set_modal(Modal::FileView { scroll: 0 }),
             Action::OpenEditor => self.request_editor(),
@@ -952,7 +957,9 @@ mod tests {
 
         app.apply(Action::OpenCreate);
         assert!(app.modal_active());
-        // Round-2 item 5: no section picker — Title is focused immediately.
+        // Category is focused first (spec 2026-09-16 §2); Tab past it to
+        // Title, leaving Category empty (pre-category fallback behavior).
+        press(&mut app, KeyCode::Tab);
         type_str(&mut app, "First item");
         press_ctrl(&mut app, 's');
 
@@ -994,11 +1001,12 @@ mod tests {
     }
 
     /// Scope change (round-2 feedback item 5): the create modal's section
-    /// picker is dead UI — sidebar-created items are always the human's and
-    /// always land at the end of the first human section (agents create
-    /// their own items via the CLI into `## Agent`, and can relocate items
-    /// later by editing the feed). Title is focused first on create (no
-    /// Section field to Tab through).
+    /// picker is dead UI — sidebar-created items are always the human's and,
+    /// with the Category field left blank, land at the end of the first
+    /// human section (agents create their own items via the CLI into
+    /// `## Agent`, and can relocate items later by editing the feed).
+    /// Category is focused first on create (spec 2026-09-16 §2); Tab past
+    /// it, leaving it empty, to exercise the pre-category fallback.
     #[test]
     fn create_modal_adds_to_first_human_section() {
         let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n\n## Later\n\n- [ ] L1\n");
@@ -1007,7 +1015,8 @@ mod tests {
         let Modal::Edit(m) = &app.modal else {
             panic!("expected edit modal")
         };
-        assert_eq!(m.focus, EditFocus::Title);
+        assert_eq!(m.focus, EditFocus::Category);
+        press(&mut app, KeyCode::Tab);
         type_str(&mut app, "New item");
         press(&mut app, KeyCode::Enter); // → Body
         type_str(&mut app, "ctx");
@@ -1039,7 +1048,10 @@ mod tests {
         };
         assert_eq!(m.title_text(), "Old");
         assert_eq!(m.body_lines(), vec!["old body"]);
-        type_str(&mut app, "er"); // cursor starts in the title
+        // Category is focused first (spec 2026-09-16 §2); Tab past it to
+        // reach the title, whose cursor starts at the end.
+        press(&mut app, KeyCode::Tab);
+        type_str(&mut app, "er");
         press_ctrl(&mut app, 's');
         let text = feed_text(&app);
         assert!(

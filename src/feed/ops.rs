@@ -244,12 +244,8 @@ fn named_section_end(doc: &Document, name: &str) -> Option<usize> {
 /// Section names that can never be categories: "Agent" is the agents' zone,
 /// "Done" the archive, "Feed" the archive's mirror name for uncategorized
 /// items (spec 2026-09-16 §1).
-/// Not yet called outside tests — wired up by the category feature's later
-/// tasks (category validation, modal suggestions).
-#[allow(dead_code)]
 const RESERVED_SECTIONS: [&str; 3] = ["agent", "done", "feed"];
 
-#[allow(dead_code)]
 pub fn is_reserved_section(name: &str) -> bool {
     RESERVED_SECTIONS
         .iter()
@@ -260,8 +256,6 @@ pub fn is_reserved_section(name: &str) -> bool {
 /// active sections plus the `# Done` archive's mirrored names ("categories
 /// used in the past") — first-seen casing, case-insensitively deduplicated,
 /// reserved names excluded.
-/// Not yet called outside tests — wired up by a later task.
-#[allow(dead_code)]
 pub fn section_names(doc: &Document) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for n in &doc.nodes {
@@ -418,8 +412,6 @@ pub fn set_state(
 /// (directly under a `#` heading). Prefills the modal's Category field —
 /// unlike the private `section_name` (archive mirroring), this does not
 /// fall back to the level-1 heading's name.
-/// Not yet called outside tests — wired up in a later task.
-#[allow(dead_code)]
 pub fn item_section(doc: &Document, index: usize) -> Option<String> {
     let mut current: Option<String> = None;
     for node in &doc.nodes[..index] {

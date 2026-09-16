@@ -65,7 +65,6 @@ pub struct EditModal {
     /// Category suggestions captured at open (`ops::section_names`).
     pub suggestions: Vec<String>,
     /// Keyboard highlight into `filtered()`; None = not in the list.
-    #[allow(dead_code)] // wired up in Task 8
     pub dropdown: Option<usize>,
     pub focus: EditFocus,
 }
@@ -189,7 +188,6 @@ impl EditModal {
     }
 
     /// Replace the field content with an accepted suggestion.
-    #[allow(dead_code)] // wired up in Task 8
     pub fn set_category(&mut self, name: &str) {
         self.category = TextArea::new(vec![name.to_string()]);
         self.category.move_cursor(CursorMove::End);
@@ -434,8 +432,15 @@ pub fn step(modal: Modal, ev: Event, area: Rect) -> ModalStep {
 fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
     if let Event::Key(k) = &ev {
         match (k.code, k.modifiers) {
-            (KeyCode::Esc, _) => return ModalStep::Continue(Modal::None),
+            (KeyCode::Esc, _) => {
+                if m.focus == EditFocus::Category && m.dropdown.is_some() {
+                    m.dropdown = None;
+                    return ModalStep::Continue(Modal::Edit(m));
+                }
+                return ModalStep::Continue(Modal::None);
+            }
             (KeyCode::Tab, _) => {
+                m.dropdown = None;
                 m.cycle_focus();
                 return ModalStep::Continue(Modal::Edit(m));
             }
@@ -446,6 +451,32 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                 if mods.contains(KeyModifiers::CONTROL) && m.original.is_some() =>
             {
                 return ModalStep::Continue(Modal::ConfirmDelete(m));
+            }
+            (KeyCode::Down, _) if m.focus == EditFocus::Category => {
+                let n = m.filtered().len().min(MAX_DROPDOWN_ROWS);
+                if n > 0 {
+                    m.dropdown = Some(m.dropdown.map_or(0, |i| (i + 1).min(n - 1)));
+                }
+                return ModalStep::Continue(Modal::Edit(m));
+            }
+            (KeyCode::Up, _) if m.focus == EditFocus::Category => {
+                m.dropdown = match m.dropdown {
+                    Some(i) if i > 0 => Some(i - 1),
+                    _ => None,
+                };
+                return ModalStep::Continue(Modal::Edit(m));
+            }
+            (KeyCode::Enter, _) if m.focus == EditFocus::Category => {
+                if let Some(i) = m.dropdown {
+                    if let Some(name) = m.filtered().get(i).cloned() {
+                        m.set_category(&name);
+                    }
+                    m.dropdown = None;
+                } else {
+                    m.focus = EditFocus::Title;
+                    m.sync_blocks();
+                }
+                return ModalStep::Continue(Modal::Edit(m));
             }
             (KeyCode::Enter, _) if m.focus == EditFocus::Title => {
                 m.focus = EditFocus::Body;
@@ -470,8 +501,17 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
             let is_edit = m.original.is_some();
             let layout = edit_layout(area, is_edit, m.dropdown_rows());
             return match edit_click(&layout, is_edit, mev.column, mev.row) {
-                Some(EditClickTarget::Category) | Some(EditClickTarget::Suggestion(_)) => {
-                    // Click behavior for the category field lands in Task 8.
+                Some(EditClickTarget::Suggestion(row)) => {
+                    if let Some(name) = m.filtered().get(row as usize).cloned() {
+                        m.set_category(&name);
+                    }
+                    m.dropdown = None;
+                    ModalStep::Continue(Modal::Edit(m))
+                }
+                Some(EditClickTarget::Category) => {
+                    m.focus = EditFocus::Category;
+                    m.dropdown = None;
+                    m.sync_blocks();
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Title) => {
@@ -532,6 +572,17 @@ mod tests {
 
     fn enter() -> Event {
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn step_edit(m: EditModal, ev: Event) -> EditModal {
+        match step(Modal::Edit(m), ev, TEST_AREA) {
+            ModalStep::Continue(Modal::Edit(m)) => m,
+            _ => panic!("expected Continue(Edit), got another step"),
+        }
     }
 
     fn create_modal() -> EditModal {
@@ -829,5 +880,77 @@ mod tests {
         let m = EditModal::edit(key, &item, None, vec![]);
         assert_eq!(m.category_text(), "");
         assert_eq!(m.original_category, None);
+    }
+
+    #[test]
+    fn down_enters_dropdown_enter_accepts() {
+        let m = EditModal::create(vec!["Work".into(), "Chores".into()]);
+        let m = step_edit(m, key(KeyCode::Down));
+        assert_eq!(m.dropdown, Some(0));
+        let m = step_edit(m, key(KeyCode::Down));
+        assert_eq!(m.dropdown, Some(1)); // clamped at the end, not wrapping
+        let m = step_edit(m, key(KeyCode::Down));
+        assert_eq!(m.dropdown, Some(1));
+        let m = step_edit(m, key(KeyCode::Enter));
+        assert_eq!(m.category_text(), "Chores");
+        assert_eq!(m.dropdown, None);
+        assert_eq!(m.focus, EditFocus::Category, "accept stays on the field");
+    }
+
+    #[test]
+    fn enter_with_dropdown_closed_advances_to_title() {
+        let m = EditModal::create(vec!["Work".into()]);
+        let m = step_edit(m, key(KeyCode::Enter));
+        assert_eq!(m.focus, EditFocus::Title);
+    }
+
+    #[test]
+    fn esc_closes_dropdown_first_then_cancels() {
+        let m = EditModal::create(vec!["Work".into()]);
+        let m = step_edit(m, key(KeyCode::Down));
+        assert_eq!(m.dropdown, Some(0));
+        let m = step_edit(m, key(KeyCode::Esc)); // first Esc: dropdown only
+        assert_eq!(m.dropdown, None);
+        match step(Modal::Edit(m), key(KeyCode::Esc), TEST_AREA) {
+            ModalStep::Continue(Modal::None) => {} // second Esc: modal cancels
+            _ => panic!("second Esc must cancel the modal"),
+        }
+    }
+
+    #[test]
+    fn typing_filters_and_resets_highlight_up_leaves_list() {
+        let m = EditModal::create(vec!["Work".into(), "Homework".into(), "Chores".into()]);
+        let m = step_edit(m, key(KeyCode::Down));
+        let m = step_edit(m, key(KeyCode::Char('w')));
+        assert_eq!(m.dropdown, None, "typing resets the highlight");
+        assert_eq!(m.filtered(), vec!["Work", "Homework"]);
+        let m = step_edit(m, key(KeyCode::Down));
+        let m = step_edit(m, key(KeyCode::Up));
+        assert_eq!(m.dropdown, None, "Up at the top leaves the list");
+    }
+
+    #[test]
+    fn tab_closes_dropdown_and_moves_focus() {
+        let m = EditModal::create(vec!["Work".into()]);
+        let m = step_edit(m, key(KeyCode::Down));
+        let m = step_edit(m, key(KeyCode::Tab));
+        assert_eq!(m.dropdown, None);
+        assert_eq!(m.focus, EditFocus::Title);
+    }
+
+    #[test]
+    fn click_on_suggestion_accepts_it() {
+        let m = EditModal::create(vec!["Work".into(), "Chores".into()]);
+        let m = step_edit(m, key(KeyCode::Down)); // dropdown open (2 rows)
+        let l = edit_layout(TEST_AREA, false, m.dropdown_rows());
+        let ev = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: l.dropdown.x + 1,
+            row: l.dropdown.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        let m = step_edit(m, ev);
+        assert_eq!(m.category_text(), "Chores");
+        assert_eq!(m.dropdown, None);
     }
 }

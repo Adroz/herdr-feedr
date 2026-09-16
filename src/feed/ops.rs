@@ -178,6 +178,44 @@ fn end_of_first_human_section(doc: &Document) -> usize {
     }
 }
 
+/// Insertion index for the true uncategorized region: just past the last
+/// item before the first `##` heading (or `# Done`), stepping back over a
+/// single preceding blank when the region holds no items. Unlike
+/// `end_of_first_human_section` (the legacy create path), a named section
+/// is ALWAYS a boundary here — clearing an item's category must never land
+/// it inside another category.
+fn end_of_uncategorized_region(doc: &Document) -> usize {
+    let mut last_item_end = 0usize;
+    let mut boundary: Option<usize> = None;
+    for (i, n) in doc.nodes.iter().enumerate() {
+        match n {
+            Node::Heading { level: 2, .. } => {
+                boundary = Some(i);
+                break;
+            }
+            Node::Heading { level: 1, text } if text.eq_ignore_ascii_case("Done") => {
+                boundary = Some(i);
+                break;
+            }
+            Node::Item(_) => last_item_end = i + 1,
+            _ => {}
+        }
+    }
+    if last_item_end > 0 {
+        return last_item_end;
+    }
+    match boundary {
+        Some(b) => {
+            if b > 0 && matches!(&doc.nodes[b - 1], Node::Raw(s) if s.is_empty()) {
+                b - 1
+            } else {
+                b
+            }
+        }
+        None => doc.nodes.len(),
+    }
+}
+
 fn agent_section_end(doc: &Document) -> Option<usize> {
     named_section_end(doc, "Agent")
 }
@@ -239,11 +277,11 @@ pub fn section_names(doc: &Document) -> Vec<String> {
     names
 }
 
-/// Find the active `## name` section (case-insensitive; archive subsections
-/// never match) or create it at the end of the human zone — before
-/// `## Agent` if present, else before `# Done`, else at EOF. Returns the
-/// insertion index for a new item at the section's end.
-pub fn ensure_section(doc: &mut Document, name: &str) -> Result<usize, OpError> {
+/// Trimmed, validated section name — the single gate both `ensure_section`
+/// and `move_to_section` use, so their checks can never drift apart (the
+/// no-drop invariant in `move_to_section` depends on this being the SAME
+/// validation `ensure_section` applies).
+fn validate_section_name(name: &str) -> Result<&str, OpError> {
     let name = name.trim();
     if name.is_empty() {
         return Err(OpError::EmptyName);
@@ -251,6 +289,15 @@ pub fn ensure_section(doc: &mut Document, name: &str) -> Result<usize, OpError> 
     if is_reserved_section(name) {
         return Err(OpError::Reserved(name.to_string()));
     }
+    Ok(name)
+}
+
+/// Find the active `## name` section (case-insensitive; archive subsections
+/// never match) or create it at the end of the human zone — before
+/// `## Agent` if present, else before `# Done`, else at EOF. Returns the
+/// insertion index for a new item at the section's end.
+pub fn ensure_section(doc: &mut Document, name: &str) -> Result<usize, OpError> {
+    let name = validate_section_name(name)?;
     if let Some(end) = named_section_end(doc, name) {
         return Ok(end);
     }
@@ -324,6 +371,30 @@ pub fn add_in_section(
             body: trim_blank_edges(body),
         }),
     );
+    Ok(())
+}
+
+/// Move an item (state, body, and tokens intact) to the end of the named
+/// section — created if missing — or, when `target` is None, to the end of
+/// the uncategorized region (never into another category). The
+/// reserved/empty checks run before the item is removed so an error leaves
+/// the doc untouched.
+#[allow(dead_code)]
+pub fn move_to_section(
+    doc: &mut Document,
+    index: usize,
+    target: Option<&str>,
+) -> Result<(), OpError> {
+    if let Some(name) = target {
+        validate_section_name(name)?;
+    }
+    let item =
+        remove(doc, index).ok_or_else(|| OpError::NotFound(format!("item at index {index}")))?;
+    let at = match target {
+        Some(name) => ensure_section(doc, name)?,
+        None => end_of_uncategorized_region(doc),
+    };
+    doc.nodes.insert(at, Node::Item(item));
     Ok(())
 }
 
@@ -903,6 +974,8 @@ Some prose.
     #[test]
     fn ensure_section_finds_existing_case_insensitive() {
         let mut doc = parse("# Feed\n\n## Work\n\n- [ ] W\n\n## Agent\n");
+        let padded = ensure_section(&mut doc, " work ").unwrap();
+        assert_eq!(padded, ensure_section(&mut doc, "work").unwrap());
         let at = ensure_section(&mut doc, "work").unwrap();
         doc.nodes.insert(
             at,
@@ -996,6 +1069,105 @@ Some prose.
         assert!(matches!(
             ensure_section(&mut doc, "  "),
             Err(OpError::EmptyName)
+        ));
+        assert_eq!(render(&doc), before);
+    }
+
+    #[test]
+    fn move_to_section_preserves_state_body_and_tokens() {
+        let mut doc =
+            parse("# Feed\n\n- [~] A @agent(claude:abc)\n  ctx line\n\n## Work\n\n- [ ] W\n");
+        let i = find(&doc, "A").unwrap();
+        move_to_section(&mut doc, i, Some("Work")).unwrap();
+        let out = render(&doc);
+        assert!(
+            out.contains("- [ ] W\n- [~] A @agent(claude:abc)\n  ctx line\n"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn move_to_section_creates_target_and_keeps_emptied_heading() {
+        let mut doc = parse("# Feed\n\n## Work\n\n- [ ] Only\n\n## Agent\n");
+        let i = find(&doc, "Only").unwrap();
+        move_to_section(&mut doc, i, Some("Chores")).unwrap();
+        let out = render(&doc);
+        assert!(
+            out.contains("## Work"),
+            "emptied heading must survive:\n{out}"
+        );
+        assert!(out.contains("## Chores\n\n- [ ] Only\n"), "got:\n{out}");
+        assert!(
+            out.find("## Chores").unwrap() < out.find("## Agent").unwrap(),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn move_to_none_lands_in_first_human_section_and_reserved_errors() {
+        let mut doc = parse("# Feed\n\n- [ ] A\n\n## Work\n\n- [ ] W\n");
+        let w = find(&doc, "W").unwrap();
+        move_to_section(&mut doc, w, None).unwrap();
+        assert!(
+            render(&doc).contains("- [ ] A\n- [ ] W\n"),
+            "got:\n{}",
+            render(&doc)
+        );
+        // Reserved target: error, document untouched.
+        let before = render(&doc);
+        let a = find(&doc, "A").unwrap();
+        assert!(matches!(
+            move_to_section(&mut doc, a, Some("Done")),
+            Err(OpError::Reserved(_))
+        ));
+        assert_eq!(render(&doc), before);
+    }
+
+    #[test]
+    fn move_to_section_rejects_empty_name_without_dropping_item() {
+        let mut doc = parse("# Feed\n\n- [ ] A\n\n## Work\n\n- [ ] W\n");
+        let before = render(&doc);
+        let a = find(&doc, "A").unwrap();
+        assert!(matches!(
+            move_to_section(&mut doc, a, Some("  ")),
+            Err(OpError::EmptyName)
+        ));
+        assert_eq!(render(&doc), before);
+    }
+
+    #[test]
+    fn move_to_none_reaches_empty_uncategorized_region() {
+        // Single categorized item; clearing its category must lift it out.
+        let mut doc = parse("# Feed\n\n## Work\n\n- [ ] W\n");
+        let w = find(&doc, "W").unwrap();
+        move_to_section(&mut doc, w, None).unwrap();
+        let out = render(&doc);
+        assert!(
+            out.find("- [ ] W").unwrap() < out.find("## Work").unwrap(),
+            "item must land before the first section, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn move_to_none_never_lands_in_another_category() {
+        let mut doc = parse("# Feed\n\n## Work\n\n- [ ] W\n\n## Chores\n\n- [ ] C\n");
+        let c = find(&doc, "C").unwrap();
+        move_to_section(&mut doc, c, None).unwrap();
+        let out = render(&doc);
+        assert!(
+            out.find("- [ ] C").unwrap() < out.find("## Work").unwrap(),
+            "cleared item must precede all sections, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn move_to_section_reserved_with_padding_errors_and_leaves_doc_untouched() {
+        let mut doc = parse("# Feed\n\n- [ ] A\n\n## Work\n\n- [ ] W\n");
+        let before = render(&doc);
+        let a = find(&doc, "A").unwrap();
+        assert!(matches!(
+            move_to_section(&mut doc, a, Some(" done ")),
+            Err(OpError::Reserved(_))
         ));
         assert_eq!(render(&doc), before);
     }

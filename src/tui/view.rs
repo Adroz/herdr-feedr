@@ -245,7 +245,7 @@ fn dim_backdrop(f: &mut Frame) {
 /// replace the static styled cursor cell).
 fn draw_edit_modal(f: &mut Frame, m: &modal::EditModal) {
     let is_edit = m.original.is_some();
-    let layout = modal::edit_layout(f.area(), is_edit);
+    let layout = modal::edit_layout(f.area(), is_edit, 0); // dropdown rendering lands in Task 9
 
     f.render_widget(Clear, layout.outer);
     let outer = Block::bordered()
@@ -687,7 +687,7 @@ mod tests {
         );
         let pos =
             render_cursor(&app, 40, 12).expect("cursor must be visible when Title is focused");
-        let layout = modal::edit_layout(Rect::new(0, 0, 40, 12), false);
+        let layout = modal::edit_layout(Rect::new(0, 0, 40, 12), false, 0);
         let inner = Block::bordered().inner(layout.title);
         // Untouched textarea: cursor still at its origin (row 0, col 0).
         assert_eq!(
@@ -791,7 +791,7 @@ mod tests {
         app.apply(Action::OpenCreate);
         let (w, h) = (60, 20);
         let buf = render_buffer(&app, w, h);
-        let layout = modal::edit_layout(Rect::new(0, 0, w, h), false);
+        let layout = modal::edit_layout(Rect::new(0, 0, w, h), false, 0);
 
         // Top-left corner is outside the centered 90%x80% panel.
         let outside = &buf[(0, 0)];

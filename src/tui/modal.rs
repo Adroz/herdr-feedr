@@ -200,7 +200,6 @@ impl EditModal {
     /// nothing matches) — the single source for both `view::draw_edit_modal`
     /// and `edit_step`'s hit-testing, so drawn and clickable rows can never
     /// drift apart.
-    #[allow(dead_code)] // wired up in Task 7/8
     pub fn dropdown_rows(&self) -> u16 {
         if self.focus == EditFocus::Category {
             self.filtered().len().min(MAX_DROPDOWN_ROWS) as u16
@@ -220,6 +219,10 @@ impl EditModal {
 #[derive(Debug, Clone, Copy)]
 pub struct EditLayout {
     pub outer: Rect,
+    pub category: Rect,
+    /// Zero-height when the dropdown is closed. Overlays the title/body
+    /// area; `edit_click` tests it first so overlap resolves to the list.
+    pub dropdown: Rect,
     pub title: Rect,
     pub body: Rect,
     pub hints: Rect,
@@ -266,16 +269,26 @@ pub(crate) fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
 /// being drawn into — the same rect that's later used to hit-test clicks
 /// (`edit_click`), so a clipped-away button also becomes unclickable rather
 /// than clickable-but-invisible.
-pub fn edit_layout(term_area: Rect, is_edit: bool) -> EditLayout {
+pub fn edit_layout(term_area: Rect, is_edit: bool, dropdown_rows: u16) -> EditLayout {
     let outer = centered(term_area, 90, 80);
     let inner = Block::bordered().padding(Padding::uniform(1)).inner(outer);
-    let [title, body, buttons, hints] = Layout::vertical([
+    let [category, title, body, buttons, hints] = Layout::vertical([
+        Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Min(3),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(inner);
+    // Inside the category field's borders, clamped like the buttons so it
+    // can never escape the drawn buffer.
+    let dropdown = Rect::new(
+        category.x.saturating_add(1),
+        category.y.saturating_add(category.height),
+        category.width.saturating_sub(2),
+        dropdown_rows,
+    )
+    .intersection(term_area);
 
     let mut x = buttons.x;
     let save = Rect::new(x, buttons.y, SAVE_LABEL.len() as u16, 1).intersection(term_area);
@@ -291,6 +304,8 @@ pub fn edit_layout(term_area: Rect, is_edit: bool) -> EditLayout {
 
     EditLayout {
         outer,
+        category,
+        dropdown,
         title,
         body,
         hints,
@@ -302,6 +317,8 @@ pub fn edit_layout(term_area: Rect, is_edit: bool) -> EditLayout {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditClickTarget {
+    Category,
+    Suggestion(u16),
     Title,
     Body,
     Save,
@@ -317,6 +334,12 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 /// filesystem or `App` access, mirrors `input::translate`'s hit-testing for
 /// the main list.
 pub fn edit_click(layout: &EditLayout, is_edit: bool, x: u16, y: u16) -> Option<EditClickTarget> {
+    if layout.dropdown.height > 0 && rect_contains(layout.dropdown, x, y) {
+        return Some(EditClickTarget::Suggestion(y - layout.dropdown.y));
+    }
+    if rect_contains(layout.category, x, y) {
+        return Some(EditClickTarget::Category);
+    }
     if rect_contains(layout.title, x, y) {
         return Some(EditClickTarget::Title);
     }
@@ -445,8 +468,12 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
     if let Event::Mouse(mev) = &ev {
         if mev.kind == MouseEventKind::Down(MouseButton::Left) {
             let is_edit = m.original.is_some();
-            let layout = edit_layout(area, is_edit);
+            let layout = edit_layout(area, is_edit, m.dropdown_rows());
             return match edit_click(&layout, is_edit, mev.column, mev.row) {
+                Some(EditClickTarget::Category) | Some(EditClickTarget::Suggestion(_)) => {
+                    // Click behavior for the category field lands in Task 8.
+                    ModalStep::Continue(Modal::Edit(m))
+                }
                 Some(EditClickTarget::Title) => {
                     m.focus = EditFocus::Title;
                     m.sync_blocks();
@@ -570,8 +597,8 @@ mod tests {
 
     #[test]
     fn edit_layout_has_no_delete_button_in_create_mode_and_one_in_edit_mode() {
-        assert!(edit_layout(TEST_AREA, false).delete.is_none());
-        assert!(edit_layout(TEST_AREA, true).delete.is_some());
+        assert!(edit_layout(TEST_AREA, false, 0).delete.is_none());
+        assert!(edit_layout(TEST_AREA, true, 0).delete.is_some());
     }
 
     /// Crash regression: at narrow widths (e.g. the ~30-col pane herdr docks
@@ -594,7 +621,7 @@ mod tests {
         for width in 1..=120u16 {
             let area = Rect::new(0, 0, width, 40);
             for is_edit in [false, true] {
-                let layout = edit_layout(area, is_edit);
+                let layout = edit_layout(area, is_edit, 0);
                 for (name, r) in [("save", layout.save), ("cancel", layout.cancel)] {
                     assert!(
                         r.is_empty() || r.right() <= area.width,
@@ -615,7 +642,7 @@ mod tests {
     /// create; clicking Title or Body moves focus there directly.
     #[test]
     fn clicking_title_or_body_moves_focus_there() {
-        let layout = edit_layout(TEST_AREA, false);
+        let layout = edit_layout(TEST_AREA, false, 0);
         let mut m = create_modal();
         assert_eq!(m.focus, EditFocus::Category);
         m.cycle_focus(); // -> Title
@@ -638,7 +665,7 @@ mod tests {
 
     #[test]
     fn clicking_save_button_saves() {
-        let layout = edit_layout(TEST_AREA, false);
+        let layout = edit_layout(TEST_AREA, false, 0);
         let m = create_modal();
         let result = step(
             Modal::Edit(m),
@@ -650,7 +677,7 @@ mod tests {
 
     #[test]
     fn clicking_cancel_button_closes_modal() {
-        let layout = edit_layout(TEST_AREA, false);
+        let layout = edit_layout(TEST_AREA, false, 0);
         let m = create_modal();
         let result = step(
             Modal::Edit(m),
@@ -662,7 +689,7 @@ mod tests {
 
     #[test]
     fn clicking_delete_button_opens_confirm_delete() {
-        let layout = edit_layout(TEST_AREA, true);
+        let layout = edit_layout(TEST_AREA, true, 0);
         let m = edit_modal();
         let delete = layout.delete.expect("edit mode has a delete button");
         let result = step(Modal::Edit(m), click(delete.x, delete.y), TEST_AREA);
@@ -751,6 +778,35 @@ mod tests {
         assert_eq!(m.filtered(), vec!["Work", "Homework"]);
         m.set_category("Chores");
         assert_eq!(m.category_text(), "Chores");
+    }
+
+    #[test]
+    fn layout_stacks_category_above_title_and_sizes_dropdown() {
+        let l = edit_layout(TEST_AREA, false, 3);
+        assert!(l.category.y < l.title.y && l.title.y < l.body.y);
+        assert_eq!(l.dropdown.height, 3);
+        assert_eq!(l.dropdown.y, l.category.y + l.category.height);
+        let l0 = edit_layout(TEST_AREA, false, 0);
+        assert_eq!(l0.dropdown.height, 0);
+    }
+
+    #[test]
+    fn clicks_hit_category_and_dropdown_rows() {
+        let l = edit_layout(TEST_AREA, false, 2);
+        assert_eq!(
+            edit_click(&l, false, l.category.x + 1, l.category.y + 1),
+            Some(EditClickTarget::Category)
+        );
+        // The dropdown overlays the title area — it must win the hit-test:
+        assert_eq!(
+            edit_click(&l, false, l.dropdown.x + 1, l.dropdown.y + 1),
+            Some(EditClickTarget::Suggestion(1))
+        );
+        let l0 = edit_layout(TEST_AREA, false, 0);
+        assert_eq!(
+            edit_click(&l0, false, l0.title.x + 1, l0.title.y + 1),
+            Some(EditClickTarget::Title)
+        );
     }
 
     #[test]

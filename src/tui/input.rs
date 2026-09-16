@@ -95,6 +95,7 @@ mod tests {
         let cfg = SidebarConfig {
             side: Side::Left,
             width: 0.18,
+            max_width: 46,
             auto_dock: false,
         };
         let mut app = App::new(

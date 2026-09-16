@@ -84,8 +84,9 @@ grouping is physical in the file, so display order remains file order.
 
 ## 7. Out of scope
 
-- CLI `feedr add --section <name>` parity (agents create into `## Agent` anyway) —
-  future ticket.
+- ~~CLI `feedr add --section <name>` parity~~ — shipped alongside this feature after
+  all: `--section` now creates a missing section and rejects reserved names (see
+  plan Task 3).
 - `ItemKey` disambiguation by section (see §4).
 - Reordering or renaming sections from the sidebar — `$EDITOR` covers it.
 

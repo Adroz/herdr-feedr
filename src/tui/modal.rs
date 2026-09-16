@@ -57,7 +57,6 @@ pub struct EditModal {
     /// Edit mode: the section the item was in when the modal opened (None =
     /// uncategorized). Compared with `category_text()` on save to decide
     /// whether the item moves. Always None in create mode.
-    #[allow(dead_code)] // wired up in Task 10 (save path)
     pub original_category: Option<String>,
     pub category: TextArea<'static>,
     pub title: TextArea<'static>,
@@ -215,6 +214,16 @@ impl EditModal {
         }
         self.dropdown = None;
     }
+}
+
+/// Rows of the dropdown actually drawn at this terminal size — the Down and
+/// Enter arms both clamp against this so the keyboard can neither highlight
+/// nor accept a suggestion the user cannot see (the rect may be clipped by
+/// `.intersection(term_area)` at degenerate sizes).
+fn visible_rows(m: &EditModal, area: Rect) -> usize {
+    edit_layout(area, m.original.is_some(), m.dropdown_rows())
+        .dropdown
+        .height as usize
 }
 
 /// Drawn geometry of the edit/create modal — the single source of truth for
@@ -473,11 +482,10 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                 // a degenerate terminal size the dropdown rect is clipped by
                 // `.intersection(term_area)`, and the highlight must never
                 // point at a row the user cannot see (Enter would accept an
-                // invisible suggestion).
-                let visible = edit_layout(area, m.original.is_some(), m.dropdown_rows())
-                    .dropdown
-                    .height as usize;
-                let n = m.filtered().len().min(MAX_DROPDOWN_ROWS).min(visible);
+                // invisible suggestion). `visible_rows` already subsumes both
+                // the MAX_DROPDOWN_ROWS cap and filtered().len() — dropdown_rows()
+                // (which feeds edit_layout here) is itself capped by both.
+                let n = visible_rows(&m, area);
                 if n > 0 {
                     m.dropdown = Some(m.dropdown.map_or(0, |i| (i + 1).min(n - 1)));
                 }
@@ -491,11 +499,19 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                 return ModalStep::Continue(Modal::Edit(m));
             }
             (KeyCode::Enter, _) if m.focus == EditFocus::Category => {
-                if let Some(i) = m.dropdown {
-                    m.accept_suggestion(i);
-                } else {
-                    m.focus = EditFocus::Title;
-                    m.sync_blocks();
+                match m.dropdown {
+                    // Only accept a highlight that is actually drawn — a
+                    // resize between the Down that set it and this Enter can
+                    // leave `i` pointing past what's visible now (B1 review
+                    // follow-up). Treat that as no-highlight: close the
+                    // dropdown without accepting, and stay on Category
+                    // rather than silently advancing to Title.
+                    Some(i) if i < visible_rows(&m, area) => m.accept_suggestion(i),
+                    Some(_) => m.dropdown = None,
+                    None => {
+                        m.focus = EditFocus::Title;
+                        m.sync_blocks();
+                    }
                 }
                 return ModalStep::Continue(Modal::Edit(m));
             }
@@ -694,7 +710,7 @@ mod tests {
     /// `dropdown` rect itself stays within the terminal's right/bottom edges
     /// too, the same way the buttons already were.
     #[test]
-    fn edit_layout_buttons_never_escape_the_terminal_at_any_width() {
+    fn edit_layout_rects_never_escape_the_terminal() {
         for width in 1..=120u16 {
             for height in [10u16, 12, 40] {
                 let area = Rect::new(0, 0, width, height);
@@ -983,6 +999,52 @@ mod tests {
                 "highlight {i} points past {visible} drawn rows"
             ),
             None => assert_eq!(visible, 0, "None only acceptable when nothing is drawn"),
+        }
+    }
+
+    /// B1 review follow-up: the Enter arm used to accept `m.dropdown = Some(i)`
+    /// without re-checking visibility, so a resize between the Down that set
+    /// the highlight and the Enter that accepts it could accept a
+    /// clipped-off (unseen) suggestion. Highlight a deep row on a tall
+    /// terminal, then feed the accepting Enter with a tiny area — the
+    /// category must stay untouched and the dropdown must simply close.
+    #[test]
+    fn resized_enter_never_accepts_a_now_invisible_highlight() {
+        let tall = Rect::new(0, 0, 80, 40);
+        let names: Vec<String> = ["A", "B", "C", "D", "E"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut m = EditModal::create(names);
+        for _ in 0..5 {
+            m = match step(Modal::Edit(m), key(KeyCode::Down), tall) {
+                ModalStep::Continue(Modal::Edit(m)) => m,
+                _ => panic!("expected Continue(Edit)"),
+            };
+        }
+        assert_eq!(m.dropdown, Some(4), "highlight parked on the deepest row");
+
+        // Terminal shrinks between the Down and the Enter — now the same
+        // dropdown rect draws fewer rows than the highlighted index.
+        let tiny = Rect::new(0, 0, 15, 5);
+        assert!(
+            visible_rows(&m, tiny) <= 4,
+            "fixture must actually clip below the highlighted row"
+        );
+
+        match step(Modal::Edit(m), enter(), tiny) {
+            ModalStep::Continue(Modal::Edit(m)) => {
+                assert_eq!(
+                    m.category_text(),
+                    "",
+                    "must not accept an unseen suggestion"
+                );
+                assert_eq!(
+                    m.dropdown, None,
+                    "dropdown closes rather than silently accepting"
+                );
+            }
+            _ => panic!("expected Continue(Edit)"),
         }
     }
 

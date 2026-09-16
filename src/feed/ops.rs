@@ -373,7 +373,6 @@ pub fn add_in_section(
 /// the uncategorized region (never into another category). The
 /// reserved/empty checks run before the item is removed so an error leaves
 /// the doc untouched.
-#[allow(dead_code)]
 pub fn move_to_section(
     doc: &mut Document,
     index: usize,

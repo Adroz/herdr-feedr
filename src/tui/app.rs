@@ -412,13 +412,28 @@ impl App {
             self.status_msg = Some("title required".into());
             return Modal::Edit(m);
         }
+        let category = m.category_text();
+        if !category.is_empty() && ops::is_reserved_section(&category) {
+            self.status_msg = Some(format!("\"{category}\" is a reserved section"));
+            return Modal::Edit(m);
+        }
         let body = m.body_lines();
         match &m.original {
             Some(key) => {
                 let key = key.clone();
+                let target: Option<String> = (!category.is_empty()).then(|| category.clone());
+                // Case-insensitive: retyping "work" over "Work" is not a move.
+                let moved = match (&m.original_category, &target) {
+                    (Some(a), Some(b)) => !a.eq_ignore_ascii_case(b),
+                    (None, None) => false,
+                    _ => true,
+                };
                 self.with_feed(move |doc| match relocate(doc, &key) {
                     Some(i) => {
                         ops::edit(doc, i, &title, &body);
+                        if moved {
+                            ops::move_to_section(doc, i, target.as_deref())?;
+                        }
                         Ok(Outcome::Changed(None))
                     }
                     None => Ok(Outcome::Unchanged(Some(
@@ -427,13 +442,16 @@ impl App {
                 });
             }
             None => {
-                // Sidebar-created items are always the human's; they land
-                // at the end of the first human section (round-2 item 5 —
-                // the section picker was dead UI: agents create their own
-                // items via the CLI into `## Agent`, and can relocate items
-                // later by editing the feed).
+                // Sidebar-created items are always the human's. An empty
+                // Category keeps the pre-category behavior (end of the first
+                // human section); a named one targets that section, creating
+                // it if needed (spec 2026-09-16 §2).
                 self.with_feed(move |doc| {
-                    ops::add(doc, &title, &body, Zone::Human);
+                    if category.is_empty() {
+                        ops::add(doc, &title, &body, Zone::Human);
+                    } else {
+                        ops::add_in_section(doc, &title, &body, &category)?;
+                    }
                     Ok(Outcome::Changed(None))
                 });
             }
@@ -1034,6 +1052,104 @@ mod tests {
         press_ctrl(&mut app, 's'); // empty title
         assert!(app.modal_active());
         assert_eq!(app.status_msg.as_deref(), Some("title required"));
+    }
+
+    // --- Task 10: save wiring — create in category, move on edit -----------
+
+    #[test]
+    fn create_with_category_lands_in_that_section_creating_it() {
+        let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n\n## Agent\n");
+        app.apply(Action::OpenCreate);
+        type_str(&mut app, "Work"); // Category field is focused first
+        press(&mut app, KeyCode::Enter); // → Title
+        type_str(&mut app, "New item");
+        press_ctrl(&mut app, 's');
+        assert!(!app.modal_active());
+        let out = feed_text(&app);
+        assert!(out.contains("## Work\n\n- [ ] New item\n"), "got:\n{out}");
+        assert!(
+            out.find("## Work").unwrap() < out.find("## Agent").unwrap(),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn create_with_existing_category_appends_case_insensitive() {
+        let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n## Work\n\n- [ ] W\n");
+        app.apply(Action::OpenCreate);
+        type_str(&mut app, "work");
+        press(&mut app, KeyCode::Enter);
+        type_str(&mut app, "New item");
+        press_ctrl(&mut app, 's');
+        let out = feed_text(&app);
+        assert!(out.contains("- [ ] W\n- [ ] New item\n"), "got:\n{out}");
+        assert!(
+            !out.contains("## work"),
+            "must not duplicate the section:\n{out}"
+        );
+    }
+
+    #[test]
+    fn edit_changing_category_moves_item_with_body() {
+        let (mut app, _fake, _dir) = app_on_disk(
+            "# Feed\n\n## Work\n\n- [~] T @agent(claude:abc)\n  ctx\n\n## Chores\n\n- [ ] C\n",
+        );
+        app.apply(Action::OpenEdit(ItemKey {
+            title: "T".into(),
+            state: State::InProgress,
+        }));
+        let Modal::Edit(m) = &app.modal else {
+            panic!("expected edit modal")
+        };
+        assert_eq!(m.category_text(), "Work"); // prefilled
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_str(&mut app, "Chores");
+        press_ctrl(&mut app, 's');
+        let out = feed_text(&app);
+        assert!(
+            out.contains("- [ ] C\n- [~] T @agent(claude:abc)\n  ctx\n"),
+            "got:\n{out}"
+        );
+        assert!(out.contains("## Work"), "emptied heading kept:\n{out}");
+    }
+
+    #[test]
+    fn edit_keeping_category_does_not_move_and_stays_byte_stable() {
+        let text = "# Feed\n\n## Work\n\n- [ ] First\n- [ ] Second\n";
+        let (mut app, _fake, _dir) = app_on_disk(text);
+        app.apply(Action::OpenEdit(ItemKey {
+            title: "First".into(),
+            state: State::Open,
+        }));
+        press_ctrl(&mut app, 's'); // change nothing
+        assert_eq!(feed_text(&app), text, "untouched save must be byte-stable");
+    }
+
+    #[test]
+    fn reserved_category_rejected_with_status() {
+        let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n");
+        app.apply(Action::OpenCreate);
+        type_str(&mut app, "Agent");
+        press(&mut app, KeyCode::Enter);
+        type_str(&mut app, "Sneaky");
+        press_ctrl(&mut app, 's');
+        assert!(app.modal_active(), "save must be refused");
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some("\"Agent\" is a reserved section")
+        );
+    }
+
+    #[test]
+    fn empty_category_keeps_first_human_section_behavior() {
+        let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n\n## Later\n\n- [ ] L1\n");
+        app.apply(Action::OpenCreate);
+        press(&mut app, KeyCode::Enter); // empty Category → Title
+        type_str(&mut app, "New item");
+        press_ctrl(&mut app, 's');
+        assert!(feed_text(&app).contains("- [ ] A\n- [ ] New item\n"));
     }
 
     #[test]

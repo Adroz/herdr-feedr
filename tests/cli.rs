@@ -216,14 +216,32 @@ fn add_with_section_lands_in_named_section() {
 }
 
 #[test]
-fn add_with_missing_section_fails() {
+fn add_with_missing_section_creates_it() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());
     feedr(&feed)
         .args(["add", "--section", "Nonexistent", "New item"])
         .assert()
+        .success();
+    let text = std::fs::read_to_string(&feed).unwrap();
+    assert!(text.contains("## Nonexistent"));
+    let section_idx = text.find("## Nonexistent").unwrap();
+    let item_idx = text.find("New item").unwrap();
+    assert!(
+        item_idx > section_idx,
+        "new item must land inside the newly created section, got:\n{text}"
+    );
+}
+
+#[test]
+fn add_with_reserved_section_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    feedr(&feed)
+        .args(["add", "--section", "Agent", "New item"])
+        .assert()
         .failure()
-        .stderr(contains("no item matches"));
+        .stderr(contains("reserved"));
     // Nothing was written on failure.
     assert!(!std::fs::read_to_string(&feed).unwrap().contains("New item"));
 }

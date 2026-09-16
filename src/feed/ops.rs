@@ -241,8 +241,6 @@ pub fn section_names(doc: &Document) -> Vec<String> {
 /// never match) or create it at the end of the human zone — before
 /// `## Agent` if present, else before `# Done`, else at EOF. Returns the
 /// insertion index for a new item at the section's end.
-/// Not yet called outside tests — wired up in a later task.
-#[allow(dead_code)]
 pub fn ensure_section(doc: &mut Document, name: &str) -> Result<usize, OpError> {
     if is_reserved_section(name) {
         return Err(OpError::Reserved(name.to_string()));
@@ -300,17 +298,16 @@ pub fn remove(doc: &mut Document, index: usize) -> Option<Item> {
     }
 }
 
-/// Add an open item at the end of the named active `##` section (the sidebar
-/// modal's section picker). Errors when no such active section exists —
-/// archive (`# Done`) subsections never match.
+/// Add an open item at the end of the named `##` section, creating the
+/// section at the end of the human zone when it doesn't exist (archive
+/// sections never match). Reserved names error.
 pub fn add_in_section(
     doc: &mut Document,
     title: &str,
     body: &[String],
     section: &str,
 ) -> Result<(), OpError> {
-    let end = named_section_end(doc, section)
-        .ok_or_else(|| OpError::NotFound(format!("section {section}")))?;
+    let end = ensure_section(doc, section)?;
     doc.nodes.insert(
         end,
         Node::Item(Item {
@@ -840,20 +837,23 @@ Some prose.
 
     #[test]
     fn add_in_section_appends_to_named_human_section() {
-        let mut doc = parse(SAMPLE); // has ## Agent and # Done/## Feed
-                                     // SAMPLE has no named human section — add one:
         let mut doc2 = parse("# Feed\n\n- [ ] A\n\n## Later\n\n- [ ] L1\n\n## Agent\n\n- [ ] G\n");
         add_in_section(&mut doc2, "L2", &["ctx".into()], "Later").unwrap();
         let out = render(&doc2);
         assert!(out.contains("- [ ] L1\n- [ ] L2\n  ctx\n"), "got:\n{out}");
-        // Missing section errors; archive sections never match:
+        // A missing section is created (before ## Agent), not an error:
+        add_in_section(&mut doc2, "X", &[], "Fresh").unwrap();
+        let out = render(&doc2);
+        assert!(
+            out.find("## Fresh").unwrap() < out.find("## Agent").unwrap(),
+            "got:\n{out}"
+        );
+        assert!(out.contains("## Fresh\n\n- [ ] X\n"), "got:\n{out}");
+        // Reserved names error ("Feed" exists only under # Done in SAMPLE):
+        let mut doc = parse(SAMPLE);
         assert!(matches!(
-            add_in_section(&mut doc, "X", &[], "Nope"),
-            Err(OpError::NotFound(_))
-        ));
-        assert!(matches!(
-            add_in_section(&mut doc, "X", &[], "Feed"), // only exists under # Done
-            Err(OpError::NotFound(_))
+            add_in_section(&mut doc, "X", &[], "Feed"),
+            Err(OpError::Reserved(_))
         ));
     }
 

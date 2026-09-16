@@ -13,6 +13,11 @@ pub struct SidebarConfig {
     /// Relative resize delta used when docking/collapsing (herdr resize
     /// amounts are proportional shares, not columns; 0.18 matches herdr-beads).
     pub width: f64,
+    /// Hard cap on the docked sidebar's width, in COLUMNS (herdr resize
+    /// amounts are proportional shares, not columns, so this is enforced by
+    /// `dock()` querying `pane layout` after the initial fraction resize and
+    /// shrinking further if needed — see src/tui/dock.rs).
+    pub max_width: u16,
     /// Read for Plan 3's tab.created auto-dock hook; the TUI itself ignores it.
     pub auto_dock: bool,
 }
@@ -21,6 +26,7 @@ pub struct SidebarConfig {
 struct SidebarToml {
     side: Option<String>,
     width: Option<f64>,
+    max_width: Option<u16>,
     auto_dock: Option<bool>,
 }
 
@@ -60,6 +66,7 @@ pub fn load_sidebar_config(config_dir: &std::path::Path) -> SidebarConfig {
     SidebarConfig {
         side,
         width: s.width.unwrap_or(0.18),
+        max_width: s.max_width.unwrap_or(46),
         auto_dock: s.auto_dock.unwrap_or(false),
     }
 }
@@ -134,13 +141,14 @@ mod tests {
             SidebarConfig {
                 side: Side::Left,
                 width: 0.18,
+                max_width: 46,
                 auto_dock: false
             }
         );
         // Parsed values:
         std::fs::write(
             dir.path().join("config.toml"),
-            "feed_path = \"/tmp/f.md\"\n\n[sidebar]\nside = \"right\"\nwidth = 0.25\nauto_dock = true\n",
+            "feed_path = \"/tmp/f.md\"\n\n[sidebar]\nside = \"right\"\nwidth = 0.25\nmax_width = 60\nauto_dock = true\n",
         )
         .unwrap();
         assert_eq!(
@@ -148,6 +156,7 @@ mod tests {
             SidebarConfig {
                 side: Side::Right,
                 width: 0.25,
+                max_width: 60,
                 auto_dock: true
             }
         );

@@ -29,13 +29,19 @@ herdr_bin="${HERDR_BIN_PATH:-herdr}"
 title_marker="feedr-sidebar" # must match src/tui/dock.rs's PANE_TITLE_MARKER
 
 # Dock amounts mirror src/tui/dock.rs's SidebarConfig default (side = left, width = 0.18
-# — see src/config.rs's load_sidebar_config). TODO: honor a user's [sidebar] side/width
-# from ~/.config/herdr-feedr/config.toml (Linux) or ~/Library/Application
-# Support/herdr-feedr/config.toml (macOS's dirs::config_dir()), like dock.rs's `dock()`
-# does. Deferred for v1 to avoid a bespoke TOML parser in bash; the plugin still docks
-# correctly, just always to the left at the 0.18 default.
+# — see src/config.rs's load_sidebar_config). TODO: honor a user's [sidebar]
+# side/width/max_width from ~/.config/herdr-feedr/config.toml (Linux) or
+# ~/Library/Application Support/herdr-feedr/config.toml (macOS's dirs::config_dir()),
+# like dock.rs's `dock()` does. Deferred for v1 to avoid a bespoke TOML parser in bash;
+# the plugin still docks correctly, just always to the left at the 0.18/46 defaults.
 dock_side="left"
 dock_amount="0.18"
+# Hard cap on the docked pane's width, in COLUMNS — mirrors src/config.rs's
+# SidebarConfig.max_width default (see src/tui/dock.rs's `clamp_max_width` for the full
+# rationale: `pane resize --amount` only accepts a proportional share, not columns, so
+# landing on an exact column cap means reading the pane's actual rendered width back via
+# `pane layout` and resizing again if it's still over budget).
+max_width_cols=46
 
 # pane_id of an already-open feedr-sidebar pane, if any (empty string if none/on error).
 find_sidebar_pane() {
@@ -49,6 +55,25 @@ find_sidebar_pane() {
 # First "pane_id" value in a `plugin pane open` JSON response.
 extract_pane_id() {
   sed -n 's/.*"pane_id":"\([^"]*\)".*/\1/p' | head -n1
+}
+
+# From a `pane layout --pane <id>` JSON response on stdin, the tab's total column width
+# (result.layout.area.width). There's exactly one "area" object per response, so a plain
+# sed pull (no jq/python) is enough — same dependency-free style as find_sidebar_pane.
+extract_area_width() {
+  sed -n 's/.*"area":{"width":\([0-9]*\).*/\1/p' | head -n1
+}
+
+# From a `pane layout --pane <id>` JSON response on stdin, one pane's own rendered column
+# width (result.layout.panes[].rect.width), matched by pane_id ($1). Same "},{ " → newline
+# split as find_sidebar_pane, so each array element lands on its own line before the
+# pane_id grep — the matched pane's own "rect" is the only one left on that line.
+extract_pane_rect_width() {
+  local pid="$1"
+  sed 's/},{/}\n{/g' \
+    | grep "\"pane_id\":\"${pid}\"" \
+    | head -n1 \
+    | sed -n 's/.*"rect":{"width":\([0-9]*\).*/\1/p'
 }
 
 existing_pane_id="$(find_sidebar_pane || true)"
@@ -81,4 +106,30 @@ if [ "$dock_side" = "left" ]; then
   done
 fi
 
-exec "$herdr_bin" pane resize --direction "$dock_side" --amount "$dock_amount" --pane "$pane_id"
+"$herdr_bin" pane resize --direction "$dock_side" --amount "$dock_amount" --pane "$pane_id" >/dev/null
+
+# Cap the docked pane at max_width_cols columns (bounded to 3 attempts — `pane resize` is
+# a proportional-share verb with no "resize to exact width" equivalent, so landing on an
+# exact column cap means repeating a delta recomputed from a fresh `pane layout` query
+# each time). Best-effort throughout: any query/parse we can't make sense of just skips
+# the rest of the clamp rather than failing the launch — the pane is already docked at
+# this point via the resize above.
+clamp_step=0
+while [ "$clamp_step" -lt 3 ]; do
+  layout_out="$("$herdr_bin" pane layout --pane "$pane_id" 2>/dev/null)" || break
+  area_width="$(printf '%s' "$layout_out" | extract_area_width || true)"
+  pane_width="$(printf '%s' "$layout_out" | extract_pane_rect_width "$pane_id" || true)"
+  if [ -z "$area_width" ] || [ -z "$pane_width" ] || [ "$area_width" -eq 0 ]; then
+    break # can't read a usable layout back; leave the pane as-is
+  fi
+  if [ "$pane_width" -le "$max_width_cols" ]; then
+    break # already within budget
+  fi
+  clamp_amount="$(awk -v w="$pane_width" -v m="$max_width_cols" -v a="$area_width" \
+    'BEGIN { printf "%.6f", (w - m) / a }')"
+  "$herdr_bin" pane resize --direction "$dock_side" --amount "$clamp_amount" --pane "$pane_id" \
+    >/dev/null 2>&1 || break
+  clamp_step=$((clamp_step + 1))
+done
+
+exit 0

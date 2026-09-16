@@ -54,7 +54,7 @@ Sweeping clears completed items from the active list while keeping history:
 
 ## 3. The sidebar ([#2](https://github.com/Adroz/herdr-feedr/issues/2), [#6](https://github.com/Adroz/herdr-feedr/issues/6))
 
-A ratatui TUI in a herdr plugin pane, docked with the herdr-beads pattern: open as `split`, swap-walk to the left edge, resize narrow. Herdr plugin v1 has no native dock, so:
+A ratatui TUI in a herdr plugin pane, docked with the herdr-beads pattern: open as `split`, swap-walk to the left edge, resize narrow (capped at a configurable max_width, default 46 columns). Herdr plugin v1 has no native dock, so:
 
 - The pane is **per-tab** (leftmost within the tab's pane grid; herdr's own sidebar is app chrome and can sit further left).
 - `auto_dock = false` by default; `true` docks the sidebar on every `tab.created`.

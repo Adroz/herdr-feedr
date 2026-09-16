@@ -55,6 +55,7 @@ pub fn dock(runner: &mut dyn Runner, herdr: &mut dyn Herdr, cfg: &SidebarConfig)
     let target_pane = focused_pane_id(&list)
         .context("no focused pane found in `herdr pane list` to dock the sidebar beside")?;
     let pane_id = open_split_dock(runner, cfg, &target_pane, false)?;
+    clamp_max_width(runner, cfg, &pane_id);
     Ok(format!("opened sidebar pane {pane_id}"))
 }
 
@@ -336,6 +337,80 @@ fn resize_changed(out: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Bound on the max-width clamp loop, mirroring `MAX_COLLAPSE_STEPS`'s
+/// rationale: `pane resize --amount` is a proportional share, not columns,
+/// and there is no "resize to exact width" verb, so hitting `cfg.max_width`
+/// means repeating a recomputed delta until `pane layout` reports we're
+/// within budget (or herdr reports no more room to give).
+const MAX_CLAMP_STEPS: u32 = 6;
+
+/// The tab's total column width and the named pane's own rect width, read
+/// from a live `herdr pane layout --pane <id>` response (verified against
+/// herdr 0.9.0: `{"layout":{"area":{"width":N,...},"panes":[{"pane_id":...,
+/// "rect":{"width":N,...}},...]}}`, optionally wrapped in `"result"` like
+/// every other herdr CLI response this module parses). `None` on any
+/// unexpected shape — the caller treats that as "stop clamping", never as a
+/// dock failure.
+fn layout_widths(layout_out: &str, pane_id: &str) -> Option<(u64, u64)> {
+    let v: Value = serde_json::from_str(layout_out).ok()?;
+    let root = v.get("result").unwrap_or(&v);
+    let layout = root.get("layout")?;
+    let area_width = layout.get("area")?.get("width")?.as_u64()?;
+    let pane_width = layout
+        .get("panes")?
+        .as_array()?
+        .iter()
+        .find(|p| p.get("pane_id").and_then(|id| id.as_str()) == Some(pane_id))?
+        .get("rect")?
+        .get("width")?
+        .as_u64()?;
+    Some((pane_width, area_width))
+}
+
+/// Post-dock clamp (spec: sidebar docks at a PROPORTIONAL `cfg.width` share,
+/// which on a wide monitor can be far more columns than wanted): after
+/// `open_split_dock`'s fraction resize, repeatedly query `pane layout` for
+/// the new pane's actual column width and, while it exceeds `cfg.max_width`,
+/// issue one more `pane resize` toward `cfg.side`'s edge with a delta
+/// recomputed from the fresh layout each iteration (`(width - max_width) /
+/// area_width`, converting the columns-over-budget back into the
+/// proportional share `pane resize` actually accepts). Best-effort and
+/// bounded by `MAX_CLAMP_STEPS`: a layout parse failure, an unchanged
+/// resize, or a resize error just stops the loop — this must never fail the
+/// dock itself, only leave the pane wider than requested.
+fn clamp_max_width(runner: &mut dyn Runner, cfg: &SidebarConfig, pane_id: &str) {
+    let dir = collapse_direction(cfg.side);
+    for _ in 0..MAX_CLAMP_STEPS {
+        let layout_out = match runner.run(&["pane", "layout", "--pane", pane_id]) {
+            Ok(out) => out,
+            Err(_) => return,
+        };
+        let (pane_width, area_width) = match layout_widths(&layout_out, pane_id) {
+            Some(widths) => widths,
+            None => return,
+        };
+        let max_width = u64::from(cfg.max_width);
+        if pane_width <= max_width || area_width == 0 {
+            return;
+        }
+        let amount = (pane_width - max_width) as f64 / area_width as f64;
+        let amount = format!("{amount}");
+        match runner.run(&[
+            "pane",
+            "resize",
+            "--direction",
+            dir,
+            "--amount",
+            &amount,
+            "--pane",
+            pane_id,
+        ]) {
+            Ok(out) if resize_changed(&out) => continue,
+            _ => return,
+        }
+    }
+}
+
 /// Shrink the pane toward `cfg.side`'s edge, repeating the same relative
 /// delta (bounded by `MAX_COLLAPSE_STEPS`) until herdr reports no more
 /// change (at its minimum width) or a resize call errors. Returns the number
@@ -405,6 +480,7 @@ mod tests {
         SidebarConfig {
             side,
             width: 0.18,
+            max_width: 46,
             auto_dock: false,
         }
     }
@@ -472,6 +548,10 @@ mod tests {
                 "pane swap --direction left --pane w1:p9",
                 "pane neighbor --direction left --pane w1:p9",
                 "pane resize --direction left --amount 0.18 --pane w1:p9",
+                // Clamp check: FakeRunner has no more responses queued, so
+                // this call gets an empty string back, which fails to parse
+                // as layout JSON — the clamp best-effort stops there.
+                "pane layout --pane w1:p9",
             ]
         );
         assert!(herdr.log.borrow().is_empty());
@@ -490,6 +570,94 @@ mod tests {
                 "plugin pane open --plugin herdr-feedr --entrypoint feedr-sidebar \
                  --placement split --direction right --target-pane w1:p1",
                 "pane resize --direction right --amount 0.18 --pane w1:p9",
+                "pane layout --pane w1:p9", // clamp check; no response queued, stops
+            ]
+        );
+    }
+
+    /// A `pane layout` response shaped like real herdr 0.9.0: the tab's
+    /// total column width and one pane's rect width, both under `result` per
+    /// this module's usual response-parsing convention.
+    fn layout_json(pane_id: &str, pane_width: u64, area_width: u64) -> String {
+        format!(
+            r#"{{"id":"cli:pane:layout","result":{{"layout":{{"area":{{"width":{area_width},"height":40}},
+            "panes":[{{"pane_id":"{pane_id}","rect":{{"width":{pane_width},"height":40}}}}]}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn dock_clamps_the_new_pane_when_layout_reports_wider_than_max_width() {
+        let opened = r#"{"id":"cli:plugin","result":{"pane_id":"w1:p9"}}"#;
+        let mut runner = FakeRunner::new(vec![
+            Ok(focused_list().into()),
+            Ok(opened.into()),
+            Ok(String::new()),                 // initial fraction resize (0.18)
+            Ok(layout_json("w1:p9", 64, 180)), // wider than max_width (46)
+            changed(true),                     // clamp resize takes effect
+            Ok(layout_json("w1:p9", 46, 180)), // now at max_width: stop
+        ]);
+        let mut herdr = FakeHerdr::default();
+        dock(&mut runner, &mut herdr, &cfg(Side::Right)).unwrap();
+        assert_eq!(
+            runner.calls,
+            [
+                "pane list",
+                "plugin pane open --plugin herdr-feedr --entrypoint feedr-sidebar \
+                 --placement split --direction right --target-pane w1:p1",
+                "pane resize --direction right --amount 0.18 --pane w1:p9",
+                "pane layout --pane w1:p9",
+                // (64 - 46) / 180 == 0.1
+                "pane resize --direction right --amount 0.1 --pane w1:p9",
+                "pane layout --pane w1:p9",
+            ]
+        );
+    }
+
+    #[test]
+    fn dock_skips_clamp_when_already_within_max_width() {
+        let opened = r#"{"id":"cli:plugin","result":{"pane_id":"w1:p9"}}"#;
+        let mut runner = FakeRunner::new(vec![
+            Ok(focused_list().into()),
+            Ok(opened.into()),
+            Ok(String::new()),                 // initial fraction resize (0.18)
+            Ok(layout_json("w1:p9", 40, 180)), // already within max_width
+        ]);
+        let mut herdr = FakeHerdr::default();
+        dock(&mut runner, &mut herdr, &cfg(Side::Right)).unwrap();
+        assert_eq!(
+            runner.calls,
+            [
+                "pane list",
+                "plugin pane open --plugin herdr-feedr --entrypoint feedr-sidebar \
+                 --placement split --direction right --target-pane w1:p1",
+                "pane resize --direction right --amount 0.18 --pane w1:p9",
+                "pane layout --pane w1:p9",
+            ]
+        );
+    }
+
+    #[test]
+    fn dock_stops_clamping_on_unparsable_layout_without_failing_the_dock() {
+        // Best-effort: a layout response we can't parse must not fail dock()
+        // itself, only skip the clamp.
+        let opened = r#"{"id":"cli:plugin","result":{"pane_id":"w1:p9"}}"#;
+        let mut runner = FakeRunner::new(vec![
+            Ok(focused_list().into()),
+            Ok(opened.into()),
+            Ok(String::new()), // initial fraction resize (0.18)
+            Ok("not json".into()),
+        ]);
+        let mut herdr = FakeHerdr::default();
+        let msg = dock(&mut runner, &mut herdr, &cfg(Side::Right)).unwrap();
+        assert!(msg.contains("opened sidebar pane w1:p9"), "got: {msg}");
+        assert_eq!(
+            runner.calls,
+            [
+                "pane list",
+                "plugin pane open --plugin herdr-feedr --entrypoint feedr-sidebar \
+                 --placement split --direction right --target-pane w1:p1",
+                "pane resize --direction right --amount 0.18 --pane w1:p9",
+                "pane layout --pane w1:p9",
             ]
         );
     }
@@ -552,6 +720,7 @@ mod tests {
                 format!("pane send-text w1:p9 {expected_exec}"),
                 "pane neighbor --direction left --pane w1:p9".to_string(),
                 "pane resize --direction left --amount 0.18 --pane w1:p9".to_string(),
+                "pane layout --pane w1:p9".to_string(), // clamp check; no response queued, stops
             ]
         );
     }

@@ -40,7 +40,7 @@ Format — a GitHub-flavored markdown checklist:
 
 ## 2. Provenance and completion authority ([#7](https://github.com/Adroz/herdr-feedr/issues/7))
 
-- **Human-created** items live in your sections. Only you write their `[x]` — even when an agent did the work. An agent finishing one writes `[?]` plus a body evidence note (PR link, test results); you review and tick.
+- **Human-created** items live in your sections. Only you write their `[x]` — even when an agent did the work. An agent finishing one writes `[?]` plus a body evidence note (PR link, test results) via `feedr review --note`; you review and tick.
 - **Agent-created** items live in the reserved `## Agent` section. Agents may close them `[x]` themselves.
 - Provenance = who *initiated*, not who typed: "add X to my list" said to an agent lands in your sections with your authority.
 
@@ -80,10 +80,11 @@ Interactions:
 
 The same binary as the TUI. Subcommands are the machine interface to the feed:
 
-`feedr list` · `feedr show <item>` · `feedr claim <item>` · `feedr add [--agent-owned] <title>` · `feedr review <item>` · `feedr done <item>` · `feedr sweep`
+`feedr list` · `feedr show <item>` · `feedr whoami` · `feedr claim <item>` · `feedr add [--agent-owned] <title>` · `feedr review <item> --note <line>` · `feedr done <item>` · `feedr sweep`
 
-- `claim` writes `[~]` and stamps `@agent(<kind>:<session-id>)`.
-- `review` writes `[?]` (+ the evidence note comes from the body the agent appends); `done` writes `[x]` — permitted only per §2 authority.
+- `claim` writes `[~]` and stamps `@agent(<kind>:<session-id>)`. The agent ref resolves in order: `--agent <kind>:<id>` > `FEEDR_AGENT` > `herdr pane current` (only when `HERDR_ENV=1`) > `CLAUDE_CODE_SESSION_ID` → `claude:<uuid>` — the last verified identical to herdr's `agent_session.value`, so the common case needs no socket call and identity also resolves outside herdr. When none yields an id, `claim` fails non-zero naming the sources tried; it never claims untagged, because an unlinked claim is a dead link the sidebar can't jump from.
+- `whoami` prints the resolved ref and its source.
+- `review` writes `[?]`; `done` writes `[x]` — permitted only per §2 authority. Both take a repeatable `--note <line>` that appends evidence to the item's body in the same write as the state change; `--note` is **required** on `review`, since `[?]` without its reason is what §2 exists to prevent.
 - All writes go through one parser/writer shared with the sidebar (see §6).
 
 ## 5. The skill ([#4](https://github.com/Adroz/herdr-feedr/issues/4), [#8](https://github.com/Adroz/herdr-feedr/issues/8))

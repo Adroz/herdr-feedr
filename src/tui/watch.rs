@@ -60,6 +60,11 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let _watcher = spawn(&feed, tx).unwrap();
         std::thread::sleep(Duration::from_millis(300));
+        // macOS FSEvents replays events that predate the watch — the tempdir
+        // creation and the initial feed.md write above both arrive here, and
+        // both legitimately match. Drain them so the assertion judges only
+        // what the sibling write produces.
+        while rx.try_recv().is_ok() {}
         std::fs::write(dir.path().join("other.txt"), "noise").unwrap();
         assert!(rx.recv_timeout(Duration::from_secs(1)).is_err());
     }

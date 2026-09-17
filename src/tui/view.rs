@@ -67,7 +67,7 @@ pub fn ellipsize(s: &str, width: usize) -> String {
     t
 }
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     if app.collapsed {
         // ~3-col rail: click anywhere restores (input.rs).
@@ -186,14 +186,20 @@ fn draw_status_row(f: &mut Frame, area: Rect, app: &App) {
 /// style/modifiers there) followed by a `Block` styled with
 /// `theme::modal_panel_style` (solid `theme::MANTLE` bg), so the panel
 /// itself — and everything drawn inside it — never carries the dim.
-fn draw_modal(f: &mut Frame, app: &App) {
+fn draw_modal(f: &mut Frame, app: &mut App) {
     if matches!(app.modal, Modal::None) {
         return;
     }
     dim_backdrop(f);
+    // The edit modal needs `&mut` (per-frame viewport reset inside
+    // `draw_edit_modal`); the read-only arms below borrow `app` immutably
+    // (`archive_text`/`file_text`), so split the Edit arm out first.
+    if let Modal::Edit(m) = &mut app.modal {
+        draw_edit_modal(f, m);
+        return;
+    }
     match &app.modal {
-        Modal::None => {}
-        Modal::Edit(m) => draw_edit_modal(f, m),
+        Modal::None | Modal::Edit(_) => {}
         Modal::ConfirmDelete(m) => {
             let area = modal::centered(f.area(), 80, 20);
             f.render_widget(Clear, area);
@@ -246,9 +252,32 @@ fn dim_backdrop(f: &mut Frame) {
 /// positioned from the textarea's logical cursor column, which drifts from
 /// the drawn text whenever tui-textarea has scrolled its viewport
 /// horizontally (see `sync_blocks` for the full rationale).
-fn draw_edit_modal(f: &mut Frame, m: &modal::EditModal) {
+fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
     let is_edit = m.original.is_some();
     let layout = modal::edit_layout(f.area(), is_edit, m.dropdown_rows());
+
+    // Re-derive each field's viewport from origin every frame: tui-textarea
+    // only ever adjusts its viewport minimally to keep the cursor visible,
+    // and never scrolls back when space frees up — so a scroll acquired at
+    // the modal's first (narrow, pre-zoom) frame would otherwise stick for
+    // the modal's whole life. Resetting before render makes the render's own
+    // cursor-visibility pass compute the scroll fresh for the CURRENT size:
+    // start-parked (unfocused) fields render unscrolled, and the focused
+    // field's end-parked cursor is safe at any first-frame width.
+    // (`i16::MIN + 1`, not `i16::MIN`: tui-textarea negates the delta
+    // internally and `-i16::MIN` overflows. 32767 rows/cols is still far
+    // beyond any feed item. And `scroll()` drags the CURSOR along to keep
+    // it inside the scrolled viewport — verified live: without the
+    // jump-back below, every frame teleported the cursor to the top-left
+    // and typing landed at the start of the field — so the cursor is saved
+    // and restored around the reset. `Jump` back to the same spot is a
+    // no-op for an active selection: the anchor is kept and the cursor
+    // ends where it already was.)
+    for ta in [&mut m.category, &mut m.title, &mut m.body] {
+        let (row, col) = ta.cursor();
+        ta.scroll((i16::MIN + 1, i16::MIN + 1));
+        ta.move_cursor(tui_textarea::CursorMove::Jump(row as u16, col as u16));
+    }
 
     f.render_widget(Clear, layout.outer);
     let outer = Block::bordered()
@@ -430,7 +459,7 @@ mod tests {
             },
         );
         app.status_msg = Some("hello".into());
-        let rows = render_to_strings(&app, 20, 12);
+        let rows = render_to_strings(&mut app, 20, 12);
         assert_eq!(rows[0], "clear completed"); // round-4: "file" removed from toolbar
         assert_eq!(rows[1], "[ ] Fix auth redire…"); // ellipsized at 20 cols
         assert_eq!(rows[2], "[~] Migrate CI");
@@ -452,8 +481,8 @@ mod tests {
     /// cell.
     #[test]
     fn collapse_chevron_renders_bottom_right_of_status_row() {
-        let app = app_with(SAMPLE);
-        let rows = render_to_strings(&app, 20, 12);
+        let mut app = app_with(SAMPLE);
+        let rows = render_to_strings(&mut app, 20, 12);
         assert!(rows[11].ends_with('«'), "got: {:?}", rows[11]);
         assert_eq!(rows[11].chars().last(), Some('«'));
     }
@@ -464,7 +493,7 @@ mod tests {
     fn long_status_message_truncates_before_chevron() {
         let mut app = app_with(SAMPLE);
         app.status_msg = Some("this is a very long status message that will not fit".into());
-        let rows = render_to_strings(&app, 20, 12);
+        let rows = render_to_strings(&mut app, 20, 12);
         assert_eq!(rows[11].chars().last(), Some('«'));
         assert_eq!(rows[11].chars().count(), 20);
     }
@@ -505,8 +534,8 @@ mod tests {
 
     #[test]
     fn agent_glyph_hidden_when_socket_absent() {
-        let app = app_with(SAMPLE); // statuses empty
-        let rows = render_to_strings(&app, 20, 12);
+        let mut app = app_with(SAMPLE); // statuses empty
+        let rows = render_to_strings(&mut app, 20, 12);
         assert_eq!(rows[3], "  @claude"); // sub-line still shown, no glyph
     }
 
@@ -516,7 +545,7 @@ mod tests {
     fn collapsed_rail_chevron_pinned_to_bottom_row() {
         let mut app = app_with(SAMPLE);
         app.collapsed = true;
-        let rows = render_to_strings(&app, 3, 6);
+        let rows = render_to_strings(&mut app, 3, 6);
         assert_eq!(rows[rows.len() - 1], "»");
     }
 
@@ -529,7 +558,7 @@ mod tests {
     fn collapsed_rail_shows_open_count_and_review_indicator() {
         let mut app = app_with(SAMPLE);
         app.collapsed = true;
-        let rows = render_to_strings(&app, 3, 6);
+        let rows = render_to_strings(&mut app, 3, 6);
         assert_eq!(rows[0], "2", "open-task count"); // Fix auth + Migrate CI
         assert_eq!(rows[1], "", "blank separator");
         assert_eq!(rows[2], "?", "review indicator");
@@ -545,7 +574,7 @@ mod tests {
     fn collapsed_rail_omits_review_and_blocked_indicators_when_absent() {
         let mut app = app_with("# Feed\n\n- [ ] A\n- [~] B\n");
         app.collapsed = true;
-        let rows = render_to_strings(&app, 3, 6);
+        let rows = render_to_strings(&mut app, 3, 6);
         assert_eq!(rows[0], "2");
         assert_eq!(rows[rows.len() - 1], "»");
         assert!(!rows.contains(&"?".to_string()));
@@ -566,7 +595,7 @@ mod tests {
             },
         );
         app.collapsed = true;
-        let rows = render_to_strings(&app, 3, 6);
+        let rows = render_to_strings(&mut app, 3, 6);
         assert!(rows.contains(&"!".to_string()), "got: {rows:?}");
         assert_eq!(rows[rows.len() - 1], "»");
     }
@@ -587,7 +616,7 @@ mod tests {
             },
         );
         app.collapsed = true;
-        let rows = render_to_strings(&app, 3, 9);
+        let rows = render_to_strings(&mut app, 3, 9);
         assert_eq!(rows[0], "2", "open count: A + C"); // B is [?], excluded
         assert_eq!(rows[1], "");
         assert_eq!(rows[2], "?");
@@ -604,7 +633,7 @@ mod tests {
         let items: String = (0..12).map(|i| format!("- [ ] Item {i}\n")).collect();
         let mut app = app_with(&items);
         app.collapsed = true;
-        let rows = render_to_strings(&app, 3, 14);
+        let rows = render_to_strings(&mut app, 3, 14);
         assert_eq!(rows[0], "1");
         assert_eq!(rows[1], "2");
     }
@@ -625,7 +654,7 @@ mod tests {
             },
         );
         app.collapsed = true;
-        let buf = render_buffer(&app, 3, 8);
+        let buf = render_buffer(&mut app, 3, 8);
         assert_eq!(buf[(0, 0)].fg, theme::TEXT, "open count: normal text");
         assert_eq!(buf[(0, 2)].fg, theme::MAUVE, "review indicator: mauve");
         assert_eq!(buf[(0, 5)].fg, theme::RED, "blocked indicator: red");
@@ -635,7 +664,7 @@ mod tests {
     fn list_scrolls() {
         let mut app = app_with(SAMPLE);
         app.scroll = 2;
-        let rows = render_to_strings(&app, 20, 12);
+        let rows = render_to_strings(&mut app, 20, 12);
         assert_eq!(rows[1], "  @claude"); // row index 2 of the row model
     }
 
@@ -669,8 +698,8 @@ mod tests {
 
     #[test]
     fn cursor_hidden_when_no_modal_active() {
-        let app = app_with(SAMPLE);
-        assert_eq!(render_cursor(&app, 40, 12), None);
+        let mut app = app_with(SAMPLE);
+        assert_eq!(render_cursor(&mut app, 40, 12), None);
     }
 
     /// Cursor fix: the real terminal cursor is never placed for the edit
@@ -689,11 +718,11 @@ mod tests {
         let mut app = app_with(SAMPLE);
         app.apply(Action::OpenCreate);
         assert_eq!(
-            render_cursor(&app, 60, 20),
+            render_cursor(&mut app, 60, 20),
             None,
             "no real terminal cursor is ever placed any more"
         );
-        let buf = render_buffer(&app, 60, 20);
+        let buf = render_buffer(&mut app, 60, 20);
         let layout = modal::edit_layout(Rect::new(0, 0, 60, 20), false, 0);
         let inner = Block::bordered().inner(layout.category);
         assert!(
@@ -713,8 +742,8 @@ mod tests {
             Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
             (60, 20),
         );
-        assert_eq!(render_cursor(&app, 60, 20), None);
-        let buf = render_buffer(&app, 60, 20);
+        assert_eq!(render_cursor(&mut app, 60, 20), None);
+        let buf = render_buffer(&mut app, 60, 20);
         let layout = modal::edit_layout(Rect::new(0, 0, 60, 20), false, 0);
         // Untouched textarea: cursor still at its origin (row 0, col 0).
         let title_inner = Block::bordered().inner(layout.title);
@@ -755,11 +784,11 @@ mod tests {
         };
         assert_eq!(m.focus, EditFocus::Save);
         assert_eq!(
-            render_cursor(&app, 40, 12),
+            render_cursor(&mut app, 40, 12),
             None,
             "no real terminal cursor when a button is focused"
         );
-        let buf = render_buffer(&app, 40, 12);
+        let buf = render_buffer(&mut app, 40, 12);
         let layout = modal::edit_layout(Rect::new(0, 0, 40, 12), false, 0);
         for field in [layout.category, layout.title, layout.body] {
             let inner = Block::bordered().inner(field);
@@ -802,7 +831,7 @@ mod tests {
         let long_line = "a".repeat(200);
         m.body.insert_str(&long_line);
 
-        let buf = render_buffer(&app, w, h);
+        let buf = render_buffer(&mut app, w, h);
         let layout = modal::edit_layout(Rect::new(0, 0, w, h), false, 0);
         let inner = Block::bordered().inner(layout.body);
 
@@ -825,7 +854,7 @@ mod tests {
     fn create_modal_shows_save_cancel_but_no_delete_or_section_picker() {
         let mut app = app_with(SAMPLE);
         app.apply(Action::OpenCreate);
-        let rows = render_to_strings(&app, 60, 20);
+        let rows = render_to_strings(&mut app, 60, 20);
         let joined = rows.join("\n");
         assert!(!joined.contains("Add to"), "got:\n{joined}");
         assert!(joined.contains(modal::SAVE_LABEL), "got:\n{joined}");
@@ -854,7 +883,7 @@ mod tests {
             title: "Fix auth redirect loop".into(),
             state: State::Open,
         }));
-        let rows = render_to_strings(&app, 30, 40);
+        let rows = render_to_strings(&mut app, 30, 40);
         assert!(!rows.is_empty());
     }
 
@@ -867,7 +896,7 @@ mod tests {
         m.dropdown = Some(0); // open the dropdown so both field and list render
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|f| draw_edit_modal(f, &m)).unwrap();
+        terminal.draw(|f| draw_edit_modal(f, &mut m)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let text: String = (0..24)
             .map(|y| {
@@ -936,12 +965,12 @@ mod tests {
             title: "T".into(),
             state: State::Open,
         };
-        let m = modal::EditModal::edit(key, &item, None, vec![]);
+        let mut m = modal::EditModal::edit(key, &item, None, vec![]);
 
         let (w, h) = (30, 24); // narrow — the herdr docked-sidebar width
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-        terminal.draw(|f| draw_edit_modal(f, &m)).unwrap();
+        terminal.draw(|f| draw_edit_modal(f, &mut m)).unwrap();
         let buf = terminal.backend().buffer().clone();
 
         let layout = modal::edit_layout(Rect::new(0, 0, w, h), true, 0);
@@ -955,6 +984,59 @@ mod tests {
         );
     }
 
+    /// The sticky-scroll regression: the modal's FIRST frame renders at the
+    /// narrow pre-zoom pane width, which scrolls the focused field's
+    /// viewport right (its cursor parks at the end); tui-textarea never
+    /// scrolls back on its own once the pane widens. The per-frame viewport
+    /// reset in `draw_edit_modal` must make the NEXT (wide) frame render
+    /// the title from its start again — the scroll is recomputed for the
+    /// current size, not inherited from the narrow frame.
+    #[test]
+    fn wide_frame_after_narrow_frame_shows_focused_title_from_start() {
+        let item = crate::feed::Item {
+            state: State::Open,
+            title: "A title long enough to overflow a narrow docked pane".into(),
+            agent: None,
+            done_date: None,
+            body: Vec::new(),
+        };
+        let key = ItemKey {
+            title: item.title.clone(),
+            state: State::Open,
+        };
+        // Categorized → Title focused, cursor parked at its END.
+        let mut m = modal::EditModal::edit(key, &item, Some("Work".into()), vec![]);
+
+        // Frame 1: narrow — the title scrolls to keep the end-cursor visible.
+        let mut narrow =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 24)).unwrap();
+        narrow.draw(|f| draw_edit_modal(f, &mut m)).unwrap();
+
+        // Frame 2: wide — the title fits; it must render from its start.
+        let (w, h) = (100, 24);
+        let mut wide = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        wide.draw(|f| draw_edit_modal(f, &mut m)).unwrap();
+        let buf = wide.backend().buffer().clone();
+        let layout = modal::edit_layout(Rect::new(0, 0, w, h), true, m.dropdown_rows());
+        let inner = Block::bordered().inner(layout.title);
+        let row: String = (inner.x..inner.x + inner.width)
+            .map(|x| buf[(x, inner.y)].symbol().to_string())
+            .collect();
+        assert!(
+            row.trim_start().starts_with("A title long"),
+            "wide frame must not inherit the narrow frame's scroll, got {row:?}"
+        );
+        // And the per-frame viewport reset must NOT have dragged the cursor
+        // along (tui-textarea's `scroll()` clamps the cursor into the
+        // scrolled viewport — verified live: typing after a draw landed at
+        // the START of the field until the cursor restore was added).
+        assert_eq!(
+            m.title.cursor(),
+            (0, item.title.len()),
+            "drawing must never move the cursor"
+        );
+    }
+
     #[test]
     fn edit_modal_shows_delete_button() {
         let mut app = app_with(SAMPLE);
@@ -962,7 +1044,7 @@ mod tests {
             title: "Fix auth redirect loop".into(),
             state: State::Open,
         }));
-        let rows = render_to_strings(&app, 60, 20);
+        let rows = render_to_strings(&mut app, 60, 20);
         let joined = rows.join("\n");
         assert!(joined.contains(modal::DELETE_LABEL), "got:\n{joined}");
     }
@@ -981,7 +1063,7 @@ mod tests {
         let mut app = app_with(SAMPLE);
         app.apply(Action::OpenCreate);
         let (w, h) = (60, 20);
-        let buf = render_buffer(&app, w, h);
+        let buf = render_buffer(&mut app, w, h);
         let layout = modal::edit_layout(Rect::new(0, 0, w, h), false, 0);
 
         // Top-left corner is outside the centered 90%x80% panel.
@@ -1026,7 +1108,7 @@ mod tests {
         );
         assert!(matches!(app.modal, Modal::ConfirmDelete(_)));
 
-        let buf = render_buffer(&app, w, h);
+        let buf = render_buffer(&mut app, w, h);
         let outer = modal::centered(Rect::new(0, 0, w, h), 80, 20);
 
         assert!(buf[(0, 0)].modifier.contains(Modifier::DIM));
@@ -1041,7 +1123,7 @@ mod tests {
         let mut app = app_with(SAMPLE);
         app.apply(Action::OpenDoneView);
         let (w, h) = (60, 20);
-        let buf = render_buffer(&app, w, h);
+        let buf = render_buffer(&mut app, w, h);
         let outer = modal::centered(Rect::new(0, 0, w, h), 90, 80);
 
         assert!(buf[(0, 0)].modifier.contains(Modifier::DIM));
@@ -1056,7 +1138,7 @@ mod tests {
         let mut app = app_with(SAMPLE);
         app.apply(Action::OpenFileView);
         let (w, h) = (60, 20);
-        let buf = render_buffer(&app, w, h);
+        let buf = render_buffer(&mut app, w, h);
         let outer = modal::centered(Rect::new(0, 0, w, h), 90, 80);
 
         assert!(buf[(0, 0)].modifier.contains(Modifier::DIM));
@@ -1068,8 +1150,8 @@ mod tests {
 
     #[test]
     fn no_dim_applied_when_no_modal_active() {
-        let app = app_with(SAMPLE);
-        let buf = render_buffer(&app, 60, 20);
+        let mut app = app_with(SAMPLE);
+        let buf = render_buffer(&mut app, 60, 20);
         assert!(!buf[(0, 0)].modifier.contains(Modifier::DIM));
     }
 }

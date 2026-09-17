@@ -5,7 +5,7 @@ use ratatui::Terminal;
 
 /// Draw the app into an in-memory buffer and return each row as a
 /// right-trimmed string.
-pub fn render_to_strings(app: &crate::tui::app::App, w: u16, h: u16) -> Vec<String> {
+pub fn render_to_strings(app: &mut crate::tui::app::App, w: u16, h: u16) -> Vec<String> {
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
     terminal.draw(|f| crate::tui::view::draw(f, app)).unwrap();
     let buf = terminal.backend().buffer().clone();
@@ -29,7 +29,7 @@ pub fn render_to_strings(app: &crate::tui::app::App, w: u16, h: u16) -> Vec<Stri
 /// visibility), so this reads its derived `Debug` output for `cursor:
 /// true`/`false` — a fresh `TestBackend` per call, so a stale position from
 /// a prior draw can never be mistaken for a currently-visible one.
-pub fn render_cursor(app: &crate::tui::app::App, w: u16, h: u16) -> Option<Position> {
+pub fn render_cursor(app: &mut crate::tui::app::App, w: u16, h: u16) -> Option<Position> {
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
     terminal.draw(|f| crate::tui::view::draw(f, app)).unwrap();
     let backend = terminal.backend_mut();
@@ -41,7 +41,7 @@ pub fn render_cursor(app: &crate::tui::app::App, w: u16, h: u16) -> Option<Posit
 /// tests that need per-cell style (fg/bg/modifier), not just the rendered
 /// text `render_to_strings` gives (round-3 item 1: dimmed-backdrop modal
 /// overlay tests need to inspect `Modifier::DIM` and background color).
-pub fn render_buffer(app: &crate::tui::app::App, w: u16, h: u16) -> Buffer {
+pub fn render_buffer(app: &mut crate::tui::app::App, w: u16, h: u16) -> Buffer {
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
     terminal.draw(|f| crate::tui::view::draw(f, app)).unwrap();
     terminal.backend().buffer().clone()

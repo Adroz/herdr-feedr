@@ -122,20 +122,15 @@ impl EditModal {
             focus,
             pending_clipboard: None,
         };
-        // `TextArea::new` already leaves the cursor (and viewport) at (0,0)
-        // — left there deliberately, not overridden to End/Bottom. This
-        // used to park all three cursors at the end on the theory that
-        // appending is the common edit, but that let tui-textarea scroll
-        // its viewport to keep the parked cursor visible on the modal's
-        // FIRST frame (rendered at the narrow pre-zoom pane width) — and
-        // tui-textarea never scrolls back once the pane later widens. Net
-        // effect: opening any item with a long line, or a multi-line body,
-        // showed it clipped to its tail even though nothing was focused
-        // there yet. Viewport correctness on open beats append convenience:
-        // the end is still one Ctrl+E / End-key / click away, and starting
-        // at Head also makes click-to-position exact (no hidden scroll
-        // offset to account for).
+        // Unfocused fields keep `TextArea::new`'s (0,0) cursor so they
+        // render unscrolled (their viewport follows their cursor); only the
+        // INITIALLY FOCUSED field parks at the end, exactly like a Tab-entry
+        // into it would. An end-parked cursor at the modal's narrow pre-zoom
+        // first frame is safe because `view::draw_edit_modal` re-derives
+        // every field's viewport from origin each frame — the scroll can no
+        // longer stick from a transient early width.
         m.sync_blocks();
+        m.park_focused_field_at_end();
         m
     }
 
@@ -1387,10 +1382,23 @@ mod tests {
             title: "A".into(),
             state: State::Open,
         };
-        let m = EditModal::edit(key, &item, Some("Work".into()), vec!["Work".into()]);
-        assert_eq!(m.category.cursor(), (0, 0), "category must park at start");
-        assert_eq!(m.title.cursor(), (0, 0), "title must park at start");
-        assert_eq!(m.body.cursor(), (0, 0), "body must park at start");
+        let m = EditModal::edit(key.clone(), &item, Some("Work".into()), vec!["Work".into()]);
+        // Categorized → Title is focused and parks at its END (like a
+        // Tab-entry); the UNFOCUSED fields park at the start so they render
+        // unscrolled (their viewport follows their cursor).
+        assert_eq!(m.category.cursor(), (0, 0), "unfocused parks at start");
+        assert_eq!(
+            m.title.cursor(),
+            (0, item.title.len()),
+            "focused parks at end"
+        );
+        assert_eq!(m.body.cursor(), (0, 0), "unfocused parks at start");
+        // Uncategorized → Category focused (empty, so end == start); the
+        // populated fields are unfocused and stay at the start.
+        let m = EditModal::edit(key, &item, None, vec![]);
+        assert_eq!(m.category.cursor(), (0, 0));
+        assert_eq!(m.title.cursor(), (0, 0), "unfocused parks at start");
+        assert_eq!(m.body.cursor(), (0, 0), "unfocused parks at start");
     }
 
     /// Spec review follow-up: at a degenerate terminal size the dropdown
@@ -1556,7 +1564,11 @@ mod tests {
     #[test]
     fn tab_parks_cursor_at_end_of_entered_field() {
         let m = categorized_edit_modal(); // focus starts on Title
-        assert_eq!(m.title.cursor(), (0, 0), "construction parks at start");
+        assert_eq!(
+            m.title.cursor(),
+            (0, "abc".len()),
+            "the initially-focused field opens parked at its end"
+        );
         let m = step_edit(m, key(KeyCode::Tab)); // → Body
         assert_eq!(m.focus, EditFocus::Body);
         assert_eq!(m.body.cursor(), (1, "line two".len()), "end of content");
@@ -1580,10 +1592,10 @@ mod tests {
     /// end — the park drops the selection first.
     #[test]
     fn tab_into_field_drops_stale_selection() {
-        let m = categorized_edit_modal(); // focus Title, "abc"
+        let m = categorized_edit_modal(); // focus Title, "abc", cursor at end
         let m = step_edit(
             m,
-            Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT)),
+            Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)),
         );
         assert!(m.title.selection_range().is_some());
         let m = step_edit(m, key(KeyCode::BackTab)); // away (→ Category)

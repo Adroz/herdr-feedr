@@ -155,6 +155,42 @@ impl EditModal {
         self.sync_blocks();
     }
 
+    /// Shift+Tab: the exact reverse of `cycle_focus`.
+    pub fn cycle_focus_back(&mut self) {
+        let is_edit = self.original.is_some();
+        self.focus = match (self.focus, is_edit) {
+            (EditFocus::Category, true) => EditFocus::Delete,
+            (EditFocus::Category, false) => EditFocus::Cancel,
+            (EditFocus::Title, _) => EditFocus::Category,
+            (EditFocus::Body, _) => EditFocus::Title,
+            (EditFocus::Save, _) => EditFocus::Body,
+            (EditFocus::Cancel, _) => EditFocus::Save,
+            (EditFocus::Delete, _) => EditFocus::Cancel,
+        };
+        self.sync_blocks();
+    }
+
+    /// Standard form behavior: tabbing INTO a text field parks its cursor at
+    /// the end of its content. Any stale selection is dropped first —
+    /// `move_cursor` extends an active selection, so the jump would
+    /// otherwise silently select everything up to the end. Applied on focus
+    /// TRANSITIONS only (Tab / Shift+Tab / Enter-advance), never at modal
+    /// construction: the modal's first frame can render at the narrow
+    /// pre-zoom pane width, and an end-parked cursor there scrolls the
+    /// viewport irreversibly (the open-scrolled bug). Mouse clicks position
+    /// the cursor explicitly and bypass this.
+    pub fn park_focused_field_at_end(&mut self) {
+        let ta = match self.focus {
+            EditFocus::Category => &mut self.category,
+            EditFocus::Title => &mut self.title,
+            EditFocus::Body => &mut self.body,
+            EditFocus::Save | EditFocus::Cancel | EditFocus::Delete => return,
+        };
+        ta.cancel_selection();
+        ta.move_cursor(CursorMove::Bottom);
+        ta.move_cursor(CursorMove::End);
+    }
+
     /// Mark the focused field's border title with `*` so focus is visible,
     /// and set each textarea's own cursor styling to match focus.
     ///
@@ -667,6 +703,14 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
             (KeyCode::Tab, _) => {
                 m.dropdown = None;
                 m.cycle_focus();
+                m.park_focused_field_at_end();
+                return ModalStep::Continue(Modal::Edit(m));
+            }
+            // Terminals report Shift+Tab as its own BackTab key.
+            (KeyCode::BackTab, _) => {
+                m.dropdown = None;
+                m.cycle_focus_back();
+                m.park_focused_field_at_end();
                 return ModalStep::Continue(Modal::Edit(m));
             }
             (KeyCode::Char('s'), mods) if mods.contains(KeyModifiers::CONTROL) => {
@@ -735,6 +779,7 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                     None => {
                         m.focus = EditFocus::Title;
                         m.sync_blocks();
+                        m.park_focused_field_at_end();
                     }
                 }
                 return ModalStep::Continue(Modal::Edit(m));
@@ -742,6 +787,7 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
             (KeyCode::Enter, _) if m.focus == EditFocus::Title => {
                 m.focus = EditFocus::Body;
                 m.sync_blocks();
+                m.park_focused_field_at_end();
                 return ModalStep::Continue(Modal::Edit(m));
             }
             // Cheap keyboard reachability for the button row (mouse click
@@ -837,6 +883,25 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
             return ModalStep::Continue(Modal::Edit(m));
         }
     }
+    // Word-jump alias: macOS binds plain Ctrl+←/→ to Mission Control at the
+    // OS level, so those keys never reach the terminal there — while
+    // Option(Alt)+←/→ is the platform's word-jump muscle memory anyway.
+    // tui-textarea 0.7 maps word movement only on Ctrl+arrow (its Alt+arrow
+    // slots are unbound; Ctrl+Alt+arrow means line Head/End), so rewrite
+    // Alt+←/→ into Ctrl+←/→ before handing the event over. Shift is kept,
+    // so Shift+Alt+arrow extends the selection word-wise like Shift+Ctrl.
+    let ev = match ev {
+        Event::Key(mut k)
+            if matches!(k.code, KeyCode::Left | KeyCode::Right)
+                && k.modifiers.contains(KeyModifiers::ALT)
+                && !k.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            k.modifiers.remove(KeyModifiers::ALT);
+            k.modifiers.insert(KeyModifiers::CONTROL);
+            Event::Key(k)
+        }
+        ev => ev,
+    };
     match m.focus {
         EditFocus::Category => {
             m.category.input(ev);
@@ -1432,6 +1497,8 @@ mod tests {
         let m = EditModal::create(vec!["Work".into()]);
         let m = step_edit(m, key(KeyCode::Enter));
         assert_eq!(m.focus, EditFocus::Title);
+        // Enter-advance parks like Tab does (end of an empty field = (0,0)).
+        assert_eq!(m.title.cursor(), (0, 0));
     }
 
     #[test]
@@ -1466,6 +1533,92 @@ mod tests {
         let m = step_edit(m, key(KeyCode::Tab));
         assert_eq!(m.dropdown, None);
         assert_eq!(m.focus, EditFocus::Title);
+    }
+
+    fn categorized_edit_modal() -> EditModal {
+        let item = Item {
+            state: State::Open,
+            title: "abc".into(),
+            agent: None,
+            done_date: None,
+            body: vec!["alpha beta gamma".into(), "line two".into()],
+        };
+        let key = ItemKey {
+            title: "abc".into(),
+            state: State::Open,
+        };
+        EditModal::edit(key, &item, Some("Work".into()), vec!["Work".into()])
+    }
+
+    /// Standard form behavior: tabbing into a field parks its cursor at the
+    /// end of the field's content (construction still parks at the start —
+    /// that's the open-viewport fix; the two are deliberately different).
+    #[test]
+    fn tab_parks_cursor_at_end_of_entered_field() {
+        let m = categorized_edit_modal(); // focus starts on Title
+        assert_eq!(m.title.cursor(), (0, 0), "construction parks at start");
+        let m = step_edit(m, key(KeyCode::Tab)); // → Body
+        assert_eq!(m.focus, EditFocus::Body);
+        assert_eq!(m.body.cursor(), (1, "line two".len()), "end of content");
+    }
+
+    #[test]
+    fn back_tab_cycles_backwards_and_parks_at_end() {
+        let m = categorized_edit_modal(); // focus starts on Title
+        let m = step_edit(m, key(KeyCode::BackTab)); // ← Category
+        assert_eq!(m.focus, EditFocus::Category);
+        assert_eq!(m.category.cursor(), (0, "Work".len()));
+        let m = step_edit(m, key(KeyCode::BackTab)); // ← Delete (edit mode)
+        assert_eq!(m.focus, EditFocus::Delete);
+        // Create mode wraps Category → Cancel (no Delete):
+        let c = EditModal::create(vec![]);
+        let c = step_edit(c, key(KeyCode::BackTab));
+        assert_eq!(c.focus, EditFocus::Cancel);
+    }
+
+    /// Tabbing into a field with a stale selection must not extend it to the
+    /// end — the park drops the selection first.
+    #[test]
+    fn tab_into_field_drops_stale_selection() {
+        let m = categorized_edit_modal(); // focus Title, "abc"
+        let m = step_edit(
+            m,
+            Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT)),
+        );
+        assert!(m.title.selection_range().is_some());
+        let m = step_edit(m, key(KeyCode::BackTab)); // away (→ Category)
+        let m = step_edit(m, key(KeyCode::Tab)); // back into Title
+        assert_eq!(m.focus, EditFocus::Title);
+        assert_eq!(m.title.selection_range(), None);
+        assert_eq!(m.title.cursor(), (0, "abc".len()));
+    }
+
+    /// macOS Mission Control eats plain Ctrl+←/→ before the terminal sees
+    /// them, so Alt(Option)+←/→ — the platform's own word-jump keys — are
+    /// remapped onto tui-textarea's Ctrl+arrow word movement. Shift is
+    /// preserved, so Shift+Alt+→ selects word-wise.
+    #[test]
+    fn alt_arrows_jump_by_word_shift_extends_selection() {
+        let mut m = categorized_edit_modal();
+        m.focus = EditFocus::Body; // "alpha beta gamma", cursor (0,0)
+        m.sync_blocks();
+        let m = step_edit(
+            m,
+            Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
+        );
+        assert_eq!(m.body.cursor(), (0, 6), "start of \"beta\"");
+        let m = step_edit(
+            m,
+            Event::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::ALT | KeyModifiers::SHIFT,
+            )),
+        );
+        assert_eq!(m.body.cursor(), (0, 11), "start of \"gamma\"");
+        assert!(
+            m.body.selection_range().is_some(),
+            "shifted word-jump must select"
+        );
     }
 
     /// B3 review follow-up: a click that moves focus off Category (to Title

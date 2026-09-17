@@ -39,7 +39,7 @@ enum Cmd {
         /// Put it in the reserved "## Agent" section (agent-initiated work)
         #[arg(long)]
         agent_owned: bool,
-        /// Target a named human section instead of the first one
+        /// Target a named section, creating it if missing (reserved: Agent, Done, Feed)
         #[arg(long, conflicts_with = "agent_owned")]
         section: Option<String>,
     },
@@ -54,6 +54,22 @@ enum Cmd {
     },
     /// Archive human [x] items under "# Done"; delete agent [x] items
     Sweep,
+    /// Launch the sidebar TUI in this terminal
+    Sidebar {
+        /// Dock a sidebar pane into herdr (idempotent open-or-focus), then exit
+        #[arg(long)]
+        dock: bool,
+    },
+    /// Internal: herdr-plugin.toml's `tab.created` [[events]] hook entry
+    /// point (Plan 3 auto-dock). Run by scripts/on-tab-created.sh, not
+    /// meant for interactive use.
+    #[command(hide = true)]
+    AutoDockHook {
+        /// The tab that was just created. Defaults to $HERDR_TAB_ID (what
+        /// herdr sets in an event hook's environment) when omitted.
+        #[arg(long)]
+        tab_id: Option<String>,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -65,6 +81,34 @@ pub fn run() -> Result<()> {
             .map(PathBuf::from),
         &config::default_config_dir(),
     );
+    if let Cmd::Sidebar { dock } = &cli.command {
+        let cfg = config::load_sidebar_config(&config::default_config_dir());
+        if *dock {
+            let mut runner = crate::tui::dock::HerdrCli::from_env();
+            let mut client = crate::tui::socket::UnixSocketClient::from_env();
+            let msg = crate::tui::dock::dock(&mut runner, &mut client, &cfg)?;
+            println!("{msg}");
+            return Ok(());
+        }
+        return crate::tui::run(path, cfg);
+    }
+    if let Cmd::AutoDockHook { tab_id } = &cli.command {
+        let cfg = config::load_sidebar_config(&config::default_config_dir());
+        if !cfg.auto_dock {
+            return Ok(()); // feature disabled — silent no-op, not an error
+        }
+        let tab_id = tab_id
+            .clone()
+            .or_else(|| std::env::var("HERDR_TAB_ID").ok())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("auto-dock-hook: no tab id (pass --tab-id or set HERDR_TAB_ID)")
+            })?;
+        let mut runner = crate::tui::dock::HerdrCli::from_env();
+        let msg = crate::tui::dock::auto_dock_for_tab(&mut runner, &cfg, &tab_id)?;
+        println!("{msg}");
+        return Ok(());
+    }
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -113,15 +157,16 @@ pub fn run() -> Result<()> {
             agent_owned,
             section,
         } => {
-            if section.is_some() {
-                bail!("--section: not implemented in v0.1, edit the file or omit");
-            }
-            let zone = if agent_owned {
-                Zone::Agent
+            if let Some(section) = section {
+                ops::add_in_section(&mut doc, &title, &body, &section)?;
             } else {
-                Zone::Human
-            };
-            ops::add(&mut doc, &title, &body, zone);
+                let zone = if agent_owned {
+                    Zone::Agent
+                } else {
+                    Zone::Human
+                };
+                ops::add(&mut doc, &title, &body, zone);
+            }
             write::save_atomic(&doc, &path)?;
         }
         Cmd::Review { item } => {
@@ -143,6 +188,9 @@ pub fn run() -> Result<()> {
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
             ops::sweep(&mut doc, &today);
             write::save_atomic(&doc, &path)?;
+        }
+        Cmd::Sidebar { .. } | Cmd::AutoDockHook { .. } => {
+            unreachable!()
         }
     }
     Ok(())

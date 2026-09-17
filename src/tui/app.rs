@@ -1205,8 +1205,13 @@ mod tests {
             panic!("expected edit modal")
         };
         assert_eq!(m.category_text(), "Work"); // prefilled
-                                               // Cursor now parks at the START of a prefilled field (viewport-open
-                                               // fix); jump to the end before backspacing "Work" away.
+                                               // A categorized item opens on Title — Tab around to Category
+                                               // (Title → Body → Save → Cancel → Delete → Category).
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Tab);
+        }
+        // Cursor parks at the START of a prefilled field (viewport-open
+        // fix); jump to the end before backspacing "Work" away.
         press(&mut app, KeyCode::End);
         for _ in 0..4 {
             press(&mut app, KeyCode::Backspace);
@@ -1233,8 +1238,13 @@ mod tests {
             panic!("expected edit modal")
         };
         assert_eq!(m.category_text(), "Work"); // prefilled
-                                               // Cursor now parks at the START of a prefilled field (viewport-open
-                                               // fix); jump to the end before backspacing "Work" away.
+                                               // A categorized item opens on Title — Tab around to Category
+                                               // (Title → Body → Save → Cancel → Delete → Category).
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Tab);
+        }
+        // Cursor parks at the START of a prefilled field (viewport-open
+        // fix); jump to the end before backspacing "Work" away.
         press(&mut app, KeyCode::End);
         for _ in 0..4 {
             press(&mut app, KeyCode::Backspace); // clear "Work"

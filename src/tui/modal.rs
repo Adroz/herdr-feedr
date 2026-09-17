@@ -101,6 +101,16 @@ impl EditModal {
         section: Option<String>,
         suggestions: Vec<String>,
     ) -> Self {
+        // An already-categorized item opens focused on Title: the category
+        // is usually staying put, and Category focus would pop the
+        // suggestion dropdown over the Title field for no reason. An
+        // uncategorized item keeps Category-first (like create) — assigning
+        // one is the likely next step there.
+        let focus = if section.is_some() {
+            EditFocus::Title
+        } else {
+            EditFocus::Category
+        };
         let mut m = EditModal {
             original: Some(key),
             category: TextArea::new(vec![section.clone().unwrap_or_default()]),
@@ -109,7 +119,7 @@ impl EditModal {
             body: TextArea::new(item.body.clone()),
             suggestions,
             dropdown: None,
-            focus: EditFocus::Category,
+            focus,
             pending_clipboard: None,
         };
         // `TextArea::new` already leaves the cursor (and viewport) at (0,0)
@@ -189,6 +199,12 @@ impl EditModal {
         self.category.set_selection_style(theme::selection());
         self.title.set_selection_style(theme::selection());
         self.body.set_selection_style(theme::selection());
+        // tui-textarea underlines the cursor's line by default
+        // (`cursor_line_style`); in these mostly-single-line fields that
+        // reads as "everything is underlined" for no reason — neutralize it.
+        self.category.set_cursor_line_style(Style::default());
+        self.title.set_cursor_line_style(Style::default());
+        self.body.set_cursor_line_style(Style::default());
         let visible = Style::default().add_modifier(Modifier::REVERSED);
         let invisible = Style::default();
         self.category
@@ -1258,10 +1274,23 @@ mod tests {
         let m = EditModal::edit(key.clone(), &item, Some("Work".into()), vec!["Work".into()]);
         assert_eq!(m.category_text(), "Work");
         assert_eq!(m.original_category.as_deref(), Some("Work"));
-        assert_eq!(m.focus, EditFocus::Category);
+        // Already categorized → Title focused (no unprompted dropdown).
+        assert_eq!(m.focus, EditFocus::Title);
         let m = EditModal::edit(key, &item, None, vec![]);
         assert_eq!(m.category_text(), "");
         assert_eq!(m.original_category, None);
+        // Uncategorized → Category focused, like create.
+        assert_eq!(m.focus, EditFocus::Category);
+    }
+
+    /// tui-textarea underlines the cursor's whole line by default, which in
+    /// these mostly-single-line fields read as "all text is underlined".
+    #[test]
+    fn no_field_underlines_its_cursor_line() {
+        let m = EditModal::create(vec!["Work".into()]);
+        for ta in [&m.category, &m.title, &m.body] {
+            assert_eq!(ta.cursor_line_style(), Style::default());
+        }
     }
 
     /// Fix: opening an existing item must leave every field's viewport

@@ -1205,6 +1205,9 @@ mod tests {
             panic!("expected edit modal")
         };
         assert_eq!(m.category_text(), "Work"); // prefilled
+                                               // Cursor now parks at the START of a prefilled field (viewport-open
+                                               // fix); jump to the end before backspacing "Work" away.
+        press(&mut app, KeyCode::End);
         for _ in 0..4 {
             press(&mut app, KeyCode::Backspace);
         }
@@ -1230,6 +1233,9 @@ mod tests {
             panic!("expected edit modal")
         };
         assert_eq!(m.category_text(), "Work"); // prefilled
+                                               // Cursor now parks at the START of a prefilled field (viewport-open
+                                               // fix); jump to the end before backspacing "Work" away.
+        press(&mut app, KeyCode::End);
         for _ in 0..4 {
             press(&mut app, KeyCode::Backspace); // clear "Work"
         }
@@ -1292,8 +1298,10 @@ mod tests {
         assert_eq!(m.title_text(), "Old");
         assert_eq!(m.body_lines(), vec!["old body"]);
         // Category is focused first (spec 2026-09-16 §2); Tab past it to
-        // reach the title, whose cursor starts at the end.
+        // reach the title, whose cursor now starts at the FRONT (viewport-
+        // open fix) — jump to End so typing "er" appends "Older" as before.
         press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::End);
         type_str(&mut app, "er");
         press_ctrl(&mut app, 's');
         let text = feed_text(&app);

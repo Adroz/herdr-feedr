@@ -112,12 +112,19 @@ impl EditModal {
             focus: EditFocus::Category,
             pending_clipboard: None,
         };
-        // TextArea::new leaves the cursor at (0,0); appending is the common
-        // edit, so park it at the end deterministically.
-        m.category.move_cursor(CursorMove::End);
-        m.title.move_cursor(CursorMove::End);
-        m.body.move_cursor(CursorMove::Bottom);
-        m.body.move_cursor(CursorMove::End);
+        // `TextArea::new` already leaves the cursor (and viewport) at (0,0)
+        // — left there deliberately, not overridden to End/Bottom. This
+        // used to park all three cursors at the end on the theory that
+        // appending is the common edit, but that let tui-textarea scroll
+        // its viewport to keep the parked cursor visible on the modal's
+        // FIRST frame (rendered at the narrow pre-zoom pane width) — and
+        // tui-textarea never scrolls back once the pane later widens. Net
+        // effect: opening any item with a long line, or a multi-line body,
+        // showed it clipped to its tail even though nothing was focused
+        // there yet. Viewport correctness on open beats append convenience:
+        // the end is still one Ctrl+E / End-key / click away, and starting
+        // at Head also makes click-to-position exact (no hidden scroll
+        // offset to account for).
         m.sync_blocks();
         m
     }
@@ -231,7 +238,11 @@ impl EditModal {
             .collect()
     }
 
-    /// Replace the field content with an accepted suggestion.
+    /// Replace the field content with an accepted suggestion. Parking the
+    /// cursor at End here (unlike `edit()`, which now parks at start) is
+    /// fine: the user just acted on this field directly, so there's no
+    /// stale-viewport-on-first-frame risk, and category names are short
+    /// enough that End never triggers a horizontal scroll anyway.
     pub fn set_category(&mut self, name: &str) {
         self.category = TextArea::new(vec![name.to_string()]);
         self.category.move_cursor(CursorMove::End);
@@ -1188,6 +1199,41 @@ mod tests {
         let m = EditModal::edit(key, &item, None, vec![]);
         assert_eq!(m.category_text(), "");
         assert_eq!(m.original_category, None);
+    }
+
+    /// Fix: opening an existing item must leave every field's viewport
+    /// scrolled to the START, not the tail. `EditModal::edit` used to park
+    /// all three cursors at End/Bottom so "appending is the common edit"
+    /// stayed a one-keystroke-away default — but the modal's FIRST frame
+    /// renders at the narrow pre-zoom pane width, and tui-textarea scrolls
+    /// its viewport to keep a parked cursor visible on that first frame; it
+    /// never scrolls back once the pane later widens. Net effect: opening a
+    /// task with any long line showed it clipped to its tail, and a
+    /// multi-line body scrolled to its bottom, even though nothing was
+    /// focused there yet. Parking at start keeps the viewport pinned to
+    /// (0,0) from the first frame — the end is still one Ctrl+E / End-key /
+    /// click away.
+    #[test]
+    fn edit_parks_all_cursors_at_start_not_end() {
+        let item = Item {
+            state: State::Open,
+            title: "A very long title that would have scrolled the field horizontally".into(),
+            agent: None,
+            done_date: None,
+            body: vec![
+                "A very long first line of body text that would have scrolled".into(),
+                "second line".into(),
+                "third line".into(),
+            ],
+        };
+        let key = ItemKey {
+            title: "A".into(),
+            state: State::Open,
+        };
+        let m = EditModal::edit(key, &item, Some("Work".into()), vec!["Work".into()]);
+        assert_eq!(m.category.cursor(), (0, 0), "category must park at start");
+        assert_eq!(m.title.cursor(), (0, 0), "title must park at start");
+        assert_eq!(m.body.cursor(), (0, 0), "body must park at start");
     }
 
     /// Spec review follow-up: at a degenerate terminal size the dropdown

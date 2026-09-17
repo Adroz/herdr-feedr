@@ -885,6 +885,51 @@ mod tests {
         );
     }
 
+    /// Rendering regression for the reported bug: opening an existing item
+    /// whose body's first line is long (100+ chars) and whose body has
+    /// 10+ lines used to show the field scrolled to the TAIL of that line
+    /// (and the body scrolled to its bottom) on the modal's first frame at a
+    /// narrow (pre-zoom) pane width, even though nothing was focused there.
+    /// After parking cursors at start (`modal::EditModal::edit`), the first
+    /// visible row of the body must show the LEADING characters of line 0,
+    /// not its tail.
+    #[test]
+    fn edit_modal_opens_with_body_viewport_showing_line_start_not_tail() {
+        let long_first_line = "A".repeat(120);
+        let mut body = vec![long_first_line];
+        for i in 1..12 {
+            body.push(format!("line {i}"));
+        }
+        let item = crate::feed::Item {
+            state: State::Open,
+            title: "T".into(),
+            agent: None,
+            done_date: None,
+            body,
+        };
+        let key = ItemKey {
+            title: "T".into(),
+            state: State::Open,
+        };
+        let m = modal::EditModal::edit(key, &item, None, vec![]);
+
+        let (w, h) = (30, 24); // narrow — the herdr docked-sidebar width
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw_edit_modal(f, &m)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let layout = modal::edit_layout(Rect::new(0, 0, w, h), true, 0);
+        let inner = Block::bordered().inner(layout.body);
+        let first_row: String = (inner.x..inner.x + inner.width)
+            .map(|x| buf[(x, inner.y)].symbol().to_string())
+            .collect();
+        assert!(
+            first_row.trim_start().starts_with('A'),
+            "body's first visible row must show the START of line 0, got {first_row:?}"
+        );
+    }
+
     #[test]
     fn edit_modal_shows_delete_button() {
         let mut app = app_with(SAMPLE);

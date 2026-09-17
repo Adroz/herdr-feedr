@@ -93,13 +93,18 @@ The same binary as the TUI. Subcommands are the machine interface to the feed:
 - `review` writes `[?]`; `done` writes `[x]` — permitted only per §2 authority. Both take a repeatable `--note <line>` that appends evidence to the item's body in the same write as the state change; `--note` is **required** on `review`, since `[?]` without its reason is what §2 exists to prevent.
 - All writes go through one parser/writer shared with the sidebar (see §6).
 
-## 5. The skill ([#4](https://github.com/Adroz/herdr-feedr/issues/4), [#8](https://github.com/Adroz/herdr-feedr/issues/8))
+## 5. The skill ([#4](https://github.com/Adroz/herdr-feedr/issues/4), [#8](https://github.com/Adroz/herdr-feedr/issues/8), [#12](https://github.com/Adroz/herdr-feedr/issues/12))
 
 `skills/herdr-feedr/SKILL.md` — the agent's interface to the feed, expressed as "run the `feedr` CLI":
 
 - Agents normally arrive with context (a named task, or a task to create). A context-free invocation lists open items and **asks**; it never auto-grabs.
 - Claim before working; finish per §2 (`review` + evidence on human-created, `done` on agent-created); add follow-up work with `add --agent-owned`.
-- Delivery (herdr has no skill mechanism; plugin `skills/` dirs are inert convention): primary install `npx skills add Adroz/herdr-feedr -g`; the plugin build step copies (never symlinks) the skill over installed copies so herdr's reinstall-to-update flow refreshes it; AGENTS.md paste-in documented as fallback. The skill is version-stamped and consistency-tested against the CLI.
+- Body, in order: the golden rule (**never edit the feed file directly** — every read and write goes through the CLI, or §6's atomicity is void); identity via `feedr whoami`, stopping to ask if it fails rather than claiming untagged; claim-or-ask; `add --agent-owned` for follow-up work; finish by §2 authority (`--human` is off-limits to agents); `sweep` and the `# Done` archive are human-only; one worked example.
+- Delivery (herdr has no skill mechanism; plugin `skills/` dirs are inert convention): the **binary owns it**. `skills/herdr-feedr/SKILL.md` is the in-repo source of truth, embedded with `include_str!` so `feedr skill install` works from an installed binary with no checkout.
+  - `feedr skill install` writes exactly two paths and no others: `~/.agents/skills/herdr-feedr/` (canonical) and `~/.claude/skills/herdr-feedr/` (symlink into `~/.agents` when absent, copy when symlinking fails, overwrite when a real dir is already there). It prints every path written.
+  - `scripts/build.sh` runs `feedr skill install --refresh-only`, which refreshes copies that already exist and **never creates** them — so herdr's reinstall-to-update flow refreshes an installed skill, while `herdr plugin install` never plants files in `$HOME` unasked.
+  - First install stays explicit and is documented two ways: `npx skills add Adroz/herdr-feedr -g` (agent-neutral primary) or `feedr skill install` (no Node needed). An AGENTS.md paste-in block is the fallback for runners without skill support.
+- Versioning: one number across crate, `herdr-plugin.toml`, and skill, stamped as a visible body line (`> Skill version 0.1.0 — requires feedr CLI >= 0.1.0.`) rather than a frontmatter key. `feedr skill status` reports each installed copy's path, stamped version, binary version, and OK/STALE; there are no ambient drift warnings. `tests/skill.rs` asserts that every `feedr ...` line in the skill parses against the real clap command, that every non-hidden subcommand appears in the skill, and that the three versions match.
 
 ## 6. Concurrency ([#8](https://github.com/Adroz/herdr-feedr/issues/8), map fog)
 

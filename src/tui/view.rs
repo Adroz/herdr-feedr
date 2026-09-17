@@ -287,26 +287,25 @@ fn draw_edit_modal(f: &mut Frame, m: &modal::EditModal) {
     f.render_widget(Paragraph::new(hint).style(theme::muted_row()), layout.hints);
 
     // Dropdown last so it overlays the title/body area (mirrors
-    // `edit_click`'s hit-test order in modal.rs).
+    // `edit_click`'s hit-test order in modal.rs). Bordered and Surface1-
+    // tinted (distinct from the plain-text field it used to be) so it reads
+    // as a floating popup rather than bare labels over the Title field.
     if layout.dropdown.height > 0 {
         f.render_widget(Clear, layout.dropdown);
+        let dropdown_block = Block::bordered()
+            .style(theme::dropdown_panel_style())
+            .border_style(theme::dropdown_border());
+        f.render_widget(dropdown_block, layout.dropdown);
         let rows: Vec<Line> = m
             .filtered()
             .iter()
-            .take(layout.dropdown.height as usize)
+            .take(layout.dropdown_inner.height as usize)
             .enumerate()
-            .map(|(i, s)| {
-                let style = if m.dropdown == Some(i) {
-                    theme::normal_text().add_modifier(Modifier::REVERSED)
-                } else {
-                    theme::normal_text()
-                };
-                Line::styled(s.clone(), style)
-            })
+            .map(|(i, s)| Line::styled(s.clone(), theme::dropdown_row(m.dropdown == Some(i))))
             .collect();
         f.render_widget(
-            Paragraph::new(rows).style(theme::modal_panel_style()),
-            layout.dropdown,
+            Paragraph::new(rows).style(theme::dropdown_panel_style()),
+            layout.dropdown_inner,
         );
     }
 }
@@ -882,6 +881,32 @@ mod tests {
         assert!(
             text.contains("Work") && text.contains("Chores"),
             "suggestions must render"
+        );
+
+        // Fix: the dropdown now draws its OWN bordered, tinted box — not
+        // bare text floating over the field below it (which used to read as
+        // form labels rather than a popup). Check both the border glyph
+        // itself and its distinct accent color at the dropdown's own
+        // corner, and the tinted background on a non-highlighted row.
+        let layout = modal::edit_layout(Rect::new(0, 0, 80, 24), false, m.dropdown_rows());
+        let corner = &buf[(layout.dropdown.x, layout.dropdown.y)];
+        assert_eq!(
+            corner.symbol(),
+            "┌",
+            "dropdown must draw its own top-left border corner"
+        );
+        assert_eq!(
+            corner.fg,
+            theme::LAVENDER,
+            "dropdown border uses its own accent color, distinct from the modal's Surface1 border"
+        );
+        // Row 0 ("Work") is highlighted (m.dropdown = Some(0)); row 1
+        // ("Chores") is the plain, non-highlighted tinted row.
+        let plain_row = &buf[(layout.dropdown_inner.x, layout.dropdown_inner.y + 1)];
+        assert_eq!(
+            plain_row.bg,
+            theme::SURFACE1,
+            "non-highlighted suggestion rows are tinted so the popup reads as a distinct surface"
         );
     }
 

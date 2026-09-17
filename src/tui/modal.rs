@@ -278,7 +278,7 @@ impl EditModal {
 /// `.intersection(term_area)` at degenerate sizes).
 fn visible_rows(m: &EditModal, area: Rect) -> usize {
     edit_layout(area, m.original.is_some(), m.dropdown_rows())
-        .dropdown
+        .dropdown_inner
         .height as usize
 }
 
@@ -293,9 +293,19 @@ fn visible_rows(m: &EditModal, area: Rect) -> usize {
 pub struct EditLayout {
     pub outer: Rect,
     pub category: Rect,
-    /// Zero-height when the dropdown is closed. Overlays the title/body
-    /// area; `edit_click` tests it first so overlap resolves to the list.
+    /// Suggestion dropdown's OUTER (bordered) box. Zero-height when the
+    /// dropdown is closed. Overlays the title/body area; `edit_click` tests
+    /// it first so overlap resolves to the list. A click inside this rect
+    /// but outside `dropdown_inner` lands on the dropdown's own border —
+    /// consumed as a no-op rather than picking a suggestion or falling
+    /// through to Title/Body beneath.
     pub dropdown: Rect,
+    /// The dropdown's row-bearing area, inside its own border — the single
+    /// source both `view::draw_edit_modal` (what it paints rows into) and
+    /// `edit_click`/`visible_rows` (what it hit-tests/counts against) derive
+    /// from, via `dropdown_inner_of`, so drawn and clickable rows can never
+    /// drift apart. Zero-height when the dropdown is closed.
+    pub dropdown_inner: Rect,
     pub title: Rect,
     pub body: Rect,
     pub hints: Rect,
@@ -359,15 +369,24 @@ pub fn edit_layout(term_area: Rect, is_edit: bool, dropdown_rows: u16) -> EditLa
         Constraint::Length(1),
     ])
     .areas(inner);
-    // Inside the category field's borders, clamped like the buttons so it
-    // can never escape the drawn buffer.
+    // Directly below Category, same width — reads as the field's own box
+    // continuing downward. +2 rows for the dropdown's own top/bottom
+    // border (zero-height, and so empty/undrawn, when the dropdown is
+    // closed). Clamped like the buttons so it can never escape the drawn
+    // buffer.
+    let dropdown_outer_height = if dropdown_rows == 0 {
+        0
+    } else {
+        dropdown_rows.saturating_add(2)
+    };
     let dropdown = Rect::new(
-        category.x.saturating_add(1),
+        category.x,
         category.y.saturating_add(category.height),
-        category.width.saturating_sub(2),
-        dropdown_rows,
+        category.width,
+        dropdown_outer_height,
     )
     .intersection(term_area);
+    let dropdown_inner = dropdown_inner_of(dropdown);
 
     let mut x = buttons.x;
     let save = Rect::new(x, buttons.y, SAVE_LABEL.len() as u16, 1).intersection(term_area);
@@ -385,6 +404,7 @@ pub fn edit_layout(term_area: Rect, is_edit: bool, dropdown_rows: u16) -> EditLa
         outer,
         category,
         dropdown,
+        dropdown_inner,
         title,
         body,
         hints,
@@ -392,6 +412,17 @@ pub fn edit_layout(term_area: Rect, is_edit: bool, dropdown_rows: u16) -> EditLa
         cancel,
         delete,
     }
+}
+
+/// The suggestion dropdown's row-bearing area, inside its own border — the
+/// single source of truth `view::draw_edit_modal` (what it paints rows
+/// into) and `edit_click`/`visible_rows` (what they hit-test/count against)
+/// both derive from, so drawn and clickable rows can never drift apart.
+/// `Block::inner` saturates rather than underflowing when `outer` is too
+/// small to fit a border (e.g. clipped to zero height when closed), so no
+/// separate empty-rect guard is needed here.
+pub(crate) fn dropdown_inner_of(outer: Rect) -> Rect {
+    Block::bordered().inner(outer)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,7 +445,15 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 /// the main list.
 pub fn edit_click(layout: &EditLayout, is_edit: bool, x: u16, y: u16) -> Option<EditClickTarget> {
     if layout.dropdown.height > 0 && rect_contains(layout.dropdown, x, y) {
-        return Some(EditClickTarget::Suggestion(y - layout.dropdown.y));
+        // Inside the dropdown's outer (bordered) box: a hit on the
+        // row-bearing inner area picks a suggestion; a hit on the border
+        // itself (e.g. the top/bottom frame) is consumed as a no-op — it
+        // must not pick a suggestion NOR fall through to Category/Title
+        // beneath, since the dropdown visually overlays them here.
+        if rect_contains(layout.dropdown_inner, x, y) {
+            return Some(EditClickTarget::Suggestion(y - layout.dropdown_inner.y));
+        }
+        return None;
     }
     if rect_contains(layout.category, x, y) {
         return Some(EditClickTarget::Category);
@@ -966,6 +1005,12 @@ mod tests {
                             d.is_empty() || (d.right() <= area.width && d.bottom() <= area.height),
                             "dropdown {d:?} escapes terminal {width}x{height}"
                         );
+                        let di = layout.dropdown_inner;
+                        assert!(
+                            di.is_empty()
+                                || (di.right() <= area.width && di.bottom() <= area.height),
+                            "dropdown inner {di:?} escapes terminal {width}x{height}"
+                        );
                     }
                 }
             }
@@ -1154,10 +1199,18 @@ mod tests {
     fn layout_stacks_category_above_title_and_sizes_dropdown() {
         let l = edit_layout(TEST_AREA, false, 3);
         assert!(l.category.y < l.title.y && l.title.y < l.body.y);
-        assert_eq!(l.dropdown.height, 3);
+        // Bordered box: 3 suggestion rows + top/bottom border = 5.
+        assert_eq!(l.dropdown.height, 5);
+        assert_eq!(l.dropdown_inner.height, 3);
         assert_eq!(l.dropdown.y, l.category.y + l.category.height);
+        assert_eq!(
+            l.dropdown_inner.y,
+            l.dropdown.y + 1,
+            "inner area starts past the top border"
+        );
         let l0 = edit_layout(TEST_AREA, false, 0);
-        assert_eq!(l0.dropdown.height, 0);
+        assert_eq!(l0.dropdown.height, 0, "closed dropdown draws no border");
+        assert_eq!(l0.dropdown_inner.height, 0);
     }
 
     #[test]
@@ -1167,10 +1220,20 @@ mod tests {
             edit_click(&l, false, l.category.x + 1, l.category.y + 1),
             Some(EditClickTarget::Category)
         );
-        // The dropdown overlays the title area — it must win the hit-test:
+        // The dropdown overlays the title area — it must win the hit-test.
+        // Row 1 is the second drawn suggestion row, inside the bordered
+        // box's inner (row-bearing) area.
         assert_eq!(
-            edit_click(&l, false, l.dropdown.x + 1, l.dropdown.y + 1),
+            edit_click(&l, false, l.dropdown_inner.x, l.dropdown_inner.y + 1),
             Some(EditClickTarget::Suggestion(1))
+        );
+        // A click on the dropdown's own border is consumed as a no-op — it
+        // must neither pick a suggestion nor fall through to Category/Title
+        // beneath it.
+        assert_eq!(
+            edit_click(&l, false, l.dropdown.x, l.dropdown.y),
+            None,
+            "a border click on the dropdown must be a no-op"
         );
         let l0 = edit_layout(TEST_AREA, false, 0);
         assert_eq!(
@@ -1252,7 +1315,9 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let mut m = EditModal::create(names);
-        let visible = edit_layout(tiny, false, m.dropdown_rows()).dropdown.height as usize;
+        let visible = edit_layout(tiny, false, m.dropdown_rows())
+            .dropdown_inner
+            .height as usize;
         assert!(
             visible < m.filtered().len().min(MAX_DROPDOWN_ROWS),
             "fixture must actually clip"
@@ -1383,8 +1448,15 @@ mod tests {
         let m = step_edit(m, key(KeyCode::Down)); // dropdown open
         assert_eq!(m.dropdown, Some(0));
         let layout = edit_layout(TEST_AREA, false, m.dropdown_rows());
-        let m = step_edit(m, click(layout.title.x, layout.title.y));
-        assert_eq!(m.focus, EditFocus::Title);
+        // The dropdown's bordered box shares Category/Title's width and, for
+        // 2 suggestions, is taller than Title's own 3 rows — it overlays
+        // all of Title and spills one row into Body. Click just past where
+        // the dropdown box ends so it actually lands on Body (not consumed
+        // by the dropdown's own border, and not Title, which is entirely
+        // covered here).
+        let y = layout.dropdown.y + layout.dropdown.height;
+        let m = step_edit(m, click(layout.body.x + 1, y));
+        assert_eq!(m.focus, EditFocus::Body);
         assert_eq!(m.dropdown, None);
     }
 
@@ -1393,7 +1465,7 @@ mod tests {
         let m = EditModal::create(vec!["Work".into(), "Chores".into()]);
         let m = step_edit(m, key(KeyCode::Down)); // dropdown open (2 rows)
         let l = edit_layout(TEST_AREA, false, m.dropdown_rows());
-        let m = step_edit(m, click(l.dropdown.x + 1, l.dropdown.y + 1));
+        let m = step_edit(m, click(l.dropdown_inner.x, l.dropdown_inner.y + 1));
         assert_eq!(m.category_text(), "Chores");
         assert_eq!(m.dropdown, None);
     }

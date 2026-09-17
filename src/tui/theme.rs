@@ -132,6 +132,37 @@ pub fn button(focused: bool) -> Style {
     }
 }
 
+/// Suggestion dropdown's own border — Lavender, the same accent
+/// `modal_title` uses to call out an open modal, rather than the plainer
+/// Surface1 the modal's own panel border uses. Bare suggestion names used to
+/// float over the Title field with no visual frame at all, reading as form
+/// labels rather than a popup; a distinct accent border (not just any
+/// border) makes the popup read as a floating, ACTIVE control rather than
+/// more static chrome.
+pub fn dropdown_border() -> Style {
+    Style::default().fg(LAVENDER)
+}
+
+/// Suggestion dropdown panel background — Surface1, one shade lighter than
+/// the modal panel's own Mantle background, so the popup visibly sits on
+/// top of the category field instead of blending into the panel behind it.
+pub fn dropdown_panel_style() -> Style {
+    Style::default().bg(SURFACE1)
+}
+
+/// One suggestion row. The keyboard/mouse-highlighted row keeps the louder
+/// `REVERSED` treatment used everywhere else in the modal (buttons, focused
+/// field cursor); every other row is normal text tinted with the dropdown's
+/// own Surface1 background rather than plain (backgroundless) text, so it
+/// reads as part of the popup even before the highlight moves onto it.
+pub fn dropdown_row(highlighted: bool) -> Style {
+    if highlighted {
+        normal_text().add_modifier(Modifier::REVERSED)
+    } else {
+        normal_text().bg(SURFACE1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +170,25 @@ mod tests {
     #[test]
     fn modal_border_uses_surface1() {
         assert_eq!(modal_border(), Style::default().fg(SURFACE1));
+    }
+
+    #[test]
+    fn dropdown_border_uses_lavender() {
+        assert_eq!(dropdown_border(), Style::default().fg(LAVENDER));
+    }
+
+    #[test]
+    fn dropdown_panel_style_has_surface1_background() {
+        assert_eq!(dropdown_panel_style(), Style::default().bg(SURFACE1));
+    }
+
+    #[test]
+    fn dropdown_row_highlighted_is_reversed_others_are_tinted() {
+        assert_eq!(
+            dropdown_row(true),
+            normal_text().add_modifier(Modifier::REVERSED)
+        );
+        assert_eq!(dropdown_row(false), normal_text().bg(SURFACE1));
     }
 
     #[test]

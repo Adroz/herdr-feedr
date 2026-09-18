@@ -51,3 +51,45 @@ command = "herdr-feedr.toggle-feedr"
 ```
 
 (Pick keys that don't collide with existing bindings — check `~/.config/herdr/config.toml` for what's already taken.)
+
+## Teach your agent
+
+The feed is only half the point: agents work items off it. herdr-feedr ships a skill at
+`skills/herdr-feedr/SKILL.md` that teaches them the protocol — claim before working, finish by
+provenance, never edit the feed file directly.
+
+herdr has no skill-delivery mechanism of its own (a plugin's `skills/` directory is inert
+convention), so installing the skill is one explicit step:
+
+```sh
+npx skills add Adroz/herdr-feedr -g   # agent-neutral; needs Node
+feedr skill install                   # same thing, no Node required
+```
+
+Either lands the canonical copy in `~/.agents/skills/herdr-feedr/` and links
+`~/.claude/skills/herdr-feedr` at it. Those two paths are the only places `feedr skill install`
+ever writes.
+
+```sh
+feedr skill status    # where it's installed, and whether it matches this binary
+```
+
+`scripts/build.sh` runs `feedr skill install --refresh-only`, which refreshes copies that
+already exist and never creates one — so `herdr plugin install` updates an installed skill
+without planting files in your home directory unasked.
+
+For runners with no skill support, paste the skill's "golden rule" and "Finishing" sections into
+your project's `AGENTS.md`.
+
+## Agent identity
+
+`feedr claim` stamps the claiming agent's ref so the sidebar can jump to its pane. The ref
+resolves from `--agent`, then `FEEDR_AGENT`, then `herdr pane current`, then
+`CLAUDE_CODE_SESSION_ID` — the last two carry the same session id, so claims work inside and
+outside herdr:
+
+```sh
+feedr whoami          # claude:2f62ad27-… (from herdr pane current)
+```
+
+It never claims untagged: an unlinked claim is a dead link, so unresolvable identity fails loudly.

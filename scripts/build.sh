@@ -23,3 +23,10 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 cd "$script_dir/.."
 
 cargo build --release
+
+# Refresh an already-installed copy of the agent skill so herdr's
+# reinstall-to-update flow updates the skill along with the binary (SPEC §5).
+# --refresh-only never *creates* a copy: installing a plugin must not write into
+# $HOME unasked. First install stays explicit —
+#   npx skills add Adroz/herdr-feedr -g   (or)   feedr skill install
+./target/release/feedr skill install --refresh-only

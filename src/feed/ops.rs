@@ -552,6 +552,21 @@ fn archive_insertion_point(doc: &Document, done_at: usize, section: &str) -> Opt
     None
 }
 
+/// Append evidence lines to an item's body (SPEC §4: `review`/`done` carry a
+/// `--note`, written in the same atomic write as the state change, so a `[?]`
+/// never lands without the reason it exists to record).
+pub fn append_note(doc: &mut Document, index: usize, notes: &[String]) {
+    debug_assert!(matches!(doc.nodes[index], Node::Item(_)));
+    if notes.is_empty() {
+        return;
+    }
+    if let Node::Item(it) = &mut doc.nodes[index] {
+        let mut body = it.body.clone();
+        body.extend(notes.iter().cloned());
+        it.body = trim_blank_edges(&body);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,6 +589,60 @@ mod tests {
 
 - [x] Old fixed thing @done(2026-09-01)
 ";
+
+    #[test]
+    fn a_note_is_appended_to_the_item_body() {
+        let mut doc = parse(SAMPLE);
+        let i = find(&doc, "Fix auth redirect loop").unwrap();
+
+        append_note(&mut doc, i, &["tests pass on 3 browsers".to_string()]);
+
+        let Node::Item(it) = &doc.nodes[i] else {
+            panic!("not an item")
+        };
+        assert_eq!(it.body, vec!["tests pass on 3 browsers".to_string()]);
+    }
+
+    #[test]
+    fn notes_append_after_existing_body_lines_in_order() {
+        let mut doc = parse("# Feed\n\n- [ ] Ship it\n  original context\n");
+        let i = find(&doc, "Ship it").unwrap();
+
+        append_note(
+            &mut doc,
+            i,
+            &["first note".to_string(), "second note".to_string()],
+        );
+
+        let Node::Item(it) = &doc.nodes[i] else {
+            panic!("not an item")
+        };
+        assert_eq!(
+            it.body,
+            vec!["original context", "first note", "second note"]
+        );
+    }
+
+    #[test]
+    fn an_empty_note_list_leaves_the_document_untouched() {
+        let mut doc = parse(SAMPLE);
+        let before = render(&doc);
+        let i = find(&doc, "Fix auth redirect loop").unwrap();
+
+        append_note(&mut doc, i, &[]);
+
+        assert_eq!(render(&doc), before);
+    }
+
+    #[test]
+    fn a_note_survives_a_render_round_trip_as_an_indented_body_line() {
+        let mut doc = parse(SAMPLE);
+        let i = find(&doc, "Fix auth redirect loop").unwrap();
+
+        append_note(&mut doc, i, &["evidence here".to_string()]);
+
+        assert!(render(&doc).contains("  evidence here\n"));
+    }
 
     #[test]
     fn zones_follow_headings() {

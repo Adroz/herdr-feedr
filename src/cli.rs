@@ -2,7 +2,9 @@ use crate::config;
 use crate::feed::ops::{self, Authority, Zone};
 use crate::feed::parse::parse;
 use crate::feed::write;
-use crate::feed::{AgentRef, Node, State};
+use crate::feed::{Node, State};
+use crate::identity;
+use crate::skill;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -26,10 +28,13 @@ enum Cmd {
     /// Claim an item: [~] + @agent tag
     Claim {
         item: String,
-        /// Claiming agent as kind:session-id, e.g. claude:0198f3ab
+        /// Claiming agent as kind:session-id, e.g. claude:0198f3ab.
+        /// Resolved from the environment when omitted (see `whoami`).
         #[arg(long)]
-        agent: String,
+        agent: Option<String>,
     },
+    /// Print the agent ref this session claims as, and where it came from
+    Whoami,
     /// Add an item
     Add {
         title: String,
@@ -44,16 +49,30 @@ enum Cmd {
         section: Option<String>,
     },
     /// Mark an item awaiting review: [?]
-    Review { item: String },
+    Review {
+        item: String,
+        /// Evidence line appended to the item body; repeatable. Required —
+        /// a [?] without its reason is what review exists to prevent.
+        #[arg(long, required = true)]
+        note: Vec<String>,
+    },
     /// Close an item: [x]
     Done {
         item: String,
         /// Assert human authority (the sidebar and you use this; agents must not)
         #[arg(long)]
         as_human: bool,
+        /// Evidence line appended to the item body; repeatable.
+        #[arg(long)]
+        note: Vec<String>,
     },
     /// Archive human [x] items under "# Done"; delete agent [x] items
     Sweep,
+    /// Manage this plugin's agent skill (its installed copies)
+    Skill {
+        #[command(subcommand)]
+        command: SkillCmd,
+    },
     /// Launch the sidebar TUI in this terminal
     Sidebar {
         /// Dock a sidebar pane into herdr (idempotent open-or-focus), then exit
@@ -70,6 +89,69 @@ enum Cmd {
         #[arg(long)]
         tab_id: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum SkillCmd {
+    /// Copy the bundled skill into the agent skill directories
+    Install {
+        /// Refresh copies that already exist; never create one. What the
+        /// plugin build step runs, so installing the plugin doesn't write
+        /// into $HOME unasked.
+        #[arg(long)]
+        refresh_only: bool,
+    },
+    /// Show where the skill is installed and whether it matches this binary
+    Status,
+}
+
+fn home_dir() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("cannot find your home directory ($HOME is unset)"))
+}
+
+fn run_skill(command: &SkillCmd) -> Result<()> {
+    let home = home_dir()?;
+    match command {
+        SkillCmd::Install { refresh_only } => {
+            for action in skill::install(&home, *refresh_only)? {
+                match action {
+                    skill::Action::Wrote(p) => println!("wrote {}", p.display()),
+                    skill::Action::Linked { link, target } => {
+                        println!("linked {} -> {}", link.display(), target.display())
+                    }
+                    skill::Action::LeftAlone(p) => {
+                        println!("left {} alone (already a symlink)", p.display())
+                    }
+                    skill::Action::SkippedNotInstalled(p) => {
+                        println!(
+                            "skipped {} (not installed; run without --refresh-only)",
+                            p.display()
+                        )
+                    }
+                }
+            }
+        }
+        SkillCmd::Status => {
+            let rows = skill::status(&home);
+            if rows.is_empty() {
+                println!("skill not installed (run `feedr skill install`)");
+                return Ok(());
+            }
+            for row in rows {
+                let installed = row.installed_version.as_deref().unwrap_or("unstamped");
+                let verdict = if row.stale { "STALE" } else { "ok" };
+                println!(
+                    "{} — skill {installed}, binary {} [{verdict}]",
+                    row.path.display(),
+                    env!("CARGO_PKG_VERSION")
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn run() -> Result<()> {
@@ -109,6 +191,15 @@ pub fn run() -> Result<()> {
         println!("{msg}");
         return Ok(());
     }
+    if let Cmd::Skill { command } = &cli.command {
+        return run_skill(command);
+    }
+    if let Cmd::Whoami = &cli.command {
+        let mut runner = crate::tui::dock::HerdrCli::from_env();
+        let id = identity::resolve(None, &identity::SystemEnv, &mut runner)?;
+        println!("{} (from {})", id.agent, id.source.label());
+        return Ok(());
+    }
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -145,10 +236,12 @@ pub fn run() -> Result<()> {
             }
         }
         Cmd::Claim { item, agent } => {
-            let a = AgentRef::parse(&agent)
-                .ok_or_else(|| anyhow::anyhow!("--agent must be kind:id, got \"{agent}\""))?;
+            let mut runner = crate::tui::dock::HerdrCli::from_env();
+            // Resolve before locating the item so an unresolvable identity
+            // fails without touching the feed.
+            let id = identity::resolve(agent.as_deref(), &identity::SystemEnv, &mut runner)?;
             let i = ops::find(&doc, &item)?;
-            ops::claim(&mut doc, i, a);
+            ops::claim(&mut doc, i, id.agent);
             write::save_atomic(&doc, &path)?;
         }
         Cmd::Add {
@@ -169,12 +262,19 @@ pub fn run() -> Result<()> {
             }
             write::save_atomic(&doc, &path)?;
         }
-        Cmd::Review { item } => {
+        Cmd::Review { item, note } => {
             let i = ops::find(&doc, &item)?;
             ops::set_state(&mut doc, i, State::Review, Authority::Agent)?;
+            // Same document, same save: the note can't be lost by a crash
+            // between the state change and the evidence.
+            ops::append_note(&mut doc, i, &note);
             write::save_atomic(&doc, &path)?;
         }
-        Cmd::Done { item, as_human } => {
+        Cmd::Done {
+            item,
+            as_human,
+            note,
+        } => {
             let i = ops::find(&doc, &item)?;
             let by = if as_human {
                 Authority::Human
@@ -182,6 +282,7 @@ pub fn run() -> Result<()> {
                 Authority::Agent
             };
             ops::set_state(&mut doc, i, State::Done, by)?;
+            ops::append_note(&mut doc, i, &note);
             write::save_atomic(&doc, &path)?;
         }
         Cmd::Sweep => {
@@ -189,7 +290,7 @@ pub fn run() -> Result<()> {
             ops::sweep(&mut doc, &today);
             write::save_atomic(&doc, &path)?;
         }
-        Cmd::Sidebar { .. } | Cmd::AutoDockHook { .. } => {
+        Cmd::Sidebar { .. } | Cmd::AutoDockHook { .. } | Cmd::Whoami | Cmd::Skill { .. } => {
             unreachable!()
         }
     }

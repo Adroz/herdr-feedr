@@ -307,11 +307,13 @@ pub fn spawn_event_thread(socket_path: PathBuf, tx: mpsc::Sender<crate::tui::App
     });
 }
 
-/// Read timeout on the event-stream connection. On a genuine stall (herdr
-/// stops responding but doesn't close the socket) this fires and we resync
-/// instead of blocking the reconnect loop forever; it also serves as a
-/// periodic self-heal for any event dropped between resync and subscribe.
-const SUBSCRIBE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Read timeout on the event-stream connection — and, since
+/// `pane.agent_status_changed` can't be subscribed globally, the interval at
+/// which agent statuses actually refresh: each timeout triggers a resync. Kept
+/// short enough that a glyph isn't visibly stale, long enough that an idle
+/// sidebar isn't hammering the socket. It also still does its original job:
+/// unwedging a stalled connection that never closes.
+const SUBSCRIBE_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Blocks streaming events until the connection drops (or the app goes away).
 /// Subscription types per the research doc's recommended wiring.
@@ -343,8 +345,13 @@ fn subscribe_loop_with_timeout(
     resync(path, tx)?;
     let mut stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(read_timeout))?;
+    // `pane.agent_status_changed` is deliberately absent: herdr 0.9.0 treats it
+    // as a PER-PANE subscription and rejects it without a `pane_id`, failing
+    // the whole request. Status changes therefore arrive via the periodic
+    // resync below (SUBSCRIBE_READ_TIMEOUT) rather than as pushed events —
+    // a poll we can rely on, instead of per-pane subscription bookkeeping
+    // that would have to be torn down and rebuilt as panes come and go.
     let sub = serde_json::json!({"id": "sub", "method": "events.subscribe", "params": {"subscriptions": [
-        {"type": "pane.agent_status_changed"},
         {"type": "pane.created"},
         {"type": "pane.closed"},
         {"type": "pane.agent_detected"}
@@ -657,6 +664,40 @@ mod tests {
         let (_dir, path, _seen) = fake_server(vec![vec![tab], vec![panes]]);
         let mut c = UnixSocketClient { socket_path: path };
         assert_eq!(c.create_tab("resume claude").unwrap(), "w1:p9");
+    }
+
+    /// Regression: herdr 0.9.0 requires a `pane_id` on a
+    /// `pane.agent_status_changed` subscription — it is per-pane, not global.
+    /// Asking for it globally made herdr reject the WHOLE subscribe request
+    /// (`invalid_request: missing field pane_id`), so the stream EOF'd, the
+    /// thread reported SocketDown, and every agent glyph in the sidebar was
+    /// cleared every 5 seconds. Verified live against the socket, which the
+    /// injected-statuses view tests could never catch.
+    #[test]
+    fn subscribe_never_asks_globally_for_a_per_pane_subscription() {
+        let (_dir, path, seen) = fake_server(vec![
+            vec![serde_json::json!({"id": "{id}", "result": {"agents": []}}).to_string()],
+            vec![r#"{"id":"sub","result":{}}"#.to_string()],
+        ]);
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        subscribe_loop(&path, &tx).unwrap();
+
+        let sub = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|l| l.contains("events.subscribe"))
+            .cloned()
+            .expect("a subscribe request should have been sent");
+        assert!(
+            !sub.contains("agent_status_changed"),
+            "subscribing globally to a per-pane event type gets the whole \
+             request rejected: {sub}"
+        );
+        for kind in ["pane.created", "pane.closed", "pane.agent_detected"] {
+            assert!(sub.contains(kind), "{kind} missing from {sub}");
+        }
     }
 
     #[test]

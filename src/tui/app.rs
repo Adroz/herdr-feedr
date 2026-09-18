@@ -401,6 +401,10 @@ impl App {
                 self.delete_item(key);
                 Modal::None
             }
+            ModalStep::Release(key) => {
+                self.release_item(key);
+                Modal::None
+            }
             ModalStep::OpenEditor => {
                 self.request_editor();
                 Modal::None
@@ -490,6 +494,21 @@ impl App {
             }
             None => Ok(Outcome::Unchanged(Some(
                 "item changed on disk — delete dropped".into(),
+            ))),
+        });
+    }
+
+    /// Release the claim from the modal's Release button. The sidebar acts
+    /// with human authority (like `feedr unclaim --as-human`), so it releases
+    /// any agent's claim, not just one matching some local identity.
+    fn release_item(&mut self, key: ItemKey) {
+        self.with_feed(move |doc| match relocate(doc, &key) {
+            Some(i) => match ops::unclaim(doc, i, &ops::Unclaimer::Human) {
+                Ok(()) => Ok(Outcome::Changed(Some("claim released".into()))),
+                Err(e) => Ok(Outcome::Unchanged(Some(e.to_string()))),
+            },
+            None => Ok(Outcome::Unchanged(Some(
+                "item changed on disk — release dropped".into(),
             ))),
         });
     }
@@ -1192,6 +1211,26 @@ mod tests {
         );
     }
 
+    /// Written after `release_item` rather than before it — noted honestly.
+    /// It covers the one path the modal and ops tests don't: modal step →
+    /// relocate → unclaim → atomic save.
+    #[test]
+    fn the_modal_release_button_clears_the_tag_on_disk() {
+        let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [~] T @agent(claude:abc)\n  ctx\n");
+        let key = ItemKey {
+            title: "T".into(),
+            state: State::InProgress,
+        };
+
+        app.release_item(key);
+
+        let out = feed_text(&app);
+        assert!(out.contains("- [ ] T\n"), "got:\n{out}");
+        assert!(!out.contains("@agent"), "tag should be gone:\n{out}");
+        assert!(out.contains("  ctx"), "body must survive:\n{out}");
+        assert_eq!(app.status_msg.as_deref(), Some("claim released"));
+    }
+
     #[test]
     fn edit_changing_category_moves_item_with_body() {
         let (mut app, _fake, _dir) = app_on_disk(
@@ -1205,9 +1244,10 @@ mod tests {
             panic!("expected edit modal")
         };
         assert_eq!(m.category_text(), "Work"); // prefilled
-                                               // A categorized item opens on Title — Tab around to Category
-                                               // (Title → Body → Save → Cancel → Delete → Category).
-        for _ in 0..5 {
+                                               // A categorized item opens on Title — Tab around to Category. This
+                                               // item is claimed, so Release sits in the ring too:
+                                               // Title → Body → Save → Cancel → Release → Delete → Category.
+        for _ in 0..6 {
             press(&mut app, KeyCode::Tab);
         }
         // Cursor parks at the START of a prefilled field (viewport-open

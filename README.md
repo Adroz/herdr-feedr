@@ -93,3 +93,8 @@ feedr whoami          # claude:2f62ad27-… (from herdr pane current)
 ```
 
 It never claims untagged: an unlinked claim is a dead link, so unresolvable identity fails loudly.
+
+A claim isn't permanent. `feedr unclaim <item>` clears the tag and puts the item back to `[ ]`;
+agents may release only their own claims, while you (and the sidebar's `[ Release ]` button, shown
+on a claimed item's edit modal) may release anyone's. In the sidebar, an `@agent` sub-line carries
+a live marker when herdr can see that session — no marker means "not visible", never "dead".

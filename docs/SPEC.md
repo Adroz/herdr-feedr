@@ -86,10 +86,11 @@ Interactions:
 
 The same binary as the TUI. Subcommands are the machine interface to the feed:
 
-`feedr list` · `feedr show <item>` · `feedr whoami` · `feedr claim <item>` · `feedr add [--agent-owned] <title>` · `feedr review <item> --note <line>` · `feedr done <item>` · `feedr sweep`
+`feedr list` · `feedr show <item>` · `feedr whoami` · `feedr claim <item>` · `feedr unclaim <item>` · `feedr add [--agent-owned] <title>` · `feedr review <item> --note <line>` · `feedr done <item>` · `feedr sweep` · `feedr skill install|status`
 
 - `claim` writes `[~]` and stamps `@agent(<kind>:<session-id>)`. The agent ref resolves in order: `--agent <kind>:<id>` > `FEEDR_AGENT` > `herdr pane current` (only when `HERDR_ENV=1`) > `CLAUDE_CODE_SESSION_ID` → `claude:<uuid>` — the last verified identical to herdr's `agent_session.value`, so the common case needs no socket call and identity also resolves outside herdr. When none yields an id, `claim` fails non-zero naming the sources tried; it never claims untagged, because an unlinked claim is a dead link the sidebar can't jump from.
 - `whoami` prints the resolved ref and its source.
+- `unclaim` releases a claim: it clears the `@agent` tag and returns the item to `[ ]`, so it reads as takeable again. Only an **in-progress** item can be released — once work has been handed back (`[?]`) or closed (`[x]`), the tag is the record of who did it, not a lock. Authority mirrors §2: an agent releases only its own claim; `--as-human` (what the sidebar uses) releases anyone's.
 - `review` writes `[?]`; `done` writes `[x]` — permitted only per §2 authority. Both take a repeatable `--note <line>` that appends evidence to the item's body in the same write as the state change; `--note` is **required** on `review`, since `[?]` without its reason is what §2 exists to prevent.
 - All writes go through one parser/writer shared with the sidebar (see §6).
 
@@ -105,6 +106,11 @@ The same binary as the TUI. Subcommands are the machine interface to the feed:
   - `scripts/build.sh` runs `feedr skill install --refresh-only`, which refreshes copies that already exist and **never creates** them — so herdr's reinstall-to-update flow refreshes an installed skill, while `herdr plugin install` never plants files in `$HOME` unasked.
   - First install stays explicit and is documented two ways: `npx skills add Adroz/herdr-feedr -g` (agent-neutral primary) or `feedr skill install` (no Node needed). An AGENTS.md paste-in block is the fallback for runners without skill support.
 - Versioning: one number across crate, `herdr-plugin.toml`, and skill, stamped as a visible body line (`> Skill version 0.1.0 — requires feedr CLI >= 0.1.0.`) rather than a frontmatter key. `feedr skill status` reports each installed copy's path, stamped version, binary version, and OK/STALE; there are no ambient drift warnings. `tests/skill.rs` asserts that every `feedr ...` line in the skill parses against the real clap command, that every non-hidden subcommand appears in the skill, and that the three versions match.
+
+## 5a. Claim liveness and release (sidebar)
+
+- The `@agent` sub-line shows a **live marker** when that session appears in the herdr socket's agent list. Presence *is* liveness; the reported status only refines the glyph, so a live agent reporting an unknown status still reads as live. Absence of a marker asserts **nothing** — an agent working outside herdr, or a claim predating a herdr restart, is indistinguishable from a dead one, and the sidebar must not label either as dead.
+- The edit modal carries a **`[ Release ]` button**, shown only while the item is claimed, sitting between Cancel and Delete in both the button row and the tab ring. It needs no confirmation step (unlike Delete): releasing is reversible — re-claiming restores the link. The sidebar releases with human authority.
 
 ## 6. Concurrency ([#8](https://github.com/Adroz/herdr-feedr/issues/8), map fog)
 

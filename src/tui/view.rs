@@ -254,7 +254,7 @@ fn dim_backdrop(f: &mut Frame) {
 /// horizontally (see `sync_blocks` for the full rationale).
 fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
     let is_edit = m.original.is_some();
-    let layout = modal::edit_layout(f.area(), is_edit, m.dropdown_rows());
+    let layout = modal::edit_layout(f.area(), is_edit, m.claimed, m.dropdown_rows());
 
     // Re-derive each field's viewport from origin every frame: tui-textarea
     // only ever adjusts its viewport minimally to keep the cursor visible,
@@ -304,6 +304,14 @@ fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
         modal::CANCEL_LABEL,
         m.focus == EditFocus::Cancel,
     );
+    if let Some(release) = layout.release {
+        render_button(
+            f,
+            release,
+            modal::RELEASE_LABEL,
+            m.focus == EditFocus::Release,
+        );
+    }
     if let Some(delete) = layout.delete {
         render_button(f, delete, modal::DELETE_LABEL, m.focus == EditFocus::Delete);
     }
@@ -746,7 +754,7 @@ mod tests {
             "no real terminal cursor is ever placed any more"
         );
         let buf = render_buffer(&mut app, 60, 20);
-        let layout = modal::edit_layout(Rect::new(0, 0, 60, 20), false, 0);
+        let layout = modal::edit_layout(Rect::new(0, 0, 60, 20), false, false, 0);
         let inner = Block::bordered().inner(layout.category);
         assert!(
             buf[(inner.x, inner.y)]
@@ -767,7 +775,7 @@ mod tests {
         );
         assert_eq!(render_cursor(&mut app, 60, 20), None);
         let buf = render_buffer(&mut app, 60, 20);
-        let layout = modal::edit_layout(Rect::new(0, 0, 60, 20), false, 0);
+        let layout = modal::edit_layout(Rect::new(0, 0, 60, 20), false, false, 0);
         // Untouched textarea: cursor still at its origin (row 0, col 0).
         let title_inner = Block::bordered().inner(layout.title);
         assert!(
@@ -812,7 +820,7 @@ mod tests {
             "no real terminal cursor when a button is focused"
         );
         let buf = render_buffer(&mut app, 40, 12);
-        let layout = modal::edit_layout(Rect::new(0, 0, 40, 12), false, 0);
+        let layout = modal::edit_layout(Rect::new(0, 0, 40, 12), false, false, 0);
         for field in [layout.category, layout.title, layout.body] {
             let inner = Block::bordered().inner(field);
             assert!(
@@ -855,7 +863,7 @@ mod tests {
         m.body.insert_str(&long_line);
 
         let buf = render_buffer(&mut app, w, h);
-        let layout = modal::edit_layout(Rect::new(0, 0, w, h), false, 0);
+        let layout = modal::edit_layout(Rect::new(0, 0, w, h), false, false, 0);
         let inner = Block::bordered().inner(layout.body);
 
         let mut found = None;
@@ -940,7 +948,7 @@ mod tests {
         // form labels rather than a popup). Check both the border glyph
         // itself and its distinct accent color at the dropdown's own
         // corner, and the tinted background on a non-highlighted row.
-        let layout = modal::edit_layout(Rect::new(0, 0, 80, 24), false, m.dropdown_rows());
+        let layout = modal::edit_layout(Rect::new(0, 0, 80, 24), false, false, m.dropdown_rows());
         let corner = &buf[(layout.dropdown.x, layout.dropdown.y)];
         assert_eq!(
             corner.symbol(),
@@ -996,7 +1004,7 @@ mod tests {
         terminal.draw(|f| draw_edit_modal(f, &mut m)).unwrap();
         let buf = terminal.backend().buffer().clone();
 
-        let layout = modal::edit_layout(Rect::new(0, 0, w, h), true, 0);
+        let layout = modal::edit_layout(Rect::new(0, 0, w, h), true, false, 0);
         let inner = Block::bordered().inner(layout.body);
         let first_row: String = (inner.x..inner.x + inner.width)
             .map(|x| buf[(x, inner.y)].symbol().to_string())
@@ -1040,7 +1048,7 @@ mod tests {
         let mut wide = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
         wide.draw(|f| draw_edit_modal(f, &mut m)).unwrap();
         let buf = wide.backend().buffer().clone();
-        let layout = modal::edit_layout(Rect::new(0, 0, w, h), true, m.dropdown_rows());
+        let layout = modal::edit_layout(Rect::new(0, 0, w, h), true, false, m.dropdown_rows());
         let inner = Block::bordered().inner(layout.title);
         let row: String = (inner.x..inner.x + inner.width)
             .map(|x| buf[(x, inner.y)].symbol().to_string())
@@ -1087,7 +1095,7 @@ mod tests {
         app.apply(Action::OpenCreate);
         let (w, h) = (60, 20);
         let buf = render_buffer(&mut app, w, h);
-        let layout = modal::edit_layout(Rect::new(0, 0, w, h), false, 0);
+        let layout = modal::edit_layout(Rect::new(0, 0, w, h), false, false, 0);
 
         // Top-left corner is outside the centered 90%x80% panel.
         let outside = &buf[(0, 0)];

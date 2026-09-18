@@ -9,7 +9,7 @@
 //! The two outcomes that require a feed write (`Save`, `Delete`) are handed
 //! back to `App::handle_modal_event`, which alone holds `with_feed` access.
 
-use crate::feed::Item;
+use crate::feed::{Item, State};
 use crate::tui::app::ItemKey;
 use crate::tui::theme;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
@@ -39,6 +39,8 @@ pub enum EditFocus {
     Body,
     Save,
     Cancel,
+    /// Edit mode only, and only while the item is claimed.
+    Release,
     /// Edit mode only — create mode has no item to delete.
     Delete,
 }
@@ -46,6 +48,7 @@ pub enum EditFocus {
 pub const SAVE_LABEL: &str = "[ Save ]";
 pub const CANCEL_LABEL: &str = "[ Cancel ]";
 pub const DELETE_LABEL: &str = "[ Delete ]";
+pub const RELEASE_LABEL: &str = "[ Release ]";
 const BUTTON_GAP: u16 = 2;
 
 /// Visible dropdown rows are capped; the keyboard highlight is clamped to
@@ -67,6 +70,9 @@ pub struct EditModal {
     /// Keyboard highlight into `filtered()`; None = not in the list.
     pub dropdown: Option<usize>,
     pub focus: EditFocus,
+    /// The item is claimed (`[~]` + an `@agent` tag), so the modal offers to
+    /// release it. Always false in create mode — nothing to release yet.
+    pub claimed: bool,
     /// Text yanked by a Ctrl+C/Ctrl+X on the focused field, waiting to be
     /// pushed to the SYSTEM clipboard. `edit_step` stays pure (no process
     /// spawning), so it only records the text here; `App::handle_modal_event`
@@ -89,6 +95,7 @@ impl EditModal {
             suggestions,
             dropdown: None,
             focus: EditFocus::Category,
+            claimed: false,
             pending_clipboard: None,
         };
         m.sync_blocks();
@@ -120,6 +127,7 @@ impl EditModal {
             suggestions,
             dropdown: None,
             focus,
+            claimed: item.state == State::InProgress && item.agent.is_some(),
             pending_clipboard: None,
         };
         // Unfocused fields keep `TextArea::new`'s (0,0) cursor so they
@@ -143,8 +151,10 @@ impl EditModal {
             (EditFocus::Title, _) => EditFocus::Body,
             (EditFocus::Body, _) => EditFocus::Save,
             (EditFocus::Save, _) => EditFocus::Cancel,
+            (EditFocus::Cancel, true) if self.claimed => EditFocus::Release,
             (EditFocus::Cancel, true) => EditFocus::Delete,
             (EditFocus::Cancel, false) => EditFocus::Category,
+            (EditFocus::Release, _) => EditFocus::Delete,
             (EditFocus::Delete, _) => EditFocus::Category,
         };
         self.sync_blocks();
@@ -155,11 +165,13 @@ impl EditModal {
         let is_edit = self.original.is_some();
         self.focus = match (self.focus, is_edit) {
             (EditFocus::Category, true) => EditFocus::Delete,
+            (EditFocus::Release, _) => EditFocus::Cancel,
             (EditFocus::Category, false) => EditFocus::Cancel,
             (EditFocus::Title, _) => EditFocus::Category,
             (EditFocus::Body, _) => EditFocus::Title,
             (EditFocus::Save, _) => EditFocus::Body,
             (EditFocus::Cancel, _) => EditFocus::Save,
+            (EditFocus::Delete, _) if self.claimed => EditFocus::Release,
             (EditFocus::Delete, _) => EditFocus::Cancel,
         };
         self.sync_blocks();
@@ -179,7 +191,7 @@ impl EditModal {
             EditFocus::Category => &mut self.category,
             EditFocus::Title => &mut self.title,
             EditFocus::Body => &mut self.body,
-            EditFocus::Save | EditFocus::Cancel | EditFocus::Delete => return,
+            EditFocus::Save | EditFocus::Cancel | EditFocus::Delete | EditFocus::Release => return,
         };
         ta.cancel_selection();
         ta.move_cursor(CursorMove::Bottom);
@@ -324,7 +336,7 @@ impl EditModal {
 /// nor accept a suggestion the user cannot see (the rect may be clipped by
 /// `.intersection(term_area)` at degenerate sizes).
 fn visible_rows(m: &EditModal, area: Rect) -> usize {
-    edit_layout(area, m.original.is_some(), m.dropdown_rows())
+    edit_layout(area, m.original.is_some(), m.claimed, m.dropdown_rows())
         .dropdown_inner
         .height as usize
 }
@@ -360,6 +372,8 @@ pub struct EditLayout {
     pub cancel: Rect,
     /// `None` in create mode — nothing to delete yet.
     pub delete: Option<Rect>,
+    /// Present only while the modal's item is claimed.
+    pub release: Option<Rect>,
 }
 
 /// Percentage-centered rect within `area` (shared by the edit modal, the
@@ -399,7 +413,12 @@ pub(crate) fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
 /// being drawn into — the same rect that's later used to hit-test clicks
 /// (`edit_click`), so a clipped-away button also becomes unclickable rather
 /// than clickable-but-invisible.
-pub fn edit_layout(term_area: Rect, is_edit: bool, dropdown_rows: u16) -> EditLayout {
+pub fn edit_layout(
+    term_area: Rect,
+    is_edit: bool,
+    is_claimed: bool,
+    dropdown_rows: u16,
+) -> EditLayout {
     let outer = centered(term_area, 90, 80);
     let inner = Block::bordered().padding(Padding::uniform(1)).inner(outer);
     // Review follow-up (B1): at inner heights below 9 the constraint solver
@@ -444,6 +463,16 @@ pub fn edit_layout(term_area: Rect, is_edit: bool, dropdown_rows: u16) -> EditLa
     x = x
         .saturating_add(CANCEL_LABEL.len() as u16)
         .saturating_add(BUTTON_GAP);
+    // Release sits between Cancel and Delete: it's the non-destructive of the
+    // two item actions, and putting it left of Delete keeps Delete last — the
+    // furthest thing from a stray click on Save.
+    let release = (is_edit && is_claimed).then(|| {
+        let r = Rect::new(x, buttons.y, RELEASE_LABEL.len() as u16, 1).intersection(term_area);
+        x = x
+            .saturating_add(RELEASE_LABEL.len() as u16)
+            .saturating_add(BUTTON_GAP);
+        r
+    });
     let delete = is_edit
         .then(|| Rect::new(x, buttons.y, DELETE_LABEL.len() as u16, 1).intersection(term_area));
 
@@ -458,6 +487,7 @@ pub fn edit_layout(term_area: Rect, is_edit: bool, dropdown_rows: u16) -> EditLa
         save,
         cancel,
         delete,
+        release,
     }
 }
 
@@ -480,6 +510,7 @@ pub enum EditClickTarget {
     Body,
     Save,
     Cancel,
+    Release,
     Delete,
 }
 
@@ -517,6 +548,11 @@ pub fn edit_click(layout: &EditLayout, is_edit: bool, x: u16, y: u16) -> Option<
     if rect_contains(layout.cancel, x, y) {
         return Some(EditClickTarget::Cancel);
     }
+    if let Some(release) = layout.release {
+        if rect_contains(release, x, y) {
+            return Some(EditClickTarget::Release);
+        }
+    }
     if is_edit {
         if let Some(d) = layout.delete {
             if rect_contains(d, x, y) {
@@ -535,6 +571,9 @@ pub enum ModalStep {
     Continue(Modal),
     Save(EditModal),
     Delete(ItemKey),
+    /// Release the item's claim — reversible, so unlike Delete it needs no
+    /// confirmation step.
+    Release(ItemKey),
     /// The `FileView`'s `e` key: only `App` can turn this into an editor
     /// request (it needs `editor_cmd`/`status_msg`), so hand it back like
     /// `Save`/`Delete`.
@@ -631,7 +670,7 @@ fn focused_textarea_mut(m: &mut EditModal) -> Option<&mut TextArea<'static>> {
         EditFocus::Category => Some(&mut m.category),
         EditFocus::Title => Some(&mut m.title),
         EditFocus::Body => Some(&mut m.body),
-        EditFocus::Save | EditFocus::Cancel | EditFocus::Delete => None,
+        EditFocus::Save | EditFocus::Cancel | EditFocus::Delete | EditFocus::Release => None,
     }
 }
 
@@ -795,13 +834,18 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
             (KeyCode::Enter, _) if m.focus == EditFocus::Delete => {
                 return ModalStep::Continue(Modal::ConfirmDelete(m))
             }
+            (KeyCode::Enter, _) if m.focus == EditFocus::Release => {
+                if let Some(key) = m.original.clone() {
+                    return ModalStep::Release(key);
+                }
+            }
             _ => {}
         }
     }
     if let Event::Mouse(mev) = &ev {
         if mev.kind == MouseEventKind::Down(MouseButton::Left) {
             let is_edit = m.original.is_some();
-            let layout = edit_layout(area, is_edit, m.dropdown_rows());
+            let layout = edit_layout(area, is_edit, m.claimed, m.dropdown_rows());
             return match edit_click(&layout, is_edit, mev.column, mev.row) {
                 Some(EditClickTarget::Suggestion(row)) => {
                     m.accept_suggestion(row as usize);
@@ -842,6 +886,10 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                 Some(EditClickTarget::Save) => ModalStep::Save(m),
                 Some(EditClickTarget::Cancel) => ModalStep::Continue(Modal::None),
                 Some(EditClickTarget::Delete) => ModalStep::Continue(Modal::ConfirmDelete(m)),
+                Some(EditClickTarget::Release) => match m.original.clone() {
+                    Some(key) => ModalStep::Release(key),
+                    None => ModalStep::Continue(Modal::Edit(m)),
+                },
                 None => ModalStep::Continue(Modal::Edit(m)),
             };
         }
@@ -857,12 +905,14 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
         // rather than being mistaken for an already-extending selection.
         if mev.kind == MouseEventKind::Drag(MouseButton::Left) {
             let is_edit = m.original.is_some();
-            let layout = edit_layout(area, is_edit, m.dropdown_rows());
+            let layout = edit_layout(area, is_edit, m.claimed, m.dropdown_rows());
             let field_rect = match m.focus {
                 EditFocus::Category => Some(layout.category),
                 EditFocus::Title => Some(layout.title),
                 EditFocus::Body => Some(layout.body),
-                EditFocus::Save | EditFocus::Cancel | EditFocus::Delete => None,
+                EditFocus::Save | EditFocus::Cancel | EditFocus::Delete | EditFocus::Release => {
+                    None
+                }
             };
             if let Some(rect) = field_rect {
                 let inner = Block::bordered().inner(rect);
@@ -910,7 +960,7 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
         EditFocus::Body => {
             m.body.input(ev);
         }
-        EditFocus::Save | EditFocus::Cancel | EditFocus::Delete => {}
+        EditFocus::Save | EditFocus::Cancel | EditFocus::Delete | EditFocus::Release => {}
     }
     ModalStep::Continue(Modal::Edit(m))
 }
@@ -1031,8 +1081,8 @@ mod tests {
 
     #[test]
     fn edit_layout_has_no_delete_button_in_create_mode_and_one_in_edit_mode() {
-        assert!(edit_layout(TEST_AREA, false, 0).delete.is_none());
-        assert!(edit_layout(TEST_AREA, true, 0).delete.is_some());
+        assert!(edit_layout(TEST_AREA, false, false, 0).delete.is_none());
+        assert!(edit_layout(TEST_AREA, true, false, 0).delete.is_some());
     }
 
     /// Crash regression: at narrow widths (e.g. the ~30-col pane herdr docks
@@ -1063,7 +1113,7 @@ mod tests {
                 let area = Rect::new(0, 0, width, height);
                 for is_edit in [false, true] {
                     for dropdown_rows in [0u16, 5] {
-                        let layout = edit_layout(area, is_edit, dropdown_rows);
+                        let layout = edit_layout(area, is_edit, false, dropdown_rows);
                         for (name, r) in [("save", layout.save), ("cancel", layout.cancel)] {
                             assert!(
                                 r.is_empty() || r.right() <= area.width,
@@ -1097,7 +1147,7 @@ mod tests {
     /// create; clicking Title or Body moves focus there directly.
     #[test]
     fn clicking_title_or_body_moves_focus_there() {
-        let layout = edit_layout(TEST_AREA, false, 0);
+        let layout = edit_layout(TEST_AREA, false, false, 0);
         let mut m = create_modal();
         assert_eq!(m.focus, EditFocus::Category);
         m.cycle_focus(); // -> Title
@@ -1120,7 +1170,7 @@ mod tests {
 
     #[test]
     fn clicking_save_button_saves() {
-        let layout = edit_layout(TEST_AREA, false, 0);
+        let layout = edit_layout(TEST_AREA, false, false, 0);
         let m = create_modal();
         let result = step(
             Modal::Edit(m),
@@ -1132,7 +1182,7 @@ mod tests {
 
     #[test]
     fn clicking_cancel_button_closes_modal() {
-        let layout = edit_layout(TEST_AREA, false, 0);
+        let layout = edit_layout(TEST_AREA, false, false, 0);
         let m = create_modal();
         let result = step(
             Modal::Edit(m),
@@ -1144,7 +1194,7 @@ mod tests {
 
     #[test]
     fn clicking_delete_button_opens_confirm_delete() {
-        let layout = edit_layout(TEST_AREA, true, 0);
+        let layout = edit_layout(TEST_AREA, true, false, 0);
         let m = edit_modal();
         let delete = layout.delete.expect("edit mode has a delete button");
         let result = step(Modal::Edit(m), click(delete.x, delete.y), TEST_AREA);
@@ -1254,7 +1304,7 @@ mod tests {
     /// "usable" down to this floor, not below it.
     #[test]
     fn short_pane_collapses_category_keeps_title_usable() {
-        let l = edit_layout(Rect::new(0, 0, 30, 14), false, 0);
+        let l = edit_layout(Rect::new(0, 0, 30, 14), false, false, 0);
         assert_eq!(l.category.height, 0, "category collapses on short panes");
         assert!(
             l.title.height >= 3,
@@ -1267,13 +1317,13 @@ mod tests {
     /// a short-pane-only concession.
     #[test]
     fn tall_pane_keeps_category_at_full_height() {
-        let l = edit_layout(TEST_AREA, false, 0);
+        let l = edit_layout(TEST_AREA, false, false, 0);
         assert_eq!(l.category.height, 3);
     }
 
     #[test]
     fn layout_stacks_category_above_title_and_sizes_dropdown() {
-        let l = edit_layout(TEST_AREA, false, 3);
+        let l = edit_layout(TEST_AREA, false, false, 3);
         assert!(l.category.y < l.title.y && l.title.y < l.body.y);
         // Bordered box: 3 suggestion rows + top/bottom border = 5.
         assert_eq!(l.dropdown.height, 5);
@@ -1284,14 +1334,14 @@ mod tests {
             l.dropdown.y + 1,
             "inner area starts past the top border"
         );
-        let l0 = edit_layout(TEST_AREA, false, 0);
+        let l0 = edit_layout(TEST_AREA, false, false, 0);
         assert_eq!(l0.dropdown.height, 0, "closed dropdown draws no border");
         assert_eq!(l0.dropdown_inner.height, 0);
     }
 
     #[test]
     fn clicks_hit_category_and_dropdown_rows() {
-        let l = edit_layout(TEST_AREA, false, 2);
+        let l = edit_layout(TEST_AREA, false, false, 2);
         assert_eq!(
             edit_click(&l, false, l.category.x + 1, l.category.y + 1),
             Some(EditClickTarget::Category)
@@ -1311,11 +1361,97 @@ mod tests {
             None,
             "a border click on the dropdown must be a no-op"
         );
-        let l0 = edit_layout(TEST_AREA, false, 0);
+        let l0 = edit_layout(TEST_AREA, false, false, 0);
         assert_eq!(
             edit_click(&l0, false, l0.title.x + 1, l0.title.y + 1),
             Some(EditClickTarget::Title)
         );
+    }
+
+    fn claimed_item() -> (ItemKey, Item) {
+        let item = Item {
+            state: State::InProgress,
+            title: "Migrate CI".into(),
+            agent: Some(crate::feed::AgentRef::parse("claude:sess-1").unwrap()),
+            done_date: None,
+            body: Vec::new(),
+        };
+        let key = ItemKey {
+            title: "Migrate CI".into(),
+            state: State::InProgress,
+        };
+        (key, item)
+    }
+
+    #[test]
+    fn a_claimed_item_opens_with_a_release_button() {
+        let (key, item) = claimed_item();
+        let m = EditModal::edit(key, &item, None, vec![]);
+        assert!(m.claimed);
+        assert!(edit_layout(TEST_AREA, true, m.claimed, 0).release.is_some());
+    }
+
+    #[test]
+    fn an_unclaimed_item_offers_no_release_button() {
+        let item = Item {
+            state: State::Open,
+            title: "T".into(),
+            agent: None,
+            done_date: None,
+            body: Vec::new(),
+        };
+        let key = ItemKey {
+            title: "T".into(),
+            state: State::Open,
+        };
+        let m = EditModal::edit(key, &item, None, vec![]);
+        assert!(!m.claimed);
+        assert!(edit_layout(TEST_AREA, true, m.claimed, 0).release.is_none());
+    }
+
+    #[test]
+    fn create_mode_never_offers_release() {
+        let m = EditModal::create(vec![]);
+        assert!(!m.claimed);
+        assert!(edit_layout(TEST_AREA, false, m.claimed, 0)
+            .release
+            .is_none());
+    }
+
+    #[test]
+    fn the_release_button_does_not_overlap_delete() {
+        let layout = edit_layout(TEST_AREA, true, true, 0);
+        let release = layout.release.unwrap();
+        let delete = layout.delete.unwrap();
+        assert!(
+            release.x + release.width <= delete.x,
+            "release {release:?} must sit left of delete {delete:?}"
+        );
+    }
+
+    #[test]
+    fn clicking_release_hits_the_release_target() {
+        let layout = edit_layout(TEST_AREA, true, true, 0);
+        let r = layout.release.unwrap();
+        assert_eq!(
+            edit_click(&layout, true, r.x + 1, r.y),
+            Some(EditClickTarget::Release)
+        );
+    }
+
+    #[test]
+    fn clicking_release_asks_the_app_to_release_the_claim() {
+        let (key, item) = claimed_item();
+        let m = EditModal::edit(key.clone(), &item, None, vec![]);
+        let layout = edit_layout(TEST_AREA, true, m.claimed, 0);
+        let r = layout.release.unwrap();
+
+        let step = step(Modal::Edit(m), click(r.x + 1, r.y), TEST_AREA);
+
+        match step {
+            ModalStep::Release(k) => assert_eq!(k, key),
+            _ => panic!("clicking Release must ask the app to release the claim"),
+        }
     }
 
     #[test]
@@ -1417,7 +1553,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let mut m = EditModal::create(names);
-        let visible = edit_layout(tiny, false, m.dropdown_rows())
+        let visible = edit_layout(tiny, false, false, m.dropdown_rows())
             .dropdown_inner
             .height as usize;
         assert!(
@@ -1641,7 +1777,7 @@ mod tests {
         let m = EditModal::create(vec!["Work".into(), "Chores".into()]);
         let m = step_edit(m, key(KeyCode::Down)); // dropdown open
         assert_eq!(m.dropdown, Some(0));
-        let layout = edit_layout(TEST_AREA, false, m.dropdown_rows());
+        let layout = edit_layout(TEST_AREA, false, false, m.dropdown_rows());
         // The dropdown's bordered box shares Category/Title's width and, for
         // 2 suggestions, is taller than Title's own 3 rows — it overlays
         // all of Title and spills one row into Body. Click just past where
@@ -1658,7 +1794,7 @@ mod tests {
     fn click_on_suggestion_accepts_it() {
         let m = EditModal::create(vec!["Work".into(), "Chores".into()]);
         let m = step_edit(m, key(KeyCode::Down)); // dropdown open (2 rows)
-        let l = edit_layout(TEST_AREA, false, m.dropdown_rows());
+        let l = edit_layout(TEST_AREA, false, false, m.dropdown_rows());
         let m = step_edit(m, click(l.dropdown_inner.x, l.dropdown_inner.y + 1));
         assert_eq!(m.category_text(), "Chores");
         assert_eq!(m.dropdown, None);
@@ -1717,7 +1853,7 @@ mod tests {
     fn clicking_body_text_places_cursor_at_the_clicked_character() {
         let mut m = create_modal();
         m.body = TextArea::new(vec!["hello world".to_string()]);
-        let layout = edit_layout(TEST_AREA, false, 0);
+        let layout = edit_layout(TEST_AREA, false, false, 0);
         let inner = Block::bordered().inner(layout.body);
         // Column 6 is the 'w' of "world" ("hello " is 6 columns wide).
         let m = step_edit(m, click(inner.x + 6, inner.y));
@@ -1729,7 +1865,7 @@ mod tests {
     fn clicking_past_end_of_body_text_clamps_cursor_to_line_end() {
         let mut m = create_modal();
         m.body = TextArea::new(vec!["hello world".to_string()]);
-        let layout = edit_layout(TEST_AREA, false, 0);
+        let layout = edit_layout(TEST_AREA, false, false, 0);
         let inner = Block::bordered().inner(layout.body);
         // Last column of the (much wider than the text) inner rect — well
         // past "hello world"'s 11 characters, but still inside the field so
@@ -1751,7 +1887,7 @@ mod tests {
         let mut m = create_modal();
         m.body = TextArea::new(vec!["hello world".to_string()]);
         m.body.move_cursor(CursorMove::Jump(0, 5));
-        let layout = edit_layout(TEST_AREA, false, 0);
+        let layout = edit_layout(TEST_AREA, false, false, 0);
         // layout.body's own (x, y) is the top-left corner of its border.
         let m = step_edit(m, click(layout.body.x, layout.body.y));
         assert_eq!(m.focus, EditFocus::Body);
@@ -1767,7 +1903,7 @@ mod tests {
         let mut m = create_modal();
         m.category = TextArea::new(vec!["alpha beta".to_string()]);
         m.dropdown = Some(0); // simulate an open dropdown highlight
-        let layout = edit_layout(TEST_AREA, false, 0);
+        let layout = edit_layout(TEST_AREA, false, false, 0);
         let inner = Block::bordered().inner(layout.category);
         // Column 6 is the 'b' of "beta" ("alpha " is 6 columns wide).
         let m = step_edit(m, click(inner.x + 6, inner.y));
@@ -1877,7 +2013,7 @@ mod tests {
     fn dragging_in_body_selects_the_dragged_span() {
         let mut m = create_modal();
         m.body = TextArea::new(vec!["hello world".to_string()]);
-        let layout = edit_layout(TEST_AREA, false, 0);
+        let layout = edit_layout(TEST_AREA, false, false, 0);
         let inner = Block::bordered().inner(layout.body);
         // Down at col 0 focuses Body and anchors the (not-yet-started)
         // cursor at (0, 0).
@@ -1904,7 +2040,7 @@ mod tests {
         m.body.move_cursor(CursorMove::Forward);
         assert!(m.body.selection_range().is_some());
 
-        let layout = edit_layout(TEST_AREA, false, 0);
+        let layout = edit_layout(TEST_AREA, false, false, 0);
         let inner = Block::bordered().inner(layout.body);
         let m = step_edit(m, click(inner.x + 3, inner.y));
         assert_eq!(

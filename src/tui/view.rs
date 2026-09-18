@@ -547,6 +547,65 @@ mod tests {
     /// A live session whose status herdr reports as Unknown must still read as
     /// live: without this it renders exactly like a claim whose agent is gone,
     /// which is the one distinction the sub-line exists to make.
+    /// The bug this fixes: a long body line scrolled sideways behind a
+    /// horizontal scrollbar instead of wrapping. Asserts the RENDERED buffer,
+    /// not the widget's configuration — the socket regression taught that a
+    /// setting can look right while the surface stays wrong.
+    #[test]
+    fn a_long_body_line_renders_across_several_wrapped_rows() {
+        let item = crate::feed::Item {
+            state: State::Open,
+            title: "T".into(),
+            agent: None,
+            done_date: None,
+            body: vec![
+                "the quick brown fox jumps over the lazy dog and keeps running well past \
+                 the right edge of this field"
+                    .into(),
+            ],
+        };
+        let key = crate::tui::app::ItemKey {
+            title: "T".into(),
+            state: State::Open,
+        };
+        let mut m = modal::EditModal::edit(key, &item, None, vec![]);
+
+        let (w, h) = (60, 24);
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw_edit_modal(f, &mut m)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let layout = modal::edit_layout(Rect::new(0, 0, w, h), true, false, m.dropdown_rows());
+        let inner = Block::bordered().inner(layout.body);
+
+        let rows: Vec<String> = (inner.y..inner.y + inner.height)
+            .map(|y| {
+                (inner.x..inner.x + inner.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        let filled: Vec<&String> = rows.iter().filter(|r| !r.is_empty()).collect();
+
+        assert!(
+            filled.len() >= 2,
+            "a line wider than the field must occupy several rows, got {rows:?}"
+        );
+        assert!(
+            filled[0].contains("the quick brown fox"),
+            "first row should start the line, got {:?}",
+            filled[0]
+        );
+        assert!(
+            filled.iter().any(|r| r.contains("running")
+                || r.contains("past")
+                || r.contains("edge")),
+            "later text must appear on a following row, not scrolled away: {rows:?}"
+        );
+    }
+
     #[test]
     fn a_live_agent_with_unknown_status_still_shows_a_live_marker() {
         let mut app = app_with(SAMPLE);

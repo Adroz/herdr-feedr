@@ -16,7 +16,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Padding};
-use tui_textarea::{CursorMove, TextArea};
+use tui_textarea::{CursorMove, TextArea, WrapMode};
 
 pub enum Modal {
     None,
@@ -98,6 +98,10 @@ impl EditModal {
             claimed: false,
             pending_clipboard: None,
         };
+        // Bodies are prose: wrap them. Title and category stay unwrapped —
+        // they're single-line fields in a 3-row box, where a wrapped second
+        // visual row would push the text out of view.
+        m.body.set_wrap_mode(WrapMode::Word);
         m.sync_blocks();
         m
     }
@@ -137,6 +141,7 @@ impl EditModal {
         // first frame is safe because `view::draw_edit_modal` re-derives
         // every field's viewport from origin each frame — the scroll can no
         // longer stick from a transient early width.
+        m.body.set_wrap_mode(WrapMode::Word);
         m.sync_blocks();
         m.park_focused_field_at_end();
         m
@@ -1381,6 +1386,40 @@ mod tests {
             state: State::InProgress,
         };
         (key, item)
+    }
+
+    /// Item bodies are prose, so a long line belongs wrapped inside the field
+    /// rather than scrolled sideways behind a horizontal scrollbar.
+    #[test]
+    fn the_body_field_soft_wraps_instead_of_scrolling_sideways() {
+        let m = EditModal::create(vec![]);
+        assert_eq!(m.body.wrap_mode(), WrapMode::Word);
+    }
+
+    #[test]
+    fn an_edited_body_wraps_too() {
+        let item = Item {
+            state: State::Open,
+            title: "T".into(),
+            agent: None,
+            done_date: None,
+            body: vec!["a very long line of prose that would otherwise scroll".into()],
+        };
+        let key = ItemKey {
+            title: "T".into(),
+            state: State::Open,
+        };
+        let m = EditModal::edit(key, &item, None, vec![]);
+        assert_eq!(m.body.wrap_mode(), WrapMode::Word);
+    }
+
+    /// Title and category are single-line by nature: wrapping them would turn
+    /// one logical line into two visual rows inside a 3-row bordered box.
+    #[test]
+    fn single_line_fields_do_not_wrap() {
+        let m = EditModal::create(vec![]);
+        assert_eq!(m.title.wrap_mode(), WrapMode::None);
+        assert_eq!(m.category.wrap_mode(), WrapMode::None);
     }
 
     #[test]

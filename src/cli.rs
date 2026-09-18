@@ -33,6 +33,14 @@ enum Cmd {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Release a claim: clear the @agent tag and put the item back to [ ]
+    Unclaim {
+        item: String,
+        /// Assert human authority — release someone else's claim (the sidebar
+        /// and you use this; agents release only their own).
+        #[arg(long)]
+        as_human: bool,
+    },
     /// Print the agent ref this session claims as, and where it came from
     Whoami,
     /// Add an item
@@ -242,6 +250,18 @@ pub fn run() -> Result<()> {
             let id = identity::resolve(agent.as_deref(), &identity::SystemEnv, &mut runner)?;
             let i = ops::find(&doc, &item)?;
             ops::claim(&mut doc, i, id.agent);
+            write::save_atomic(&doc, &path)?;
+        }
+        Cmd::Unclaim { item, as_human } => {
+            let by = if as_human {
+                ops::Unclaimer::Human
+            } else {
+                let mut runner = crate::tui::dock::HerdrCli::from_env();
+                let id = identity::resolve(None, &identity::SystemEnv, &mut runner)?;
+                ops::Unclaimer::Agent(id.agent)
+            };
+            let i = ops::find(&doc, &item)?;
+            ops::unclaim(&mut doc, i, &by)?;
             write::save_atomic(&doc, &path)?;
         }
         Cmd::Add {

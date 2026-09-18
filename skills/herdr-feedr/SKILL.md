@@ -68,6 +68,23 @@ feedr add "Backfill the migration test" --agent-owned --body "Found while fixing
 the human's. Drop the flag only when you're recording something on the human's behalf at their
 request.
 
+## Giving an item back
+
+If you can't finish what you claimed — wrong agent for the job, blocked on something outside
+your reach, the human redirected you — release it rather than leaving it claimed:
+
+```sh
+feedr unclaim auth
+```
+
+That clears your tag and puts the item back to `[ ]`, so it reads as takeable again. A claim you
+walk away from silently is worse than no claim: it tells everyone the work is in hand when it
+isn't.
+
+You may release **only items you claimed yourself** — releasing another agent's claim fails, and
+`--as-human` is the human's flag, not yours. Once you've handed work back with `review`, the tag
+stops being a lock and becomes the record of who did the work, so there's nothing left to release.
+
 ## Finishing
 
 Who may close an item depends on who created it.

@@ -26,6 +26,10 @@ pub enum OpError {
     Reserved(String),
     #[error("section name required")]
     EmptyName,
+    #[error("\"{0}\" isn't claimed")]
+    NotClaimed(String),
+    #[error("\"{0}\" is claimed by {1} — only they (or you, with --as-human) can release it")]
+    NotYours(String, AgentRef),
 }
 
 pub fn zone_of(doc: &Document, index: usize) -> Zone {
@@ -567,6 +571,41 @@ pub fn append_note(doc: &mut Document, index: usize, notes: &[String]) {
     }
 }
 
+/// Who is releasing a claim. An agent may release only its own (SPEC §2's
+/// provenance rule, applied to claims); the human releases anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unclaimer {
+    Human,
+    Agent(AgentRef),
+}
+
+/// Release a claim: clear the `@agent` tag and put the item back to `[ ]` so
+/// it reads as takeable again. Only an in-progress item can be released —
+/// once work has been handed back (`[?]`) or closed (`[x]`), the tag is the
+/// record of who did it, not a lock to release.
+pub fn unclaim(doc: &mut Document, index: usize, by: &Unclaimer) -> Result<(), OpError> {
+    debug_assert!(matches!(doc.nodes[index], Node::Item(_)));
+    let Node::Item(it) = &doc.nodes[index] else {
+        return Ok(());
+    };
+    // "Claimed" means in-progress with a tag: a [?] or [x] carries its tag as
+    // a record of who did the work, and there's no lock left to release.
+    let holder = match (&it.agent, it.state) {
+        (Some(a), State::InProgress) => a.clone(),
+        _ => return Err(OpError::NotClaimed(it.title.clone())),
+    };
+    if let Unclaimer::Agent(me) = by {
+        if me != &holder {
+            return Err(OpError::NotYours(it.title.clone(), holder));
+        }
+    }
+    if let Node::Item(it) = &mut doc.nodes[index] {
+        it.state = State::Open;
+        it.agent = None;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,6 +681,83 @@ mod tests {
         append_note(&mut doc, i, &["evidence here".to_string()]);
 
         assert!(render(&doc).contains("  evidence here\n"));
+    }
+
+    fn claimed_sample() -> Document {
+        let mut doc = parse(SAMPLE);
+        let i = find(&doc, "Fix auth").unwrap();
+        claim(&mut doc, i, AgentRef::parse("claude:sess-1").unwrap());
+        doc
+    }
+
+    #[test]
+    fn the_human_releases_a_claim_and_the_item_reads_as_takeable_again() {
+        let mut doc = claimed_sample();
+        let i = find(&doc, "Fix auth").unwrap();
+
+        unclaim(&mut doc, i, &Unclaimer::Human).unwrap();
+
+        let Node::Item(it) = &doc.nodes[i] else {
+            panic!("not an item")
+        };
+        assert_eq!(it.state, State::Open);
+        assert_eq!(it.agent, None);
+    }
+
+    #[test]
+    fn an_agent_releases_its_own_claim() {
+        let mut doc = claimed_sample();
+        let i = find(&doc, "Fix auth").unwrap();
+        let me = AgentRef::parse("claude:sess-1").unwrap();
+
+        unclaim(&mut doc, i, &Unclaimer::Agent(me)).unwrap();
+
+        let Node::Item(it) = &doc.nodes[i] else {
+            panic!("not an item")
+        };
+        assert_eq!(it.agent, None);
+    }
+
+    #[test]
+    fn an_agent_cannot_release_another_agents_claim() {
+        let mut doc = claimed_sample();
+        let before = render(&doc);
+        let i = find(&doc, "Fix auth").unwrap();
+        let other = AgentRef::parse("codex:sess-2").unwrap();
+
+        let err = unclaim(&mut doc, i, &Unclaimer::Agent(other)).unwrap_err();
+
+        assert!(matches!(err, OpError::NotYours(..)), "{err:?}");
+        assert_eq!(
+            render(&doc),
+            before,
+            "a refused release must not touch the feed"
+        );
+    }
+
+    #[test]
+    fn releasing_an_unclaimed_item_is_an_error() {
+        let mut doc = parse(SAMPLE);
+        let i = find(&doc, "Write onboarding doc").unwrap();
+
+        let err = unclaim(&mut doc, i, &Unclaimer::Human).unwrap_err();
+
+        assert!(matches!(err, OpError::NotClaimed(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_handed_back_item_keeps_its_tag_as_a_record() {
+        let mut doc = claimed_sample();
+        let i = find(&doc, "Fix auth").unwrap();
+        set_state(&mut doc, i, State::Review, Authority::Agent).unwrap();
+
+        let err = unclaim(&mut doc, i, &Unclaimer::Human).unwrap_err();
+
+        assert!(matches!(err, OpError::NotClaimed(_)), "{err:?}");
+        let Node::Item(it) = &doc.nodes[i] else {
+            panic!("not an item")
+        };
+        assert!(it.agent.is_some(), "the tag records who did the work");
     }
 
     #[test]

@@ -609,3 +609,66 @@ fn skill_status_says_so_when_nothing_is_installed() {
         .success()
         .stdout(contains("not installed"));
 }
+
+#[test]
+fn an_agent_unclaims_its_own_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    feedr_bare_env(&feed)
+        .env("CLAUDE_CODE_SESSION_ID", "sess-42")
+        .args(["claim", "auth"])
+        .assert()
+        .success();
+    feedr_bare_env(&feed)
+        .env("CLAUDE_CODE_SESSION_ID", "sess-42")
+        .args(["unclaim", "auth"])
+        .assert()
+        .success();
+    let text = std::fs::read_to_string(&feed).unwrap();
+    assert!(text.contains("[ ] Fix auth redirect loop"));
+    assert!(!text.contains("@agent"), "the tag should be gone: {text}");
+}
+
+#[test]
+fn an_agent_cannot_unclaim_someone_elses_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    feedr_bare_env(&feed)
+        .args(["claim", "auth", "--agent", "claude:sess-1"])
+        .assert()
+        .success();
+    let before = std::fs::read_to_string(&feed).unwrap();
+    feedr_bare_env(&feed)
+        .env("CLAUDE_CODE_SESSION_ID", "sess-99")
+        .args(["unclaim", "auth"])
+        .assert()
+        .failure()
+        .stderr(contains("claude:sess-1"));
+    assert_eq!(std::fs::read_to_string(&feed).unwrap(), before);
+}
+
+#[test]
+fn the_human_unclaims_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    feedr_bare_env(&feed)
+        .args(["claim", "auth", "--agent", "claude:sess-1"])
+        .assert()
+        .success();
+    feedr_bare_env(&feed)
+        .args(["unclaim", "auth", "--as-human"])
+        .assert()
+        .success();
+    assert!(!std::fs::read_to_string(&feed).unwrap().contains("@agent"));
+}
+
+#[test]
+fn unclaiming_an_unclaimed_item_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    feedr_bare_env(&feed)
+        .args(["unclaim", "auth", "--as-human"])
+        .assert()
+        .failure()
+        .stderr(contains("isn't claimed"));
+}

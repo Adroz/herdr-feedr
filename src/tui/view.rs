@@ -383,7 +383,11 @@ fn row_line(app: &App, row: &Row, w: usize) -> Line<'static> {
         }
         Row::AgentLine { agent, .. } => {
             let status = app.statuses.get(&agent.id).map(|i| i.status);
-            let glyph_char = status.and_then(status_glyph);
+            // Presence in `statuses` IS liveness; the status only refines it.
+            // An Unknown status must not fall back to "no marker", or a live
+            // agent reads exactly like one that's gone (spec §3: absence of a
+            // marker is neutral, never an assertion that the agent is dead).
+            let glyph_char = status.and_then(|s| status_glyph(s).or(Some('·')));
             let glyph = glyph_char.map(|g| format!(" {g}")).unwrap_or_default();
             let kind = ellipsize(&agent.kind, w.saturating_sub(4 + glyph.chars().count()));
             let mut spans = vec![Span::styled(format!("  @{kind}"), theme::agent_subline())];
@@ -530,6 +534,25 @@ mod tests {
         assert_eq!(line.spans[1].style, theme::item_glyph(State::InProgress));
         assert_eq!(line.spans[2].content, "] ");
         assert_eq!(line.spans[2].style, theme::normal_text());
+    }
+
+    /// A live session whose status herdr reports as Unknown must still read as
+    /// live: without this it renders exactly like a claim whose agent is gone,
+    /// which is the one distinction the sub-line exists to make.
+    #[test]
+    fn a_live_agent_with_unknown_status_still_shows_a_live_marker() {
+        let mut app = app_with(SAMPLE);
+        app.statuses.insert(
+            "0198f3ab".to_string(),
+            AgentInfo {
+                pane_id: "w1:p1".into(),
+                kind: "claude".into(),
+                session_id: "0198f3ab".into(),
+                status: AgentStatus::Unknown,
+            },
+        );
+        let rows = render_to_strings(&mut app, 20, 12);
+        assert_eq!(rows[3], "  @claude ·");
     }
 
     #[test]

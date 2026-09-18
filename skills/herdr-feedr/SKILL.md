@@ -41,6 +41,8 @@ feedr list
 feedr show auth
 ```
 
+A claimed item's tag reads `@claude:abc (live)` when herdr can currently see that session. **No marker means "not visible", not "dead"** — an agent working outside herdr looks identical to one that's gone, so treat an unmarked claim as taken unless the human says otherwise.
+
 `show` takes any unambiguous substring of the title and prints the item's body — the context
 the human left for whoever picks it up. Read it before starting.
 

@@ -110,6 +110,7 @@ The same binary as the TUI. Subcommands are the machine interface to the feed:
 ## 5a. Claim liveness and release (sidebar)
 
 - The `@agent` sub-line shows a **live marker** when that session appears in the herdr socket's agent list. Presence *is* liveness; the reported status only refines the glyph, so a live agent reporting an unknown status still reads as live. Absence of a marker asserts **nothing** — an agent working outside herdr, or a claim predating a herdr restart, is indistinguishable from a dead one, and the sidebar must not label either as dead.
+- `feedr list` and `feedr show` print the same signal as text: a claimed item's tag reads `@claude:abc (live)` when the socket confirms that session. Agents read the feed through the CLI and never see the sidebar, so the marker has to reach them there. The socket is consulted only inside herdr (`HERDR_ENV`), and any failure means no marker — liveness is a hint, never a reason for `list` to fail or hang.
 - The edit modal carries a **`[ Release ]` button**, shown only while the item is claimed, sitting between Cancel and Delete in both the button row and the tab ring. It needs no confirmation step (unlike Delete): releasing is reversible — re-claiming restores the link. The sidebar releases with human authority.
 
 ## 6. Concurrency ([#8](https://github.com/Adroz/herdr-feedr/issues/8), map fog)

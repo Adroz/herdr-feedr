@@ -2,11 +2,13 @@ use crate::config;
 use crate::feed::ops::{self, Authority, Zone};
 use crate::feed::parse::parse;
 use crate::feed::write;
+use crate::feed::AgentRef;
 use crate::feed::{Node, State};
 use crate::identity;
 use crate::skill;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -162,6 +164,34 @@ fn run_skill(command: &SkillCmd) -> Result<()> {
     Ok(())
 }
 
+/// Session ids herdr can currently see, for the `(live)` marker on a claimed
+/// item (SPEC §5a). Only consulted inside herdr — outside it there's no socket
+/// to answer — and any failure yields an empty set, never an error: liveness
+/// is a hint, and `list` must stay usable when herdr isn't there.
+fn live_sessions(
+    env: &dyn identity::Env,
+    herdr: &mut dyn crate::tui::socket::Herdr,
+) -> HashSet<String> {
+    if env.get("HERDR_ENV").is_none() {
+        return HashSet::new();
+    }
+    herdr
+        .list_agents()
+        .map(|agents| agents.into_iter().map(|a| a.session_id).collect())
+        .unwrap_or_default()
+}
+
+/// One item's agent suffix: the tag, plus `(live)` only when herdr confirms
+/// that session. Absence asserts nothing — an agent working outside herdr is
+/// indistinguishable from one that's gone (SPEC §5a).
+fn agent_suffix(agent: Option<&AgentRef>, live: &HashSet<String>) -> String {
+    match agent {
+        None => String::new(),
+        Some(a) if live.contains(&a.id) => format!("  @{a} (live)"),
+        Some(a) => format!("  @{a}"),
+    }
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let path = config::resolve_feed_path(
@@ -217,17 +247,15 @@ pub fn run() -> Result<()> {
 
     match cli.command {
         Cmd::List => {
+            let mut herdr = crate::tui::socket::UnixSocketClient::from_env();
+            let live = live_sessions(&identity::SystemEnv, &mut herdr);
             for (i, node) in doc.nodes.iter().enumerate() {
                 match node {
                     Node::Heading { level: 2, text } if ops::zone_of(&doc, i) != Zone::Archive => {
                         println!("{text}:");
                     }
                     Node::Item(it) if ops::zone_of(&doc, i) != Zone::Archive => {
-                        let agent = it
-                            .agent
-                            .as_ref()
-                            .map(|a| format!("  @{a}"))
-                            .unwrap_or_default();
+                        let agent = agent_suffix(it.agent.as_ref(), &live);
                         println!("[{}] {}{agent}", it.state.to_char(), it.title);
                     }
                     _ => {}
@@ -235,9 +263,12 @@ pub fn run() -> Result<()> {
             }
         }
         Cmd::Show { item } => {
+            let mut herdr = crate::tui::socket::UnixSocketClient::from_env();
+            let live = live_sessions(&identity::SystemEnv, &mut herdr);
             let i = ops::find(&doc, &item)?;
             if let Node::Item(it) = &doc.nodes[i] {
-                println!("[{}] {}", it.state.to_char(), it.title);
+                let agent = agent_suffix(it.agent.as_ref(), &live);
+                println!("[{}] {}{agent}", it.state.to_char(), it.title);
                 for b in &it.body {
                     println!("  {b}");
                 }
@@ -315,4 +346,90 @@ pub fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::socket::{AgentInfo, AgentStatus, FakeHerdr};
+
+    struct Env(Vec<(&'static str, &'static str)>);
+    impl identity::Env for Env {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    fn agent(id: &str) -> AgentRef {
+        AgentRef::parse(&format!("claude:{id}")).unwrap()
+    }
+
+    #[test]
+    fn a_confirmed_session_is_marked_live() {
+        let live: HashSet<String> = ["sess-1".to_string()].into_iter().collect();
+        assert_eq!(
+            agent_suffix(Some(&agent("sess-1")), &live),
+            "  @claude:sess-1 (live)"
+        );
+    }
+
+    #[test]
+    fn an_unconfirmed_session_gets_the_tag_but_no_claim_about_it() {
+        let live: HashSet<String> = ["sess-1".to_string()].into_iter().collect();
+        assert_eq!(agent_suffix(Some(&agent("gone")), &live), "  @claude:gone");
+    }
+
+    #[test]
+    fn an_unclaimed_item_has_no_suffix() {
+        assert_eq!(agent_suffix(None, &HashSet::new()), "");
+    }
+
+    #[test]
+    fn outside_herdr_no_socket_call_is_made() {
+        let mut herdr = FakeHerdr {
+            agents: vec![AgentInfo {
+                pane_id: "w1:p1".into(),
+                kind: "claude".into(),
+                session_id: "sess-1".into(),
+                status: AgentStatus::Working,
+            }],
+            ..Default::default()
+        };
+
+        let live = live_sessions(&Env(vec![]), &mut herdr);
+
+        assert!(live.is_empty(), "no HERDR_ENV means no socket to ask");
+    }
+
+    #[test]
+    fn inside_herdr_the_live_set_comes_from_the_socket() {
+        let mut herdr = FakeHerdr {
+            agents: vec![AgentInfo {
+                pane_id: "w1:p1".into(),
+                kind: "claude".into(),
+                session_id: "sess-1".into(),
+                status: AgentStatus::Working,
+            }],
+            ..Default::default()
+        };
+
+        let live = live_sessions(&Env(vec![("HERDR_ENV", "1")]), &mut herdr);
+
+        assert!(live.contains("sess-1"));
+    }
+
+    #[test]
+    fn a_socket_failure_is_silently_no_liveness() {
+        let mut herdr = FakeHerdr {
+            fail: true,
+            ..Default::default()
+        };
+
+        let live = live_sessions(&Env(vec![("HERDR_ENV", "1")]), &mut herdr);
+
+        assert!(live.is_empty(), "liveness is a hint; list must still work");
+    }
 }

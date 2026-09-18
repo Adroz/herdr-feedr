@@ -60,7 +60,10 @@ fn claim_then_review_then_human_done() {
         .unwrap()
         .contains("- [~] Fix auth redirect loop @agent(claude:abc123)"));
 
-    feedr(&feed).args(["review", "auth"]).assert().success();
+    feedr(&feed)
+        .args(["review", "auth", "--note", "patched the redirect guard"])
+        .assert()
+        .success();
     assert!(std::fs::read_to_string(&feed)
         .unwrap()
         .contains("- [?] Fix auth"));
@@ -110,10 +113,17 @@ fn add_and_sweep() {
 }
 
 #[test]
-fn claim_requires_agent_ref() {
+fn claim_rejects_a_malformed_agent_ref() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());
-    feedr(&feed).args(["claim", "auth"]).assert().failure();
+    // The flag is optional (identity resolves from the environment — see
+    // `claim_without_the_agent_flag_resolves_identity_from_the_environment`),
+    // but a supplied ref that doesn't parse is a mistake, not a fallthrough.
+    feedr(&feed)
+        .args(["claim", "auth", "--agent", "no-colon"])
+        .assert()
+        .failure()
+        .stderr(contains("kind:id"));
 }
 
 #[test]
@@ -418,4 +428,184 @@ fn auto_dock_hook_subcommand_is_wired() {
         .assert()
         .success()
         .stdout(contains("--tab-id"));
+}
+
+/// The test process itself often runs inside herdr with a live Claude session,
+/// so identity tests must start from a blank environment or they'd resolve
+/// against the developer's own session instead of the fixture.
+fn feedr_bare_env(feed: &std::path::Path) -> Command {
+    let mut cmd = feedr(feed);
+    cmd.env_remove("FEEDR_AGENT")
+        .env_remove("HERDR_ENV")
+        .env_remove("CLAUDE_CODE_SESSION_ID");
+    cmd
+}
+
+#[test]
+fn whoami_prints_the_resolved_ref_and_its_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    feedr_bare_env(&feed)
+        .env("FEEDR_AGENT", "codex:sess-7")
+        .arg("whoami")
+        .assert()
+        .success()
+        .stdout(contains("codex:sess-7").and(contains("FEEDR_AGENT")));
+}
+
+#[test]
+fn whoami_fails_loudly_when_no_source_resolves() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    feedr_bare_env(&feed)
+        .arg("whoami")
+        .assert()
+        .failure()
+        .stderr(contains("--agent").and(contains("CLAUDE_CODE_SESSION_ID")));
+}
+
+#[test]
+fn claim_without_the_agent_flag_resolves_identity_from_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    feedr_bare_env(&feed)
+        .env("CLAUDE_CODE_SESSION_ID", "sess-42")
+        .args(["claim", "auth"])
+        .assert()
+        .success();
+    assert!(std::fs::read_to_string(&feed)
+        .unwrap()
+        .contains("[~] Fix auth redirect loop @agent(claude:sess-42)"));
+}
+
+#[test]
+fn an_unresolvable_claim_fails_and_leaves_the_feed_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    let before = std::fs::read_to_string(&feed).unwrap();
+    feedr_bare_env(&feed)
+        .args(["claim", "auth"])
+        .assert()
+        .failure()
+        .stderr(contains("FEEDR_AGENT"));
+    assert_eq!(std::fs::read_to_string(&feed).unwrap(), before);
+}
+
+#[test]
+fn review_requires_a_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    feedr(&feed)
+        .args(["review", "auth"])
+        .assert()
+        .failure()
+        .stderr(contains("--note"));
+}
+
+#[test]
+fn review_writes_the_state_and_the_evidence_note_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    feedr(&feed)
+        .args(["review", "auth", "--note", "fixed in a1b2c3, tests green"])
+        .assert()
+        .success();
+    let text = std::fs::read_to_string(&feed).unwrap();
+    assert!(text.contains("[?] Fix auth redirect loop"));
+    assert!(text.contains("  fixed in a1b2c3, tests green"));
+}
+
+#[test]
+fn notes_are_repeatable() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    feedr(&feed)
+        .args([
+            "review",
+            "auth",
+            "--note",
+            "first line",
+            "--note",
+            "second line",
+        ])
+        .assert()
+        .success();
+    let text = std::fs::read_to_string(&feed).unwrap();
+    assert!(text.contains("  first line"));
+    assert!(text.contains("  second line"));
+}
+
+#[test]
+fn done_takes_an_optional_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    feedr(&feed)
+        .args(["done", "auth", "--as-human", "--note", "shipped"])
+        .assert()
+        .success();
+    let text = std::fs::read_to_string(&feed).unwrap();
+    assert!(text.contains("[x] Fix auth redirect loop"));
+    assert!(text.contains("  shipped"));
+}
+
+#[test]
+fn skill_install_writes_both_targets_and_says_what_it_did() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    let home = tempfile::tempdir().unwrap();
+    feedr(&feed)
+        .env("HOME", home.path())
+        .args(["skill", "install"])
+        .assert()
+        .success()
+        .stdout(contains(".agents/skills/herdr-feedr").and(contains(".claude/skills/herdr-feedr")));
+    assert!(home
+        .path()
+        .join(".agents/skills/herdr-feedr/SKILL.md")
+        .exists());
+}
+
+#[test]
+fn skill_install_refresh_only_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    let home = tempfile::tempdir().unwrap();
+    feedr(&feed)
+        .env("HOME", home.path())
+        .args(["skill", "install", "--refresh-only"])
+        .assert()
+        .success();
+    assert!(!home.path().join(".agents").exists());
+    assert!(!home.path().join(".claude").exists());
+}
+
+#[test]
+fn skill_status_reports_the_installed_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    let home = tempfile::tempdir().unwrap();
+    feedr(&feed)
+        .env("HOME", home.path())
+        .args(["skill", "install"])
+        .assert()
+        .success();
+    feedr(&feed)
+        .env("HOME", home.path())
+        .args(["skill", "status"])
+        .assert()
+        .success()
+        .stdout(contains(env!("CARGO_PKG_VERSION")).and(contains("ok")));
+}
+
+#[test]
+fn skill_status_says_so_when_nothing_is_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    let home = tempfile::tempdir().unwrap();
+    feedr(&feed)
+        .env("HOME", home.path())
+        .args(["skill", "status"])
+        .assert()
+        .success()
+        .stdout(contains("not installed"));
 }

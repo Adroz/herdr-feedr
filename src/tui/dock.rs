@@ -102,6 +102,7 @@ pub fn auto_dock_for_tab(
     // not yank focus away from wherever the user (or another agent) already
     // is — unlike the user-initiated `dock()` path above.
     let pane_id = open_split_dock(runner, cfg, &target_pane, true)?;
+    clamp_max_width(runner, cfg, &pane_id);
     Ok(format!(
         "auto-docked sidebar pane {pane_id} in tab {tab_id}"
     ))
@@ -136,23 +137,36 @@ fn open_split_dock(
     };
     if cfg.side == Side::Left {
         for _ in 0..6 {
-            if runner
-                .run(&[
-                    "pane",
-                    "neighbor",
-                    "--direction",
-                    "left",
-                    "--pane",
-                    &pane_id,
-                ])
-                .is_err()
-            {
+            let Ok(out) = runner.run(&[
+                "pane",
+                "neighbor",
+                "--direction",
+                "left",
+                "--pane",
+                &pane_id,
+            ]) else {
                 break; // at the left edge
-            }
-            if runner
-                .run(&["pane", "swap", "--direction", "left", "--pane", &pane_id])
-                .is_err()
-            {
+            };
+            // herdr focuses a swap's SOURCE pane (verified live, 0.9.3).
+            // Swapping from the neighbor's side leaves focus on the work
+            // pane, not the freshly docked sidebar; the `--pane` form is the
+            // fallback when the neighbor's id can't be read.
+            let neighbor = crate::tui::socket::find_string_field(
+                &serde_json::from_str::<Value>(&out).unwrap_or(Value::Null),
+                "neighbor_pane_id",
+            );
+            let swapped = match &neighbor {
+                Some(n) => runner.run(&[
+                    "pane",
+                    "swap",
+                    "--source-pane",
+                    n,
+                    "--target-pane",
+                    &pane_id,
+                ]),
+                None => runner.run(&["pane", "swap", "--direction", "left", "--pane", &pane_id]),
+            };
+            if swapped.is_err() {
                 break;
             }
         }
@@ -773,7 +787,41 @@ mod tests {
                  --placement split --direction right --target-pane w1:p9 --no-focus",
                 "pane neighbor --direction left --pane w1:p10",
                 "pane resize --direction left --amount 0.18 --pane w1:p10",
+                "pane layout --pane w1:p10", // max-width clamp
             ]
+        );
+    }
+
+    /// herdr focuses a swap's source pane, so the walk swaps FROM the
+    /// neighbor: the work pane keeps focus, not the new sidebar. A real
+    /// layout then drives the max-width clamp (106 → 46 cols of 332).
+    #[test]
+    fn auto_dock_swaps_from_the_neighbor_and_clamps_width() {
+        let list = r#"{"id":"x","result":{"panes":[
+            {"pane_id":"w1:p9","tab_id":"w1:t9","terminal_title_stripped":"vim"}]}}"#;
+        let opened = r#"{"id":"y","result":{"pane_id":"w1:p10"}}"#;
+        let neighbor = r#"{"result":{"neighbor":{"neighbor_pane_id":"w1:p9","pane_id":"w1:p10"}}}"#;
+        let layout = r#"{"result":{"layout":{"area":{"width":332},"panes":[
+            {"pane_id":"w1:p10","rect":{"width":106}},
+            {"pane_id":"w1:p9","rect":{"width":226}}]}}}"#;
+        let mut runner = FakeRunner::new(vec![
+            Ok(list.into()),
+            Ok(opened.into()),
+            Ok(neighbor.into()),
+            Ok(String::new()),                   // swap
+            Err(anyhow::anyhow!("no neighbor")), // now at the edge
+            Ok(String::new()),                   // resize
+            Ok(layout.into()),
+        ]);
+        auto_dock_for_tab(&mut runner, &cfg(Side::Left), "w1:t9").unwrap();
+        assert_eq!(
+            runner.calls[3],
+            "pane swap --source-pane w1:p9 --target-pane w1:p10"
+        );
+        assert!(
+            runner.calls[7].starts_with("pane resize --direction left --amount 0.1807"),
+            "clamp resize missing: {:?}",
+            runner.calls
         );
     }
 
@@ -804,6 +852,7 @@ mod tests {
                 format!("pane send-text w1:p10 {expected_exec}"),
                 "pane neighbor --direction left --pane w1:p10".to_string(),
                 "pane resize --direction left --amount 0.18 --pane w1:p10".to_string(),
+                "pane layout --pane w1:p10".to_string(), // max-width clamp
             ]
         );
     }

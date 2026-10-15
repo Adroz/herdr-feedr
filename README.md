@@ -30,7 +30,7 @@ Rebuild loop while iterating:
 
 1. Edit the code.
 2. `cargo build --release` (or re-run `herdr plugin link <path>`, which re-runs `scripts/build.sh`).
-3. Close and reopen the sidebar pane (`toggle-feedr` twice, or `plugin pane close` + `open-feedr`) to pick up the new binary — herdr doesn't hot-reload a running pane's process.
+3. Restart the sidebars so they pick up the new binary — herdr doesn't hot-reload a running pane's process. `bash scripts/reload-feedr.sh` does steps 2–3 for every open sidebar in every tab (`--dry-run` to preview, `--tab <id>` for one tab); or close and reopen a single one by hand (`toggle-feedr` twice).
 
 `herdr plugin list` shows whether herdr-feedr loaded, with its pane and both actions.
 

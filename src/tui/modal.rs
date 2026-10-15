@@ -106,6 +106,16 @@ impl EditModal {
         m
     }
 
+    /// Create with the category pre-filled (clicking a section header):
+    /// the category is already decided, so focus starts on Title.
+    pub fn create_in(suggestions: Vec<String>, category: &str) -> Self {
+        let mut m = Self::create(suggestions);
+        m.set_category(category);
+        m.focus = EditFocus::Title;
+        m.sync_blocks();
+        m
+    }
+
     pub fn edit(
         key: ItemKey,
         item: &Item,
@@ -292,12 +302,17 @@ impl EditModal {
         }
     }
 
-    /// Suggestions matching the field, case-insensitive substring.
+    /// Suggestions matching the field, case-insensitive substring. A
+    /// suggestion the field already equals is dropped — offering to "pick"
+    /// the exact text already typed is noise.
     pub fn filtered(&self) -> Vec<String> {
         let q = self.category_text().to_lowercase();
         self.suggestions
             .iter()
-            .filter(|s| s.to_lowercase().contains(&q))
+            .filter(|s| {
+                let s = s.to_lowercase();
+                s.contains(&q) && s != q
+            })
             .cloned()
             .collect()
     }
@@ -1291,6 +1306,24 @@ mod tests {
         assert_eq!(m.filtered(), vec!["Work", "Homework"]);
         m.set_category("Chores");
         assert_eq!(m.category_text(), "Chores");
+    }
+
+    #[test]
+    fn an_exact_match_drops_out_of_the_dropdown() {
+        let mut m = EditModal::create(vec!["Work".into(), "Homework".into()]);
+        m.category.insert_str("work");
+        // Case-insensitive exact match on "Work" hides it; "Homework" stays.
+        assert_eq!(m.filtered(), vec!["Homework"]);
+        m.set_category("Homework");
+        assert_eq!(m.dropdown_rows(), 0);
+    }
+
+    #[test]
+    fn create_in_prefills_category_and_focuses_title() {
+        let m = EditModal::create_in(vec!["Interactives".into()], "Interactives");
+        assert_eq!(m.category_text(), "Interactives");
+        assert_eq!(m.focus, EditFocus::Title);
+        assert_eq!(m.dropdown_rows(), 0);
     }
 
     /// Review follow-up (B1): at very short pane heights the constraint

@@ -55,7 +55,7 @@ pub fn dock(runner: &mut dyn Runner, herdr: &mut dyn Herdr, cfg: &SidebarConfig)
     let target_pane = focused_pane_id(&list)
         .context("no focused pane found in `herdr pane list` to dock the sidebar beside")?;
     let pane_id = open_split_dock(runner, cfg, &target_pane, false)?;
-    clamp_max_width(runner, cfg, &pane_id);
+    size_sidebar(runner, herdr, cfg, &pane_id);
     Ok(format!("opened sidebar pane {pane_id}"))
 }
 
@@ -69,6 +69,7 @@ pub fn dock(runner: &mut dyn Runner, herdr: &mut dyn Herdr, cfg: &SidebarConfig)
 /// the way the user-initiated `dock()`/`herdr.focus_pane` path does).
 pub fn auto_dock_for_tab(
     runner: &mut dyn Runner,
+    herdr: &mut dyn Herdr,
     cfg: &SidebarConfig,
     tab_id: &str,
 ) -> Result<String> {
@@ -102,6 +103,7 @@ pub fn auto_dock_for_tab(
     // not yank focus away from wherever the user (or another agent) already
     // is — unlike the user-initiated `dock()` path above.
     let pane_id = open_split_dock(runner, cfg, &target_pane, true)?;
+    size_sidebar(runner, herdr, cfg, &pane_id);
     Ok(format!(
         "auto-docked sidebar pane {pane_id} in tab {tab_id}"
     ))
@@ -136,23 +138,36 @@ fn open_split_dock(
     };
     if cfg.side == Side::Left {
         for _ in 0..6 {
-            if runner
-                .run(&[
-                    "pane",
-                    "neighbor",
-                    "--direction",
-                    "left",
-                    "--pane",
-                    &pane_id,
-                ])
-                .is_err()
-            {
+            let Ok(out) = runner.run(&[
+                "pane",
+                "neighbor",
+                "--direction",
+                "left",
+                "--pane",
+                &pane_id,
+            ]) else {
                 break; // at the left edge
-            }
-            if runner
-                .run(&["pane", "swap", "--direction", "left", "--pane", &pane_id])
-                .is_err()
-            {
+            };
+            // herdr focuses a swap's SOURCE pane (verified live, 0.9.3).
+            // Swapping from the neighbor's side leaves focus on the work
+            // pane, not the freshly docked sidebar; the `--pane` form is the
+            // fallback when the neighbor's id can't be read.
+            let neighbor = crate::tui::socket::find_string_field(
+                &serde_json::from_str::<Value>(&out).unwrap_or(Value::Null),
+                "neighbor_pane_id",
+            );
+            let swapped = match &neighbor {
+                Some(n) => runner.run(&[
+                    "pane",
+                    "swap",
+                    "--source-pane",
+                    n,
+                    "--target-pane",
+                    &pane_id,
+                ]),
+                None => runner.run(&["pane", "swap", "--direction", "left", "--pane", &pane_id]),
+            };
+            if swapped.is_err() {
                 break;
             }
         }
@@ -337,6 +352,169 @@ fn resize_changed(out: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The sidebar's intended column width: its `cfg.width` share of the tab,
+/// capped at `cfg.max_width`.
+fn target_width(cfg: &SidebarConfig, area_width: u64) -> u64 {
+    let share = (cfg.width * area_width as f64).round() as u64;
+    share.min(u64::from(cfg.max_width)).max(1)
+}
+
+/// Columns the absorbing side of the top split must keep — never squeeze
+/// the user's work panes to nothing to make room for the sidebar.
+const MIN_OTHER_WIDTH: u64 = 10;
+
+/// Size the sidebar to `target_width`: the exact fit when herdr's layout API
+/// answers, else the older delta-resize clamp (best-effort either way —
+/// sizing never fails a dock).
+fn size_sidebar(
+    runner: &mut dyn Runner,
+    herdr: &mut dyn Herdr,
+    cfg: &SidebarConfig,
+    pane_id: &str,
+) {
+    let Ok(layout_out) = runner.run(&["pane", "layout", "--pane", pane_id]) else {
+        return;
+    };
+    if fit_from_layout(herdr, cfg, pane_id, &layout_out).is_err() {
+        clamp_max_width(runner, cfg, pane_id, Some(layout_out));
+    }
+}
+
+/// Set the sidebar pane to exactly `target_width` columns via
+/// `layout.set_split_ratio` (see `plan_fit`). `pane resize` can't do this:
+/// its amount is a share of whichever split it lands on, which for a
+/// sidebar nested inside another pane's subtree is not the tab's width.
+pub fn fit_width(
+    runner: &mut dyn Runner,
+    herdr: &mut dyn Herdr,
+    cfg: &SidebarConfig,
+    pane_id: &str,
+) -> Result<()> {
+    let layout_out = runner.run(&["pane", "layout", "--pane", pane_id])?;
+    fit_from_layout(herdr, cfg, pane_id, &layout_out)
+}
+
+/// `fit_width` from an already-read `pane layout --pane <id>` response.
+fn fit_from_layout(
+    herdr: &mut dyn Herdr,
+    cfg: &SidebarConfig,
+    pane_id: &str,
+    layout_out: &str,
+) -> Result<()> {
+    let (_, area_width) =
+        layout_widths(layout_out, pane_id).context("unreadable `pane layout` output")?;
+    let tab_id = crate::tui::socket::find_string_field(
+        &serde_json::from_str::<Value>(layout_out).unwrap_or(Value::Null),
+        "tab_id",
+    )
+    .context("no tab_id in `pane layout` output")?;
+    let root = herdr.layout_export(&tab_id)?;
+    let plan = plan_fit(&root, pane_id, target_width(cfg, area_width), area_width)
+        .context("sidebar is not in a side-by-side split")?;
+    for (path, ratio) in plan {
+        herdr.set_split_ratio(&tab_id, &path, ratio)?;
+    }
+    Ok(())
+}
+
+/// Split ratios that make `pane_id` exactly `target` columns wide in the
+/// `layout.export` tree `root` (tab `area_width` wide), as `(path, ratio)`.
+///
+/// Every pane beside the sidebar on the way up keeps its width: each
+/// side-by-side split between the sidebar and the topmost one grows (or
+/// shrinks) by the sidebar's delta, and the topmost side-by-side split —
+/// whose width is fixed — hands that delta to its other side. Stacked
+/// (`down`) splits pass width straight through and are left alone. `None`
+/// when the pane isn't in the tree or shares no side-by-side split.
+///
+/// Widths are modelled as `round(width * ratio)` for the first child; each
+/// ratio is nudged a quarter-column past the exact boundary so herdr lands
+/// on the intended column whether it rounds or floors.
+pub fn plan_fit(
+    root: &Value,
+    pane_id: &str,
+    target: u64,
+    area_width: u64,
+) -> Option<Vec<(Vec<bool>, f64)>> {
+    // (node, took_second) for every split from the root down to the pane.
+    fn find<'a>(node: &'a Value, pane_id: &str, path: &mut Vec<(&'a Value, bool)>) -> bool {
+        match node.get("type").and_then(Value::as_str) {
+            Some("pane") => node.get("pane_id").and_then(Value::as_str) == Some(pane_id),
+            Some("split") => {
+                for (key, second) in [("first", false), ("second", true)] {
+                    path.push((node, second));
+                    if node
+                        .get(key)
+                        .is_some_and(|child| find(child, pane_id, path))
+                    {
+                        return true;
+                    }
+                    path.pop();
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+    let mut chain = Vec::new();
+    if !find(root, pane_id, &mut chain) {
+        return None;
+    }
+
+    // Width of each split on the chain, and of the child the chain enters.
+    struct Step {
+        index: usize,
+        second: bool,
+        width: u64,
+        child: u64,
+    }
+    let mut steps = Vec::new();
+    let mut width = area_width;
+    for (index, (node, second)) in chain.iter().enumerate() {
+        let side_by_side = node.get("direction").and_then(Value::as_str) == Some("right");
+        let child = if side_by_side {
+            let ratio = node.get("ratio").and_then(Value::as_f64)?;
+            let first = ((width as f64 * ratio).round() as u64).min(width);
+            if *second {
+                width - first
+            } else {
+                first
+            }
+        } else {
+            width
+        };
+        if side_by_side {
+            steps.push(Step {
+                index,
+                second: *second,
+                width,
+                child,
+            });
+        }
+        width = child;
+    }
+    let (top, inner) = steps.split_first()?;
+
+    // Room the inner splits' other sides keep; the top split absorbs the rest.
+    let kept: u64 = inner.iter().map(|s| s.width - s.child).sum();
+    let max_target = top.width.checked_sub(MIN_OTHER_WIDTH + kept)?;
+    let mut need = target.min(max_target).max(1);
+
+    let path_to = |index: usize| -> Vec<bool> { chain[..index].iter().map(|(_, s)| *s).collect() };
+    let ratio_for = |first: u64, total: u64| (first as f64 + 0.25) / total as f64;
+    let mut plan = Vec::new();
+    for step in inner.iter().rev() {
+        let other = step.width - step.child;
+        let total = need + other;
+        let first = if step.second { other } else { need };
+        plan.push((path_to(step.index), ratio_for(first, total)));
+        need = total;
+    }
+    let first = if top.second { top.width - need } else { need };
+    plan.push((path_to(top.index), ratio_for(first, top.width)));
+    Some(plan)
+}
+
 /// Bound on the max-width clamp loop, mirroring `MAX_COLLAPSE_STEPS`'s
 /// rationale: `pane resize --amount` is a proportional share, not columns,
 /// and there is no "resize to exact width" verb, so hitting `cfg.max_width`
@@ -378,12 +556,22 @@ fn layout_widths(layout_out: &str, pane_id: &str) -> Option<(u64, u64)> {
 /// bounded by `MAX_CLAMP_STEPS`: a layout parse failure, an unchanged
 /// resize, or a resize error just stops the loop — this must never fail the
 /// dock itself, only leave the pane wider than requested.
-fn clamp_max_width(runner: &mut dyn Runner, cfg: &SidebarConfig, pane_id: &str) {
+///
+/// `first_layout`, when given, stands in for the first iteration's read.
+fn clamp_max_width(
+    runner: &mut dyn Runner,
+    cfg: &SidebarConfig,
+    pane_id: &str,
+    mut first_layout: Option<String>,
+) {
     let dir = collapse_direction(cfg.side);
     for _ in 0..MAX_CLAMP_STEPS {
-        let layout_out = match runner.run(&["pane", "layout", "--pane", pane_id]) {
-            Ok(out) => out,
-            Err(_) => return,
+        let layout_out = match first_layout.take() {
+            Some(out) => out,
+            None => match runner.run(&["pane", "layout", "--pane", pane_id]) {
+                Ok(out) => out,
+                Err(_) => return,
+            },
         };
         let (pane_width, area_width) = match layout_widths(&layout_out, pane_id) {
             Some(widths) => widths,
@@ -745,7 +933,13 @@ mod tests {
             {"pane_id":"w1:p1","tab_id":"w1:t2","terminal_title_stripped":"feedr-sidebar"},
             {"pane_id":"w1:p2","tab_id":"w1:t9","terminal_title_stripped":"vim"}]}}"#;
         let mut runner = FakeRunner::new(vec![Ok(list.into())]);
-        let msg = auto_dock_for_tab(&mut runner, &cfg(Side::Left), "w1:t2").unwrap();
+        let msg = auto_dock_for_tab(
+            &mut runner,
+            &mut FakeHerdr::default(),
+            &cfg(Side::Left),
+            "w1:t2",
+        )
+        .unwrap();
         assert!(msg.contains("no-op"), "got: {msg}");
         assert_eq!(runner.calls, ["pane list"]); // nothing opened, nothing focused
     }
@@ -763,7 +957,13 @@ mod tests {
             Ok(opened.into()),
             Err(anyhow::anyhow!("no neighbor")), // neighbor: at the edge (single-pane new tab)
         ]);
-        let msg = auto_dock_for_tab(&mut runner, &cfg(Side::Left), "w1:t9").unwrap();
+        let msg = auto_dock_for_tab(
+            &mut runner,
+            &mut FakeHerdr::default(),
+            &cfg(Side::Left),
+            "w1:t9",
+        )
+        .unwrap();
         assert!(msg.contains("auto-docked"), "got: {msg}");
         assert_eq!(
             runner.calls,
@@ -773,7 +973,47 @@ mod tests {
                  --placement split --direction right --target-pane w1:p9 --no-focus",
                 "pane neighbor --direction left --pane w1:p10",
                 "pane resize --direction left --amount 0.18 --pane w1:p10",
+                "pane layout --pane w1:p10", // max-width clamp
             ]
+        );
+    }
+
+    /// herdr focuses a swap's source pane, so the walk swaps FROM the
+    /// neighbor: the work pane keeps focus, not the new sidebar. A real
+    /// layout then drives the max-width clamp (106 → 46 cols of 332).
+    #[test]
+    fn auto_dock_swaps_from_the_neighbor_and_clamps_width() {
+        let list = r#"{"id":"x","result":{"panes":[
+            {"pane_id":"w1:p9","tab_id":"w1:t9","terminal_title_stripped":"vim"}]}}"#;
+        let opened = r#"{"id":"y","result":{"pane_id":"w1:p10"}}"#;
+        let neighbor = r#"{"result":{"neighbor":{"neighbor_pane_id":"w1:p9","pane_id":"w1:p10"}}}"#;
+        let layout = r#"{"result":{"layout":{"area":{"width":332},"panes":[
+            {"pane_id":"w1:p10","rect":{"width":106}},
+            {"pane_id":"w1:p9","rect":{"width":226}}]}}}"#;
+        let mut runner = FakeRunner::new(vec![
+            Ok(list.into()),
+            Ok(opened.into()),
+            Ok(neighbor.into()),
+            Ok(String::new()),                   // swap
+            Err(anyhow::anyhow!("no neighbor")), // now at the edge
+            Ok(String::new()),                   // resize
+            Ok(layout.into()),
+        ]);
+        auto_dock_for_tab(
+            &mut runner,
+            &mut FakeHerdr::default(),
+            &cfg(Side::Left),
+            "w1:t9",
+        )
+        .unwrap();
+        assert_eq!(
+            runner.calls[3],
+            "pane swap --source-pane w1:p9 --target-pane w1:p10"
+        );
+        assert!(
+            runner.calls[7].starts_with("pane resize --direction left --amount 0.1807"),
+            "clamp resize missing: {:?}",
+            runner.calls
         );
     }
 
@@ -789,7 +1029,13 @@ mod tests {
             Ok(String::new()),                   // send-text
             Err(anyhow::anyhow!("no neighbor")), // edge (single-pane new tab)
         ]);
-        let msg = auto_dock_for_tab(&mut runner, &cfg(Side::Left), "w1:t9").unwrap();
+        let msg = auto_dock_for_tab(
+            &mut runner,
+            &mut FakeHerdr::default(),
+            &cfg(Side::Left),
+            "w1:t9",
+        )
+        .unwrap();
         assert!(msg.contains("auto-docked"), "got: {msg}");
         let exe = std::env::current_exe().unwrap();
         let expected_exec = format!("exec '{}' sidebar\n", exe.display());
@@ -804,6 +1050,7 @@ mod tests {
                 format!("pane send-text w1:p10 {expected_exec}"),
                 "pane neighbor --direction left --pane w1:p10".to_string(),
                 "pane resize --direction left --amount 0.18 --pane w1:p10".to_string(),
+                "pane layout --pane w1:p10".to_string(), // max-width clamp
             ]
         );
     }
@@ -813,7 +1060,13 @@ mod tests {
         let list = r#"{"id":"x","result":{"panes":[
             {"pane_id":"w1:p1","tab_id":"w1:t2","terminal_title_stripped":"vim"}]}}"#;
         let mut runner = FakeRunner::new(vec![Ok(list.into())]);
-        let err = auto_dock_for_tab(&mut runner, &cfg(Side::Left), "w1:t9").unwrap_err();
+        let err = auto_dock_for_tab(
+            &mut runner,
+            &mut FakeHerdr::default(),
+            &cfg(Side::Left),
+            "w1:t9",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("w1:t9"), "got: {err}");
     }
 
@@ -949,5 +1202,163 @@ mod tests {
         // once responses run out, so scope the assertion to what we scripted.
         expand_pane(&mut r, &cfg(Side::Left), "w1:p3", 2);
         assert_eq!(r.calls.len(), 2, "stops as soon as a resize call errors");
+    }
+
+    fn pane(id: &str) -> Value {
+        serde_json::json!({"type": "pane", "pane_id": id})
+    }
+
+    fn split(direction: &str, ratio: f64, first: Value, second: Value) -> Value {
+        serde_json::json!({"type": "split", "direction": direction, "ratio": ratio,
+            "first": first, "second": second})
+    }
+
+    /// Width of `pane_id` under herdr's `round(width * ratio)` model, after
+    /// applying `plan` — the check every plan_fit test cares about.
+    fn widths_after(root: &Value, plan: &[(Vec<bool>, f64)], area: u64) -> Vec<(String, u64)> {
+        fn walk(
+            node: &Value,
+            path: &mut Vec<bool>,
+            plan: &[(Vec<bool>, f64)],
+            w: u64,
+            out: &mut Vec<(String, u64)>,
+        ) {
+            if node["type"] == "pane" {
+                out.push((node["pane_id"].as_str().unwrap().into(), w));
+                return;
+            }
+            let ratio = plan
+                .iter()
+                .find(|(p, _)| p == path)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| node["ratio"].as_f64().unwrap());
+            let (a, b) = if node["direction"] == "right" {
+                let first = (w as f64 * ratio).round() as u64;
+                (first, w - first)
+            } else {
+                (w, w)
+            };
+            path.push(false);
+            walk(&node["first"], path, plan, a, out);
+            path.pop();
+            path.push(true);
+            walk(&node["second"], path, plan, b, out);
+            path.pop();
+        }
+        let mut out = Vec::new();
+        walk(root, &mut Vec::new(), plan, area, &mut out);
+        out
+    }
+
+    #[test]
+    fn target_width_is_the_share_capped_at_max_width() {
+        assert_eq!(target_width(&cfg(Side::Left), 332), 46); // 60 → capped
+        assert_eq!(target_width(&cfg(Side::Left), 200), 36); // 0.18 × 200
+    }
+
+    /// A sidebar docked into a fresh tab: one root split, sidebar first.
+    #[test]
+    fn plan_fit_sizes_a_root_level_sidebar() {
+        let root = split("right", 0.32, pane("sb"), pane("work"));
+        let plan = plan_fit(&root, "sb", 46, 332).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0, Vec::<bool>::new());
+        assert_eq!(
+            widths_after(&root, &plan, 332),
+            [("sb".into(), 46), ("work".into(), 286)]
+        );
+    }
+
+    /// The live shape that came back 22 cols wide: re-docking split the
+    /// tab's first pane, nesting the sidebar beside it. The fit widens the
+    /// sidebar, keeps its neighbor's width, and takes the columns from the
+    /// far side of the root split.
+    #[test]
+    fn plan_fit_keeps_a_nested_sidebars_neighbor_width() {
+        let root = split(
+            "right",
+            0.20786516,
+            split("right", 0.32, pane("sb"), pane("p7")),
+            split("right", 0.16906475, pane("p8"), pane("p1A")),
+        );
+        let before = widths_after(&root, &[], 332);
+        assert_eq!(before[0], ("sb".into(), 22));
+        let plan = plan_fit(&root, "sb", 46, 332).unwrap();
+        let after = widths_after(&root, &plan, 332);
+        assert_eq!(after[0], ("sb".into(), 46));
+        assert_eq!(
+            after[1], before[1],
+            "the sidebar's neighbor keeps its width"
+        );
+        assert_eq!(after.iter().map(|(_, w)| w).sum::<u64>(), 332);
+    }
+
+    /// A sidebar on the SECOND side of a split, inside a stacked (down)
+    /// split: stacked splits pass width through untouched.
+    #[test]
+    fn plan_fit_handles_second_side_and_stacked_splits() {
+        let root = split(
+            "right",
+            0.6,
+            pane("work"),
+            split("down", 0.5, pane("sb"), pane("below")),
+        );
+        let plan = plan_fit(&root, "sb", 46, 300).unwrap();
+        assert_eq!(plan.len(), 1, "only the side-by-side split changes");
+        let after = widths_after(&root, &plan, 300);
+        assert_eq!(
+            after,
+            [
+                ("work".into(), 254),
+                ("sb".into(), 46),
+                ("below".into(), 46)
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_fit_never_squeezes_the_work_side_below_its_floor() {
+        let root = split("right", 0.5, pane("sb"), pane("work"));
+        let plan = plan_fit(&root, "sb", 46, 40).unwrap();
+        let after = widths_after(&root, &plan, 40);
+        assert_eq!(after[1], ("work".into(), MIN_OTHER_WIDTH));
+    }
+
+    #[test]
+    fn plan_fit_declines_without_a_side_by_side_split() {
+        assert!(plan_fit(&pane("sb"), "sb", 46, 332).is_none());
+        let stacked = split("down", 0.5, pane("sb"), pane("work"));
+        assert!(plan_fit(&stacked, "sb", 46, 332).is_none());
+        let root = split("right", 0.5, pane("a"), pane("b"));
+        assert!(plan_fit(&root, "missing", 46, 332).is_none());
+    }
+
+    /// When herdr's layout API answers, docking sets exact ratios instead of
+    /// falling back to the delta-resize clamp.
+    #[test]
+    fn auto_dock_fits_width_through_the_layout_api() {
+        let list = r#"{"id":"x","result":{"panes":[
+            {"pane_id":"w1:p9","tab_id":"w1:t9","terminal_title_stripped":"vim"}]}}"#;
+        let opened = r#"{"id":"y","result":{"pane_id":"w1:p10"}}"#;
+        let layout = r#"{"result":{"layout":{"tab_id":"w1:t9","area":{"width":332},"panes":[
+            {"pane_id":"w1:p10","rect":{"width":106}},
+            {"pane_id":"w1:p9","rect":{"width":226}}]}}}"#;
+        let mut runner = FakeRunner::new(vec![
+            Ok(list.into()),
+            Ok(opened.into()),
+            Err(anyhow::anyhow!("no neighbor")),
+            Ok(String::new()), // resize
+            Ok(layout.into()),
+        ]);
+        let mut herdr = FakeHerdr {
+            layout: Some(split("right", 0.32, pane("w1:p10"), pane("w1:p9"))),
+            ..FakeHerdr::default()
+        };
+        auto_dock_for_tab(&mut runner, &mut herdr, &cfg(Side::Left), "w1:t9").unwrap();
+        assert_eq!(runner.calls.last().unwrap(), "pane layout --pane w1:p10");
+        assert_eq!(
+            herdr.log.borrow().as_slice(),
+            ["set_split_ratio w1:t9 [] 0.1393"]
+        );
     }
 }

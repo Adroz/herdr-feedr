@@ -126,6 +126,14 @@ pub trait Herdr {
     /// modal). Explicit `on`/`off` is used rather than `toggle` so this is
     /// idempotent regardless of the pane's current zoom state.
     fn zoom_pane(&mut self, pane_id: &str, on: bool) -> Result<()>;
+    /// `layout.export {tab_id}` — the tab's split tree (`layout.root`): split
+    /// nodes carry `direction`/`ratio`/`first`/`second`, leaves `pane_id`.
+    fn layout_export(&mut self, tab_id: &str) -> Result<Value>;
+    /// `layout.set_split_ratio {tab_id, path, ratio}` — set one split's
+    /// first-child share exactly. `path` walks from the root: `false` =
+    /// first child, `true` = second (verified live, herdr 0.9.3). Unlike
+    /// `pane swap`, it doesn't activate the tab.
+    fn set_split_ratio(&mut self, tab_id: &str, path: &[bool], ratio: f64) -> Result<()>;
 
     /// Resume a session in a fresh tab (spec §3: @agent click with the pane
     /// gone): create a tab, then start the agent in its pane with the kind's
@@ -291,6 +299,26 @@ impl Herdr for UnixSocketClient {
         )?;
         Ok(())
     }
+    fn layout_export(&mut self, tab_id: &str) -> Result<Value> {
+        let result = request(
+            &self.socket_path,
+            "layout.export",
+            serde_json::json!({"tab_id": tab_id}),
+        )?;
+        result
+            .get("layout")
+            .and_then(|l| l.get("root"))
+            .cloned()
+            .context("no layout.root in layout.export response")
+    }
+    fn set_split_ratio(&mut self, tab_id: &str, path: &[bool], ratio: f64) -> Result<()> {
+        request(
+            &self.socket_path,
+            "layout.set_split_ratio",
+            serde_json::json!({"tab_id": tab_id, "path": path, "ratio": ratio}),
+        )?;
+        Ok(())
+    }
     // open_resume_tab: the trait's provided create_tab + agent_start
     // composition (Task 3) — no override needed.
 }
@@ -389,6 +417,8 @@ pub struct FakeHerdr {
     pub agents: Vec<AgentInfo>,
     /// Shared so tests can keep a clone and inspect calls after boxing.
     pub log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    /// What `layout_export` returns; `None` makes it fail.
+    pub layout: Option<Value>,
 }
 
 #[cfg(test)]
@@ -443,6 +473,17 @@ impl Herdr for FakeHerdr {
         self.log.borrow_mut().push(format!(
             "zoom_pane {pane_id} {}",
             if on { "on" } else { "off" }
+        ));
+        Ok(())
+    }
+    fn layout_export(&mut self, _tab_id: &str) -> Result<Value> {
+        self.layout.clone().context("no layout in fake")
+    }
+    fn set_split_ratio(&mut self, tab_id: &str, path: &[bool], ratio: f64) -> Result<()> {
+        let path: Vec<&str> = path.iter().map(|b| if *b { "2" } else { "1" }).collect();
+        self.log.borrow_mut().push(format!(
+            "set_split_ratio {tab_id} [{}] {ratio:.4}",
+            path.join(",")
         ));
         Ok(())
     }

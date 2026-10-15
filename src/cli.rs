@@ -98,6 +98,10 @@ enum Cmd {
         /// herdr sets in an event hook's environment) when omitted.
         #[arg(long)]
         tab_id: Option<String>,
+        /// Dock even when `[sidebar] auto_dock` is off — used by
+        /// scripts/reload-feedr.sh to re-dock a sidebar it just closed.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -212,9 +216,9 @@ pub fn run() -> Result<()> {
         }
         return crate::tui::run(path, cfg);
     }
-    if let Cmd::AutoDockHook { tab_id } = &cli.command {
+    if let Cmd::AutoDockHook { tab_id, force } = &cli.command {
         let cfg = config::load_sidebar_config(&config::default_config_dir());
-        if !cfg.auto_dock {
+        if !cfg.auto_dock && !force {
             return Ok(()); // feature disabled — silent no-op, not an error
         }
         let tab_id = tab_id

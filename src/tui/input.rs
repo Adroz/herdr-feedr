@@ -2,8 +2,8 @@ use crate::tui::app::{Action, App, Row};
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 
 /// Pure event → action mapping. `size` is the terminal (width, height);
-/// geometry must mirror view::draw: y=0 toolbar, list at y=1..=h-3,
-/// Done(n) at h-2, status line at h-1.
+/// geometry must mirror view::draw: list at y=0..=h-4, Done(n) at h-3,
+/// toolbar at h-2, status line at h-1.
 pub fn translate(ev: &Event, app: &App, size: (u16, u16)) -> Option<Action> {
     let (w, h) = size;
     match ev {
@@ -36,7 +36,7 @@ fn click(app: &App, x: u16, y: u16, w: u16, h: u16) -> Option<Action> {
         // Any click on the rail restores the sidebar.
         return Some(Action::ToggleCollapse);
     }
-    if y == 0 {
+    if h >= 2 && y == h - 2 {
         // Toolbar columns must match view::TOOLBAR ("clear completed").
         // Round-4 item 1: "file" is gone from the toolbar — the file
         // viewer is reachable via the `f` key instead — so everything
@@ -53,13 +53,13 @@ fn click(app: &App, x: u16, y: u16, w: u16, h: u16) -> Option<Action> {
         let chevron_w = CHEVRON_ZONE_WIDTH.min(w);
         return (chevron_w > 0 && x >= w - chevron_w).then_some(Action::ToggleCollapse);
     }
-    if h >= 2 && y == h - 2 {
+    if h >= 3 && y == h - 3 {
         return Some(Action::OpenDoneView);
     }
-    if h >= 4 && (1..=h - 3).contains(&y) {
-        let idx = app.scroll + (y as usize - 1);
+    if h >= 4 && y <= h - 4 {
+        let idx = app.scroll + y as usize;
         return match app.rows.get(idx)? {
-            Row::Section(_) => None,
+            Row::Section(t) => Some(Action::OpenCreateIn(t.clone())),
             // Row is "[<char>] title" (round-2 item 2): checkbox zone is
             // x 0..=2 (the bracket pair + state char), title starts at x 4;
             // x==3 (the space after "]") is a dead zone between them.
@@ -135,7 +135,7 @@ mod tests {
         Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
     }
 
-    const SIZE: (u16, u16) = (22, 10); // list rows y=1..=7, Done row y=8, status y=9; w=22 so the toolbar ("clear completed") and the bottom-right chevron zone both fit
+    const SIZE: (u16, u16) = (22, 10); // list rows y=0..=6, Done row y=7, toolbar y=8, status y=9; w=22 so the toolbar ("clear completed") and the bottom-right chevron zone both fit
 
     #[test]
     fn keys_quit_add_editor_scroll() {
@@ -158,14 +158,15 @@ mod tests {
     /// item 1: "file" is gone from the toolbar entirely — "clear completed"
     /// still spans 0..=14, and everything right of it is a dead zone. The
     /// file viewer moved to the `f` key (see `f_key_opens_file_view`).
+    /// The toolbar now sits at the bottom, between Done and the status row.
     #[test]
     fn toolbar_clicks() {
         let app = app_with(SAMPLE);
-        assert_eq!(translate(&click(0, 0), &app, SIZE), Some(Action::Sweep));
-        assert_eq!(translate(&click(14, 0), &app, SIZE), Some(Action::Sweep));
-        assert_eq!(translate(&click(15, 0), &app, SIZE), None); // dead zone
-        assert_eq!(translate(&click(17, 0), &app, SIZE), None); // dead zone (was "file")
-        assert_eq!(translate(&click(21, 0), &app, SIZE), None); // dead zone
+        assert_eq!(translate(&click(0, 8), &app, SIZE), Some(Action::Sweep));
+        assert_eq!(translate(&click(14, 8), &app, SIZE), Some(Action::Sweep));
+        assert_eq!(translate(&click(15, 8), &app, SIZE), None); // dead zone
+        assert_eq!(translate(&click(17, 8), &app, SIZE), None); // dead zone (was "file")
+        assert_eq!(translate(&click(21, 8), &app, SIZE), None); // dead zone
     }
 
     /// Round-4 item 1: with "file" removed from the toolbar, the internal
@@ -208,18 +209,18 @@ mod tests {
         };
         for x in 0..=2 {
             assert_eq!(
-                translate(&click(x, 1), &app, SIZE),
+                translate(&click(x, 0), &app, SIZE),
                 Some(Action::Advance(alpha.clone())),
                 "x={x}"
             );
         }
-        assert_eq!(translate(&click(3, 1), &app, SIZE), None); // dead zone
+        assert_eq!(translate(&click(3, 0), &app, SIZE), None); // dead zone
         assert_eq!(
-            translate(&click(4, 1), &app, SIZE),
+            translate(&click(4, 0), &app, SIZE),
             Some(Action::OpenEdit(alpha.clone()))
         );
         assert_eq!(
-            translate(&click(7, 1), &app, SIZE),
+            translate(&click(7, 0), &app, SIZE),
             Some(Action::OpenEdit(alpha))
         );
     }
@@ -232,15 +233,15 @@ mod tests {
             state: State::Review,
         };
         assert_eq!(
-            translate(&click(4, 3), &app, SIZE),
+            translate(&click(4, 2), &app, SIZE),
             Some(Action::AgentClick(beta))
         );
         assert_eq!(
-            translate(&click(2, 4), &app, SIZE),
+            translate(&click(2, 3), &app, SIZE),
             Some(Action::OpenCreate)
         ); // + add
         assert_eq!(
-            translate(&click(3, 8), &app, SIZE),
+            translate(&click(3, 7), &app, SIZE),
             Some(Action::OpenDoneView)
         );
         assert_eq!(translate(&click(3, 6), &app, SIZE), None); // empty list space
@@ -250,19 +251,28 @@ mod tests {
     fn scroll_offsets_hit_testing_and_collapsed_restores() {
         let mut app = app_with(SAMPLE);
         app.scroll = 2;
-        // y=1 now hits row 2 (the agent line):
+        // y=0 now hits row 2 (the agent line):
         let beta = ItemKey {
             title: "Beta".into(),
             state: State::Review,
         };
         assert_eq!(
-            translate(&click(4, 1), &app, SIZE),
+            translate(&click(4, 0), &app, SIZE),
             Some(Action::AgentClick(beta))
         );
         app.collapsed = true;
         assert_eq!(
             translate(&click(1, 4), &app, SIZE),
             Some(Action::ToggleCollapse)
+        );
+    }
+
+    #[test]
+    fn section_header_click_opens_create_in_that_section() {
+        let app = app_with("# Feed\n\n## Interactives\n\n- [ ] Alpha\n");
+        assert_eq!(
+            translate(&click(3, 0), &app, SIZE),
+            Some(Action::OpenCreateIn("Interactives".into()))
         );
     }
 }

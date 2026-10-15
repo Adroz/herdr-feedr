@@ -9,7 +9,8 @@ use ratatui::widgets::{Block, Clear, Padding, Paragraph};
 use ratatui::Frame;
 
 /// Toolbar text; the click span in input.rs must match these columns:
-/// "clear completed" at 0..=14. Round-3 item 2 moved the collapse chevron
+/// "clear completed" at 0..=14. Drawn at the bottom, between the Done row
+/// and the status row. Round-3 item 2 moved the collapse chevron
 /// off the toolbar onto the bottom-right of the status row
 /// (`draw_status_row`) — herdr's own native position for it. Round-4 item 1
 /// dropped "file" from the toolbar entirely; the internal file viewer stays
@@ -74,14 +75,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         render_collapsed_rail(f, area, app);
         return;
     }
-    let [toolbar, list, done, status] = Layout::vertical([
-        Constraint::Length(1),
+    let [list, done, toolbar, status] = Layout::vertical([
         Constraint::Min(0),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(area);
-    f.render_widget(Paragraph::new(TOOLBAR).style(theme::muted_row()), toolbar);
 
     let w = area.width as usize;
     let lines: Vec<Line> = app
@@ -98,6 +98,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             .style(theme::muted_row().add_modifier(Modifier::BOLD)),
         done,
     );
+    f.render_widget(Paragraph::new(TOOLBAR).style(theme::muted_row()), toolbar);
     draw_status_row(f, status, app);
 
     draw_modal(f, app);
@@ -472,15 +473,15 @@ mod tests {
         );
         app.status_msg = Some("hello".into());
         let rows = render_to_strings(&mut app, 20, 12);
-        assert_eq!(rows[0], "clear completed"); // round-4: "file" removed from toolbar
-        assert_eq!(rows[1], "[ ] Fix auth redire…"); // ellipsized at 20 cols
-        assert_eq!(rows[2], "[~] Migrate CI");
-        assert_eq!(rows[3], "  @claude >"); // live working glyph
-        assert_eq!(rows[4], "Agent");
-        assert_eq!(rows[5], "[?] Add retry to de…");
-        assert_eq!(rows[6], "  @claude >");
-        assert_eq!(rows[7], "+ add");
-        assert_eq!(rows[10], "Done (1)"); // bottom-pinned, h-2
+        assert_eq!(rows[0], "[ ] Fix auth redire…"); // ellipsized at 20 cols
+        assert_eq!(rows[1], "[~] Migrate CI");
+        assert_eq!(rows[2], "  @claude >"); // live working glyph
+        assert_eq!(rows[3], "Agent");
+        assert_eq!(rows[4], "[?] Add retry to de…");
+        assert_eq!(rows[5], "  @claude >");
+        assert_eq!(rows[6], "+ add");
+        assert_eq!(rows[9], "Done (1)"); // bottom-pinned, h-3
+        assert_eq!(rows[10], "clear completed"); // under Done, h-2
                                           // status line, h-1: "hello" on the left, « pinned bottom-right
                                           // (round-3 item 2 — native-herdr collapse position). 20-col row:
                                           // "hello" (5) + 14 blank cells + « (1) = 20.
@@ -619,14 +620,14 @@ mod tests {
             },
         );
         let rows = render_to_strings(&mut app, 20, 12);
-        assert_eq!(rows[3], "  @claude ·");
+        assert_eq!(rows[2], "  @claude ·");
     }
 
     #[test]
     fn agent_glyph_hidden_when_socket_absent() {
         let mut app = app_with(SAMPLE); // statuses empty
         let rows = render_to_strings(&mut app, 20, 12);
-        assert_eq!(rows[3], "  @claude"); // sub-line still shown, no glyph
+        assert_eq!(rows[2], "  @claude"); // sub-line still shown, no glyph
     }
 
     /// The `»` restore chevron always renders on the bottom row (matching
@@ -755,7 +756,7 @@ mod tests {
         let mut app = app_with(SAMPLE);
         app.scroll = 2;
         let rows = render_to_strings(&mut app, 20, 12);
-        assert_eq!(rows[1], "  @claude"); // row index 2 of the row model
+        assert_eq!(rows[0], "  @claude"); // row index 2 of the row model
     }
 
     #[test]

@@ -70,17 +70,25 @@ pub enum Row {
 }
 
 /// Flatten the active feed into display rows; count archived items for Done(n).
+/// A section heading is only emitted once an item lands under it — an empty
+/// section has nothing to show, so its header would just be noise.
 pub fn build_rows(doc: &Document) -> (Vec<Row>, usize) {
     let mut rows = Vec::new();
     let mut done_count = 0usize;
+    let mut pending_section: Option<String> = None;
     for (i, n) in doc.nodes.iter().enumerate() {
         let archived = ops::zone_of(doc, i) == Zone::Archive;
         match n {
             Node::Item(_) if archived => done_count += 1,
             Node::Heading { level: 2, text } if !archived => {
-                rows.push(Row::Section(text.clone()));
+                pending_section = Some(text.clone());
             }
+            // Any other heading (a level-1 zone) ends the pending section.
+            Node::Heading { .. } => pending_section = None,
             Node::Item(it) => {
+                if let Some(t) = pending_section.take() {
+                    rows.push(Row::Section(t));
+                }
                 let key = ItemKey::of(it);
                 rows.push(Row::Item {
                     key: key.clone(),
@@ -110,6 +118,8 @@ pub enum Action {
     Advance(ItemKey),
     OpenEdit(ItemKey),
     OpenCreate,
+    /// Create with the category pre-filled — clicking a section header.
+    OpenCreateIn(String),
     OpenDoneView,
     AgentClick(ItemKey),
     ScrollUp,
@@ -312,6 +322,10 @@ impl App {
             Action::OpenCreate => {
                 let suggestions = ops::section_names(&self.doc);
                 self.set_modal(Modal::Edit(EditModal::create(suggestions)))
+            }
+            Action::OpenCreateIn(section) => {
+                let suggestions = ops::section_names(&self.doc);
+                self.set_modal(Modal::Edit(EditModal::create_in(suggestions, &section)))
             }
             Action::OpenDoneView => self.set_modal(Modal::DoneView { scroll: 0 }),
             Action::OpenFileView => self.set_modal(Modal::FileView { scroll: 0 }),
@@ -660,6 +674,28 @@ mod tests {
                 "I:?:Add retry to deploy test",
                 "A:claude",
                 "+",
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_sections_render_no_header() {
+        let doc = parse(
+            "# Feed\n\n## Empty\n\n## Interactives\n\n- [ ] Build event db\n\n## Trailing\n",
+        );
+        let (rows, _) = build_rows(&doc);
+        assert_eq!(
+            rows,
+            vec![
+                Row::Section("Interactives".into()),
+                Row::Item {
+                    key: ItemKey {
+                        title: "Build event db".into(),
+                        state: State::Open,
+                    },
+                    agent: None,
+                },
+                Row::Add,
             ]
         );
     }

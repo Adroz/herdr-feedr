@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Reload every open feedr sidebar onto a freshly built binary. herdr never hot-reloads a
 # running pane's process, so after `cargo build --release` each sidebar keeps running the
-# old code until it is restarted. This closes each feedr-sidebar pane and immediately
-# re-docks a new one into the same tab (`feedr auto-dock-hook --force`, the same per-tab
-# dock the tab.created hook uses: left edge, configured width, no focus steal).
+# old code until it is restarted.
+#
+# Each sidebar is replaced IN PLACE: a new sidebar is split off the old one, then the old
+# one closes and the new one inherits its exact slot in the tab's split tree — no other
+# pane moves or resizes. `feedr fit-sidebar` then sets it to the configured width exactly
+# (its `width` share of the tab, capped at `max_width`), taking or giving the columns on
+# the far side of the tab's top split.
 #
 # Usage: scripts/reload-feedr.sh [--no-build] [--dry-run] [--tab <tab_id>]...
 #   --no-build   skip `cargo build --release` (binary already fresh)
@@ -11,13 +15,14 @@
 #   --tab ID     only reload the sidebar in this tab (repeatable); default is every tab
 #                in every workspace
 #
-# A failed build aborts before any pane is touched. A sidebar that is the only pane in
-# its tab is skipped: closing it would close the tab, and there'd be nothing to re-dock
-# beside. Per-pane state that lives only in the process (collapsed, scroll) resets.
+# A failed build aborts before any pane is touched. If the in-place split fails, it falls
+# back to closing the sidebar and re-docking a fresh one (`feedr auto-dock-hook --force`),
+# skipping a sidebar that is its tab's only pane since closing it would close the tab.
+# Per-pane state that lives only in the process (collapsed, scroll) resets.
 #
-# herdr activates a tab whenever a pane in it is swapped, so re-docking into background
-# tabs would drag the user's view around. Each workspace's active tab is snapshotted up
-# front and restored at the end, the focused workspace last so it stays in front.
+# Some herdr layout ops activate the tab they touch, which would drag the user's view
+# around. Each workspace's active tab is snapshotted up front and restored at the end,
+# the focused workspace last so it stays in front.
 #
 # Pane discovery matches the terminal title the sidebar sets on startup — same approach
 # and same sed-over-sorted-JSON parsing as open-feedr.sh (see its header for why).
@@ -96,14 +101,35 @@ failed=0
 [ "$dry_run" -eq 1 ] || trap restore_view EXIT
 while read -r pane_id tab_id; do
   wanted_tab "$tab_id" || continue
-  panes_in_tab="$(printf '%s\n' "$objects" | grep -c "\"tab_id\":\"${tab_id}\"" || true)"
-  if [ "$panes_in_tab" -le 1 ]; then
-    echo "skip   $tab_id: sidebar $pane_id is the tab's only pane"
-    skipped=$((skipped + 1))
-    continue
-  fi
   if [ "$dry_run" -eq 1 ]; then
     echo "would  $tab_id: reload sidebar $pane_id"
+    continue
+  fi
+
+  # In place: split the new sidebar off the old, then close the old.
+  new_id="$("$herdr_bin" plugin pane open --plugin herdr-feedr --entrypoint feedr-sidebar \
+    --placement split --direction right --target-pane "$pane_id" --no-focus 2>/dev/null \
+    | sed -n 's/.*"pane_id":"\([^"]*\)".*/\1/p' | head -n1 || true)"
+  if [ -n "$new_id" ]; then
+    if ! "$herdr_bin" pane close "$pane_id" >/dev/null; then
+      echo "FAIL   $tab_id: opened $new_id but could not close old sidebar $pane_id" >&2
+      failed=$((failed + 1))
+      continue
+    fi
+    if fit="$("$feedr_bin" fit-sidebar --pane "$new_id" 2>&1)"; then
+      echo "ok     $tab_id: replaced $pane_id with $new_id"
+    else
+      echo "ok     $tab_id: replaced $pane_id with $new_id (width not fitted: $fit)"
+    fi
+    reloaded=$((reloaded + 1))
+    continue
+  fi
+
+  # Fallback: close and re-dock. Never close a tab's only pane.
+  panes_in_tab="$(printf '%s\n' "$objects" | grep -c "\"tab_id\":\"${tab_id}\"" || true)"
+  if [ "$panes_in_tab" -le 1 ]; then
+    echo "skip   $tab_id: in-place reload failed and sidebar $pane_id is the tab's only pane"
+    skipped=$((skipped + 1))
     continue
   fi
   if ! "$herdr_bin" pane close "$pane_id" >/dev/null; then
@@ -112,7 +138,7 @@ while read -r pane_id tab_id; do
     continue
   fi
   if msg="$("$feedr_bin" auto-dock-hook --force --tab-id "$tab_id" 2>&1)"; then
-    echo "ok     $tab_id: $msg"
+    echo "ok     $tab_id: $msg (re-docked)"
     reloaded=$((reloaded + 1))
   else
     echo "FAIL   $tab_id: closed $pane_id but re-dock failed: $msg" >&2

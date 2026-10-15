@@ -103,6 +103,13 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Internal: size a sidebar pane to its configured width exactly. Run by
+    /// scripts/reload-feedr.sh after it swaps a fresh sidebar into place.
+    #[command(hide = true)]
+    FitSidebar {
+        #[arg(long)]
+        pane: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -229,8 +236,20 @@ pub fn run() -> Result<()> {
                 anyhow::anyhow!("auto-dock-hook: no tab id (pass --tab-id or set HERDR_TAB_ID)")
             })?;
         let mut runner = crate::tui::dock::HerdrCli::from_env();
-        let msg = crate::tui::dock::auto_dock_for_tab(&mut runner, &cfg, &tab_id)?;
+        let msg = crate::tui::dock::auto_dock_for_tab(
+            &mut runner,
+            &mut crate::tui::socket::UnixSocketClient::from_env(),
+            &cfg,
+            &tab_id,
+        )?;
         println!("{msg}");
+        return Ok(());
+    }
+    if let Cmd::FitSidebar { pane } = &cli.command {
+        let cfg = config::load_sidebar_config(&config::default_config_dir());
+        let mut runner = crate::tui::dock::HerdrCli::from_env();
+        let mut client = crate::tui::socket::UnixSocketClient::from_env();
+        crate::tui::dock::fit_width(&mut runner, &mut client, &cfg, pane)?;
         return Ok(());
     }
     if let Cmd::Skill { command } = &cli.command {
@@ -345,7 +364,11 @@ pub fn run() -> Result<()> {
             ops::sweep(&mut doc, &today);
             write::save_atomic(&doc, &path)?;
         }
-        Cmd::Sidebar { .. } | Cmd::AutoDockHook { .. } | Cmd::Whoami | Cmd::Skill { .. } => {
+        Cmd::Sidebar { .. }
+        | Cmd::AutoDockHook { .. }
+        | Cmd::FitSidebar { .. }
+        | Cmd::Whoami
+        | Cmd::Skill { .. } => {
             unreachable!()
         }
     }

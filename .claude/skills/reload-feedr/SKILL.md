@@ -5,7 +5,7 @@ description: Use when feedr sidebar code has changed and the running sidebars in
 
 # Reload feedr
 
-herdr never hot-reloads a pane's process: every open feedr sidebar keeps running the binary it started with. `scripts/reload-feedr.sh` rebuilds the release binary, then closes and re-docks the sidebar in every tab of every workspace.
+herdr never hot-reloads a pane's process: every open feedr sidebar keeps running the binary it started with. `scripts/reload-feedr.sh` rebuilds the release binary, then replaces the sidebar in every tab of every workspace in place: the new sidebar takes the old one's exact slot, and no other pane moves.
 
 ## Run it
 
@@ -26,12 +26,14 @@ It needs `HERDR_ENV=1`, so run it from inside herdr. A failed build stops the sc
 
 One line per sidebar (`ok`, `skip` or `FAIL`), then a summary. The exit code is non-zero if any sidebar failed.
 
-- `skip … only pane`: the sidebar is alone in its tab. Closing it would close the tab, so the script leaves it alone.
+- `ok … (width not fitted: …)`: the sidebar was reloaded but kept its old width. Usually it shares no side-by-side split with anything.
+- `ok … (re-docked)`: the in-place swap failed, so the script closed the sidebar and docked a fresh one at the left edge instead.
+- `skip … only pane`: the in-place swap failed and the sidebar is alone in its tab. The script left it alone, because closing it would close the tab.
 - `FAIL … re-dock failed`: that tab now has no sidebar. Fix the error, then rerun with `--tab <id>`.
 
 ## What the user should expect
 
-- The sidebars come back docked left at the configured width, capped at `max_width`. A width someone dragged by hand is not kept.
+- Every sidebar is set to exactly the configured width: its `width` share of the tab, capped at `max_width` (46 columns by default). Panes next to it keep their widths. The difference comes out of the panes on the other side of the tab, and a width someone dragged by hand is not kept.
 - Collapsed state and scroll position reset to the defaults.
 - The user's view and focus are restored when it finishes: each workspace goes back to its active tab, and the work pane keeps focus rather than the sidebar. The screen may flicker while it runs.
 - Report the summary line. If anything was skipped or failed, list the tab ids.

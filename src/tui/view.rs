@@ -68,6 +68,40 @@ pub fn ellipsize(s: &str, width: usize) -> String {
     t
 }
 
+/// Where the Today panel and the scrolling list sit inside the list region
+/// (everything above the Done row). Shared with `input::click` so drawn and
+/// clicked rows can never drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListLayout {
+    /// The bordered Today panel, pinned to the top; zero-height when Today
+    /// is empty.
+    pub today: Rect,
+    /// The scrolling list, below the panel and a blank row.
+    pub list: Rect,
+}
+
+pub fn list_layout(area: Rect, today_rows: usize) -> ListLayout {
+    if today_rows == 0 {
+        return ListLayout {
+            today: Rect { height: 0, ..area },
+            list: area,
+        };
+    }
+    let panel_h = (today_rows as u16).saturating_add(2).min(area.height);
+    let today = Rect {
+        height: panel_h,
+        ..area
+    };
+    // One blank row between the panel and the list, when there's room.
+    let taken = panel_h.saturating_add(1).min(area.height);
+    let list = Rect {
+        y: area.y + taken,
+        height: area.height - taken,
+        ..area
+    };
+    ListLayout { today, list }
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     if app.collapsed {
@@ -83,7 +117,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     ])
     .areas(area);
 
-    let w = area.width as usize;
+    let ListLayout { today, list } = list_layout(list, app.today_rows.len());
+    if today.height > 0 {
+        let border = theme::today_border(app.today_over_cap);
+        let block = Block::bordered()
+            .border_style(border)
+            .title(Span::styled(" Today ", border.add_modifier(Modifier::BOLD)));
+        let inner_w = block.inner(today).width as usize;
+        let rows: Vec<Line> = app
+            .today_rows
+            .iter()
+            .map(|r| row_line(app, r, inner_w))
+            .collect();
+        f.render_widget(Paragraph::new(rows).block(block), today);
+    }
+
+    let w = list.width as usize;
     let lines: Vec<Line> = app
         .rows
         .iter()
@@ -292,8 +341,7 @@ fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
     let outer = Block::bordered()
         .style(theme::modal_panel_style())
         .border_style(theme::modal_border())
-        .title_style(theme::modal_title())
-        .title(if is_edit { "Edit item" } else { "New item" })
+        .title(edit_modal_title(m, is_edit))
         .padding(Padding::uniform(1));
     f.render_widget(outer, layout.outer);
 
@@ -326,7 +374,7 @@ fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
     }
 
     let hint = if is_edit {
-        "Tab field · ^S save · ^D delete · Esc cancel"
+        "Tab field · ^T today · ^S save · ^D delete · Esc cancel"
     } else {
         "Tab field · ^S save · Esc cancel"
     };
@@ -354,6 +402,20 @@ fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
             layout.dropdown_inner,
         );
     }
+}
+
+/// "Edit item ── ☆ Today": the Today toggle sits in the top border, right
+/// of the title (edit mode only — a new item can't be marked yet).
+fn edit_modal_title(m: &modal::EditModal, is_edit: bool) -> Line<'static> {
+    if !is_edit {
+        return Line::styled("New item", theme::modal_title());
+    }
+    let toggle = if m.today { "★ Today" } else { "☆ Today" };
+    Line::from(vec![
+        Span::styled("Edit item", theme::modal_title()),
+        Span::styled(" ── ", theme::modal_border()),
+        Span::styled(toggle, theme::today_toggle(m.today)),
+    ])
 }
 
 fn render_button(f: &mut Frame, area: Rect, label: &str, focused: bool) {
@@ -415,6 +477,10 @@ fn row_line(app: &App, row: &Row, w: usize) -> Line<'static> {
         }
         // Round-2 item 3: de-emphasized like the toolbar/Done/status rows —
         // it's chrome, not a task.
+        Row::Category(name) => Line::styled(
+            format!("    {}", ellipsize(name, w.saturating_sub(4))),
+            theme::today_category(),
+        ),
         Row::Add => Line::styled("+ add", theme::muted_row()),
     }
 }
@@ -436,6 +502,8 @@ mod tests {
             width: 0.18,
             max_width: 46,
             auto_dock: false,
+            auto_close: true,
+            quit_herdr_when_last: true,
         }
     }
 

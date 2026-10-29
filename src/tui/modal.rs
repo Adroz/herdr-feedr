@@ -86,6 +86,15 @@ pub struct EditModal {
     /// Category, title and body lines as the modal opened — the baseline
     /// `is_dirty` compares against.
     loaded: [Vec<String>; 3],
+    /// The pending Today toggle (`☆`/`★ Today` in the top border, Ctrl+T),
+    /// applied on save. Edit mode only.
+    pub today: bool,
+    /// Whether the item was in Today when the modal opened — save touches
+    /// `@today` only when `today` differs, and it counts toward dirty.
+    pub loaded_today: bool,
+    /// Today was already full of OTHER items when the modal opened, so
+    /// Ctrl+T refuses to mark this one. Save re-checks against the disk.
+    pub today_full: bool,
 }
 
 impl EditModal {
@@ -106,6 +115,9 @@ impl EditModal {
             pending_clipboard: None,
             drawn_fields: None,
             loaded: Default::default(),
+            today: false,
+            loaded_today: false,
+            today_full: false,
         };
         // Bodies are prose: wrap them. Title and category stay unwrapped —
         // they're single-line fields in a 3-row box, where a wrapped second
@@ -129,10 +141,11 @@ impl EditModal {
         self.loaded = self.fields();
     }
 
-    /// Whether the title, body or category differ from what was loaded.
-    /// Typing a change and then undoing it by hand is clean again.
+    /// Whether the title, body, category or Today toggle differ from what
+    /// was loaded. Typing a change and then undoing it by hand is clean
+    /// again.
     pub fn is_dirty(&self) -> bool {
-        self.fields() != self.loaded
+        self.fields() != self.loaded || self.today != self.loaded_today
     }
 
     /// Create with the category pre-filled (clicking a section header):
@@ -175,6 +188,9 @@ impl EditModal {
             pending_clipboard: None,
             drawn_fields: None,
             loaded: Default::default(),
+            today: item.today,
+            loaded_today: item.today,
+            today_full: false,
         };
         m.mark_loaded();
         // Unfocused fields keep `TextArea::new`'s (0,0) cursor so they
@@ -634,6 +650,9 @@ pub enum ModalStep {
     /// An outside click on a dirty edit modal: it stays open, and only `App`
     /// can put the "how to leave" hint on the status line.
     Unsaved(EditModal),
+    /// Ctrl+T on an item while Today is full of others: the toggle stays
+    /// unset, and only `App` can say so on the status line.
+    TodayFull(EditModal),
 }
 
 /// Status hint for an outside click that a dirty edit modal refused.
@@ -849,6 +868,16 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
             }
             (KeyCode::Char('s'), mods) if mods.contains(KeyModifiers::CONTROL) => {
                 return ModalStep::Save(m);
+            }
+            // Today toggle; a new item has no slot to claim yet.
+            (KeyCode::Char('t'), mods)
+                if mods.contains(KeyModifiers::CONTROL) && m.original.is_some() =>
+            {
+                if !m.today && m.today_full {
+                    return ModalStep::TodayFull(m);
+                }
+                m.today = !m.today;
+                return ModalStep::Continue(Modal::Edit(m));
             }
             (KeyCode::Char('d'), mods)
                 if mods.contains(KeyModifiers::CONTROL) && m.original.is_some() =>

@@ -4,7 +4,7 @@ expression: "d.screen().join(\"\\n\")"
 ---
 [ ] Alpha
 + add
-  ┌Edit item─────────────────────────┐
+  ┌Edit item ── ☆ Today──────────────┐
   │                                  │
   │ ┌Category*─────────────────────┐ │
   │ │                              │ │
@@ -21,7 +21,7 @@ expression: "d.screen().join(\"\\n\")"
   │ │                              │ │
   │ └──────────────────────────────┘ │
   │ [ Save ]  [ Cancel ]  [ Delete ] │
-  │ Tab field · ^S save · ^D delete  │
+  │ Tab field · ^T today · ^S save · │
   │                                  │
 Do└──────────────────────────────────┘
 clear completed

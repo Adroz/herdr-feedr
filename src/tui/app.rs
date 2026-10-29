@@ -88,7 +88,47 @@ pub enum Row {
         key: ItemKey,
         agent: AgentRef,
     },
+    /// A Today item's home section, on the muted sub-line under its title.
+    Category(String),
     Add,
+}
+
+/// Whether an item holds a Today slot (and so shows in the Today panel).
+/// A hand-typed `[x] … @today` doesn't: Today is uncompleted items only.
+fn in_today(it: &Item) -> bool {
+    it.today && it.state != State::Done
+}
+
+/// An item's title row, plus its `@agent` sub-line when claimed.
+fn push_item_rows(rows: &mut Vec<Row>, it: &Item) {
+    let key = ItemKey::of(it);
+    rows.push(Row::Item {
+        key: key.clone(),
+        agent: it.agent.clone(),
+    });
+    if let Some(a) = &it.agent {
+        rows.push(Row::AgentLine {
+            key,
+            agent: a.clone(),
+        });
+    }
+}
+
+/// The Today panel's rows, in file order: each item's title row, its home
+/// section sub-line, then its `@agent` sub-line when claimed. Empty when
+/// nothing is in Today (the panel is then not drawn).
+pub fn build_today_rows(doc: &Document) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for (i, n) in doc.nodes.iter().enumerate() {
+        if let Node::Item(it) = n {
+            if in_today(it) && ops::zone_of(doc, i) != Zone::Archive {
+                let start = rows.len();
+                push_item_rows(&mut rows, it);
+                rows.insert(start + 1, Row::Category(ops::section_name(doc, i)));
+            }
+        }
+    }
+    rows
 }
 
 /// Flatten the active feed into display rows; count archived items for Done(n).
@@ -107,21 +147,13 @@ pub fn build_rows(doc: &Document) -> (Vec<Row>, usize) {
             }
             // Any other heading (a level-1 zone) ends the pending section.
             Node::Heading { .. } => pending_section = None,
+            // Today items show only in the Today panel.
+            Node::Item(it) if in_today(it) => {}
             Node::Item(it) => {
                 if let Some(t) = pending_section.take() {
                     rows.push(Row::Section(t));
                 }
-                let key = ItemKey::of(it);
-                rows.push(Row::Item {
-                    key: key.clone(),
-                    agent: it.agent.clone(),
-                });
-                if let Some(a) = &it.agent {
-                    rows.push(Row::AgentLine {
-                        key,
-                        agent: a.clone(),
-                    });
-                }
+                push_item_rows(&mut rows, it);
             }
             _ => {}
         }
@@ -163,6 +195,11 @@ pub struct App {
     pub cfg: SidebarConfig,
     pub doc: Document,
     pub rows: Vec<Row>,
+    /// The Today panel's rows, pinned above `rows` (empty = no panel).
+    pub today_rows: Vec<Row>,
+    /// More than `ops::TODAY_CAP` items in Today (only a hand edit gets
+    /// there): the panel's outline turns red.
+    pub today_over_cap: bool,
     pub done_count: usize,
     pub scroll: usize,
     pub collapsed: bool,
@@ -196,6 +233,7 @@ pub struct App {
     /// `herdr` CLI runner for the collapse/expand pane resize. Injected so
     /// tests record the calls instead of spawning the real binary.
     pub herdr_cli: Box<dyn Runner>,
+    auto_close: crate::tui::auto_close::AutoClose,
     /// How long a write waits for the feed lock held by another writer.
     pub lock_timeout: std::time::Duration,
 }
@@ -207,6 +245,8 @@ impl App {
             cfg,
             doc: Document::default(),
             rows: Vec::new(),
+            today_rows: Vec::new(),
+            today_over_cap: false,
             done_count: 0,
             scroll: 0,
             collapsed: false,
@@ -224,6 +264,7 @@ impl App {
             clipboard: Box::new(SystemClipboard::new()),
             clock: Box::new(SystemClock),
             herdr_cli: Box::new(HerdrCli::from_env()),
+            auto_close: Default::default(),
             lock_timeout: lock::timeout_from_env(),
         }
     }
@@ -231,6 +272,8 @@ impl App {
     pub fn rebuild(&mut self) {
         let (rows, done) = build_rows(&self.doc);
         self.rows = rows;
+        self.today_rows = build_today_rows(&self.doc);
+        self.today_over_cap = ops::today_count(&self.doc) > ops::TODAY_CAP;
         self.done_count = done;
         self.scroll = self.scroll.min(self.rows.len().saturating_sub(1));
     }
@@ -362,7 +405,10 @@ impl App {
                     if let Node::Item(it) = &self.doc.nodes[i] {
                         let section = ops::item_section(&self.doc, i);
                         let suggestions = ops::section_names(&self.doc);
-                        self.set_modal(Modal::Edit(EditModal::edit(key, it, section, suggestions)));
+                        let mut m = EditModal::edit(key, it, section, suggestions);
+                        let others = ops::today_count(&self.doc) - usize::from(in_today(it));
+                        m.today_full = others >= ops::TODAY_CAP;
+                        self.set_modal(Modal::Edit(m));
                     }
                 }
             }
@@ -476,6 +522,10 @@ impl App {
                 self.status_msg = Some(crate::tui::modal::UNSAVED_HINT.into());
                 Modal::Edit(m)
             }
+            ModalStep::TodayFull(m) => {
+                self.status_msg = Some(ops::OpError::TodayFull.to_string());
+                Modal::Edit(m)
+            }
         };
         // `edit_step` stays pure — no process spawning there — so a
         // Ctrl+C/Ctrl+X only records the yanked text in
@@ -523,10 +573,25 @@ impl App {
                     (None, None) => false,
                     _ => true,
                 };
+                // Touch `@today` only when the toggle moved, so an untouched
+                // toggle never undoes a hand edit made while the modal was up.
+                let today = (m.today != m.loaded_today).then_some(m.today);
                 let mut found = true;
+                let mut today_refused = false;
                 self.with_feed(|doc| match relocate_for_edit(doc, &key) {
                     Some(i) => {
                         ops::edit(doc, i, &title, &body);
+                        // Before the move: moving changes the item's index.
+                        match today {
+                            Some(true) => {
+                                if let Err(e) = ops::set_today(doc, i) {
+                                    today_refused = true;
+                                    return Err(e.into());
+                                }
+                            }
+                            Some(false) => ops::clear_today(doc, i),
+                            None => {}
+                        }
                         if moved {
                             ops::move_to_section(doc, i, target.as_deref())?;
                         }
@@ -542,6 +607,15 @@ impl App {
                 // Keep the modal (and the typed text) up rather than
                 // silently throwing the edit away with the item.
                 if !found {
+                    return Modal::Edit(m);
+                }
+                // Today filled up on disk since the modal opened: nothing
+                // was written; the toggle drops back so a re-save keeps the
+                // rest of the edit.
+                if today_refused {
+                    let mut m = m;
+                    m.today = false;
+                    m.today_full = true;
                     return Modal::Edit(m);
                 }
             }
@@ -636,13 +710,17 @@ impl App {
         }
     }
 
+    /// The Today panel's rows, then the list's: every item shown, once.
+    fn all_rows(&self) -> impl Iterator<Item = &Row> {
+        self.today_rows.iter().chain(&self.rows)
+    }
+
     /// Count of active items still to do — `[ ]` or `[~]` — the number shown
     /// on the collapsed rail (Plan 3c). Deliberately excludes `[?]` (its own
     /// indicator) and `[x]` (shown separately as `Done (n)` in the expanded
     /// view; not "open" work).
     pub fn open_task_count(&self) -> usize {
-        self.rows
-            .iter()
+        self.all_rows()
             .filter(|r| {
                 matches!(r, Row::Item { key, .. } if matches!(key.state, State::Open | State::InProgress))
             })
@@ -652,8 +730,7 @@ impl App {
     /// Count of active items awaiting review (`[?]`) — the collapsed rail's
     /// mauve indicator.
     pub fn review_task_count(&self) -> usize {
-        self.rows
-            .iter()
+        self.all_rows()
             .filter(|r| matches!(r, Row::Item { key, .. } if key.state == State::Review))
             .count()
     }
@@ -663,10 +740,33 @@ impl App {
     /// agents actually referenced by the feed (rows), not every agent herdr
     /// happens to know about.
     pub fn any_linked_agent_blocked(&self) -> bool {
-        self.rows.iter().any(|r| {
+        self.all_rows().any(|r| {
             matches!(r, Row::AgentLine { agent, .. }
                 if self.statuses.get(&agent.id).map(|i| i.status) == Some(AgentStatus::Blocked))
         })
+    }
+
+    /// Time-driven work, once per loop step: the auto-close re-check.
+    pub fn tick(&mut self) {
+        use crate::tui::auto_close::Verdict;
+        let Some(own) = self.herdr_pane_id.as_deref() else {
+            return;
+        };
+        if !self.cfg.auto_close {
+            return;
+        }
+        let now = self.clock.now();
+        let quit = self.cfg.quit_herdr_when_last;
+        match self.auto_close.tick(own, now, quit, self.herdr.as_mut()) {
+            Verdict::Stay => {}
+            Verdict::Exit => self.should_quit = true,
+            Verdict::StopServerThenExit => {
+                // A failed stop still exits: herdr then just opens a fresh
+                // default workspace, as it did before auto-close.
+                let _ = self.herdr.stop_server();
+                self.should_quit = true;
+            }
+        }
     }
 
     pub fn on_event(&mut self, ev: crate::tui::AppEvent) {
@@ -684,7 +784,13 @@ impl App {
                     a.status = status;
                 }
             }
-            crate::tui::AppEvent::Layout { .. } => {}
+            crate::tui::AppEvent::Layout { pane_ids, .. } => {
+                if let (true, Some(own)) = (self.cfg.auto_close, self.herdr_pane_id.as_deref()) {
+                    let now = self.clock.now();
+                    self.auto_close
+                        .on_layout(own, &pane_ids, now, self.herdr.as_mut());
+                }
+            }
             crate::tui::AppEvent::SocketDown => self.statuses.clear(),
         }
     }
@@ -738,6 +844,7 @@ mod tests {
                 Row::Section(t) => format!("S:{t}"),
                 Row::Item { key, .. } => format!("I:{}:{}", key.state.to_char(), key.title),
                 Row::AgentLine { agent, .. } => format!("A:{}", agent.kind),
+                Row::Category(c) => format!("C:{c}"),
                 Row::Add => "+".into(),
             })
             .collect();
@@ -835,6 +942,8 @@ mod tests {
             width: 0.18,
             max_width: 46,
             auto_dock: false,
+            auto_close: true,
+            quit_herdr_when_last: true,
         }
     }
 

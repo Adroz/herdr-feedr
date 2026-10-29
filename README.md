@@ -2,21 +2,26 @@
 
 The feed rack for your herd — a markdown-backed to-do sidebar for [Herdr](https://herdr.dev), shared between you and your coding agents. You keep a plain to-do list; agents pull work from it, add their own, and report back — all through one file you can always open in any editor.
 
-**Status: core + CLI + sidebar TUI + herdr plugin packaging implemented** (`cargo install --path .` → `feedr sidebar`, or `feedr sidebar --dock` inside herdr; or install as a herdr plugin — see below). The agent skill is next; the v1 spec is in [docs/SPEC.md](docs/SPEC.md); it was decided through the wayfinder map in [issue #1](https://github.com/Adroz/herdr-feedr/issues/1) (research findings live on `research/*` branches, format prototypes on `prototype/feed-format`).
+<img src="docs/screenshot.png" alt="The feedr sidebar: a Today panel with three items above sections of to-dos, two of them claimed by @claude" width="331">
 
-Planned shape: one Rust binary — a ratatui sidebar pane (via the herdr plugin system) plus a `feedr` CLI that agents drive through a shipped skill.
+- **One markdown file** (`~/.config/herdr-feedr/feed.md` by default): GFM checkboxes, `##` sections, an indented body per item for agent context. Hand edits are respected.
+- **A sidebar in every tab**: click a checkbox to advance `[ ]` → `[~]` → `[x]`, click a title to edit, mark up to three items as **Today**, select text to copy.
+- **Agents work the same list** through the `feedr` CLI and a shipped skill: they list, claim (`@agent(...)`), add, and hand items back for review (`[?]`).
+- **Safe to share**: every write is locked and atomic, so you and your agents never lose each other's edits.
 
-## Install as a herdr plugin
+The design is in [docs/SPEC.md](docs/SPEC.md).
 
-herdr-feedr ships a `herdr-plugin.toml` manifest (see [docs/SPEC.md §8](docs/SPEC.md)) that packages the sidebar as a herdr plugin pane, plus two actions to open it: `open-feedr` (open-or-focus, docked to the `[sidebar]` side, left by default) and `toggle-feedr` (close if open, else open). v1 supports Linux and macOS; there's no Windows packaging yet.
+## Install
 
-### Published install
+**Requirements:** [herdr](https://herdr.dev) 0.9.0+ on macOS or Linux, and a [Rust toolchain](https://rustup.rs). v1 builds from source; prebuilt binaries are tracked in [#42](https://github.com/Adroz/herdr-feedr/issues/42). Windows isn't supported yet.
 
 ```sh
 herdr plugin install Adroz/herdr-feedr
 ```
 
-herdr clones the repo, runs `scripts/build.sh` (`cargo build --release` — a Rust toolchain is required; there's no prebuilt-binary download in v1), and registers the `feedr-sidebar` pane and the `open-feedr`/`toggle-feedr` actions.
+herdr clones the repo, runs `scripts/build.sh` (`cargo build --release`), and registers the `feedr-sidebar` pane plus two actions: `open-feedr` (open or focus the sidebar, docked to the configured side, left by default) and `toggle-feedr` (close if open, else open). Then install the agent skill (see [Teach your agent](#teach-your-agent) below).
+
+Outside herdr, `cargo install --path .` gives you the `feedr` CLI, and `feedr sidebar` runs the sidebar in any terminal.
 
 ### Local development
 

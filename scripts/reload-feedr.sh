@@ -25,7 +25,7 @@
 # the focused workspace last so it stays in front.
 #
 # Pane discovery matches the terminal title the sidebar sets on startup — same approach
-# and same sed-over-sorted-JSON parsing as open-feedr.sh (see its header for why).
+# and same sed-over-sorted-JSON parsing as toggle-feedr.sh (see its header for why).
 set -euo pipefail
 
 herdr_bin="${HERDR_BIN_PATH:-herdr}"

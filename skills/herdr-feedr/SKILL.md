@@ -5,7 +5,7 @@ description: Use when working items from the herdr-feedr feed — the shared mar
 
 # herdr-feedr
 
-> Skill version 0.1.0 — requires feedr CLI >= 0.1.0. Run `feedr skill status` if commands here don't match the binary.
+> Skill version 0.2.0 — requires feedr CLI >= 0.2.0. Run `feedr skill status` if commands here don't match the binary.
 
 The feed is one markdown file shared by a human and their agents. It's rendered live in a
 sidebar pane; you reach it through the `feedr` CLI.
@@ -55,8 +55,15 @@ feedr claim auth
 That sets `[~]` and stamps your ref. Claim **before** you start working, not after — the stamp
 is what tells the human (and other agents) the item is taken.
 
+### Today
+
+Items flagged `★ Today` in `list` and `show` are the human's **Today**: their current focus,
+at most three items. Today is the human's call, not yours — no command sets or clears it, and
+it drops off on its own when an item is done.
+
 **If you arrive without a specific task** — the human just said "grab something off the feed" —
-list the open items, say which one you propose, and **ask**. Never auto-grab.
+list the open items, name the Today items first and propose one of them (fall back to the rest
+of the list only when Today is empty or all of it is taken), and **ask**. Never auto-grab.
 
 ## While you work
 

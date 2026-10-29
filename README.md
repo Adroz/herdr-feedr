@@ -34,6 +34,16 @@ Rebuild loop while iterating:
 
 `herdr plugin list` shows whether herdr-feedr loaded, with its pane and both actions.
 
+### Render snapshots
+
+Sidebar layouts (Today panel, list, edit modal, Done archive, file view) are pinned as [`insta`](https://insta.rs) text snapshots in `src/tui/snapshots/`, so a layout change shows up as a reviewable diff. When `cargo test` fails on a snapshot:
+
+1. `cargo install cargo-insta` (once).
+2. `cargo insta review` — read each diff. Accept it only if the change is one you meant to make; otherwise fix the code.
+3. Commit the updated `.snap` files with the change that caused them. Never commit `.snap.new` files.
+
+A new snapshot test fails until its first `.snap` is accepted the same way. CI never writes snapshots, so an unreviewed one fails the build there. Snapshots are text only — colour and style are asserted in ordinary tests.
+
 ### Bind keys
 
 Bind the actions to keys in `~/.config/herdr/config.toml` (`type = "plugin_action"`, `command = "<plugin-id>.<action-id>"` — the same shape herdr-file-viewer uses for its own binding):

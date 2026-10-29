@@ -106,6 +106,8 @@ impl Driver {
         app.clock = Box::new(clock.clone());
         app.clipboard = Box::new(clipboard.clone());
         app.herdr_cli = Box::new(RecordingCli(herdr_log.clone()));
+        // Short, and never from the env: a held lock fails fast in tests.
+        app.lock_timeout = Duration::from_millis(50);
         app.reload();
         let (tx, rx) = mpsc::channel();
         let mut d = Driver {
@@ -163,8 +165,19 @@ impl Driver {
         self.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
     }
 
-    // No consumer yet: bracketed paste lands later in spec #22.
-    #[allow(dead_code)]
+    /// Left press on the first cell of `path`, drag through the rest, and
+    /// release on the last.
+    pub fn drag(&mut self, path: &[(u16, u16)]) {
+        let (&(x0, y0), rest) = path.split_first().expect("a drag needs a start cell");
+        self.mouse(MouseEventKind::Down(MouseButton::Left), x0, y0);
+        for &(x, y) in rest {
+            self.mouse(MouseEventKind::Drag(MouseButton::Left), x, y);
+        }
+        let &(x, y) = path.last().unwrap();
+        self.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
+    }
+
+    /// A bracketed terminal paste, delivered as one event.
     pub fn paste(&mut self, text: &str) {
         self.event(Event::Paste(text.into()));
     }
@@ -290,6 +303,218 @@ mod tests {
         assert!(d.exit_requested());
     }
 
+    // --- Click/drag positions in edit fields (#32) --------------------------
+    //
+    // At 40x24 the edit modal's Body field draws its text in columns 5..=34
+    // (30 cells) from row 11 down (6 rows) (see the `edit_modal_open` snapshot). Each
+    // test clicks a cell, types a marker and saves, so the feed shows exactly
+    // which logical character the click landed on.
+
+    const BODY_X: u16 = 5;
+    const BODY_Y: u16 = 11;
+
+    /// Open the edit modal for the first item, as a user would.
+    fn open_first_item(feed: &str) -> Driver {
+        let mut d = Driver::new(feed, 40, 24);
+        d.click(6, 0);
+        assert!(d.screen().iter().any(|l| l.contains("Edit item")));
+        d
+    }
+
+    fn save(d: &mut Driver) {
+        d.key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    }
+
+    #[test]
+    fn a_click_on_a_wrapped_continuation_row_lands_under_the_pointer() {
+        // 33 chars: word-wraps after "six " so "seven" starts row 2.
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  one two three four five six seven\n");
+        assert!(
+            d.screen()[BODY_Y as usize + 1].contains("│seven"),
+            "{:#?}",
+            d.screen()
+        );
+
+        d.click(BODY_X + 2, BODY_Y + 1); // the 'v' of "seven"
+        d.type_str("X");
+        save(&mut d);
+
+        assert!(
+            d.feed().contains("  one two three four five six seXven\n"),
+            "got: {}",
+            d.feed()
+        );
+    }
+
+    /// Ten body lines in a six-row field: Tab into Body parks the cursor at
+    /// the end, which scrolls the field so "line4".."line9" are drawn.
+    fn scrolled_body() -> Driver {
+        let body: String = (0..10).map(|i| format!("  line{i}\n")).collect();
+        let mut d = open_first_item(&format!("# Feed\n\n- [ ] Alpha\n{body}"));
+        d.key(KeyCode::Tab, KeyModifiers::NONE); // Category -> Title
+        d.key(KeyCode::Tab, KeyModifiers::NONE); // Title -> Body, cursor at end
+        assert!(
+            d.screen()[BODY_Y as usize].contains("│line4"),
+            "{:#?}",
+            d.screen()
+        );
+        d
+    }
+
+    #[test]
+    fn a_click_in_a_scrolled_body_lands_under_the_pointer() {
+        let mut d = scrolled_body();
+
+        d.click(BODY_X + 1, BODY_Y); // the 'i' of the top drawn row, "line4"
+        assert!(
+            d.screen()[BODY_Y as usize].contains("│line4"),
+            "the click must not scroll the field away from what was clicked: {:#?}",
+            d.screen()
+        );
+        d.type_str("X");
+        save(&mut d);
+
+        assert!(d.feed().contains("  lXine4\n"), "got: {}", d.feed());
+    }
+
+    #[test]
+    fn a_click_after_wide_characters_lands_under_the_pointer() {
+        // 日, 本 and 🙂 each draw two cells wide, so 'a' is in cell 6.
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  日本🙂ab\n");
+
+        d.click(BODY_X + 6, BODY_Y);
+        d.type_str("X");
+        save(&mut d);
+
+        assert!(d.feed().contains("  日本🙂Xab\n"), "got: {}", d.feed());
+    }
+
+    #[test]
+    fn a_click_on_the_right_half_of_a_wide_character_lands_on_it() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  日本🙂ab\n");
+
+        d.click(BODY_X + 3, BODY_Y); // second cell of 本
+        d.type_str("X");
+        save(&mut d);
+
+        assert!(d.feed().contains("  日X本🙂ab\n"), "got: {}", d.feed());
+    }
+
+    fn copy(d: &mut Driver) -> Vec<String> {
+        d.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        d.clipboard_writes()
+    }
+
+    #[test]
+    fn a_drag_across_a_soft_wrap_selects_what_was_dragged_over() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  one two three four five six seven\n");
+
+        // From the 't' of "two" on row 1 to just after "sev" on the wrapped row 2.
+        d.drag(&[(BODY_X + 4, BODY_Y), (BODY_X + 3, BODY_Y + 1)]);
+
+        assert_eq!(copy(&mut d), ["two three four five six sev"]);
+    }
+
+    #[test]
+    fn a_drag_in_a_scrolled_body_selects_what_was_dragged_over() {
+        let mut d = scrolled_body();
+
+        // Top drawn row ("line4") down to the end of the third ("line6").
+        d.drag(&[(BODY_X, BODY_Y), (BODY_X + 5, BODY_Y + 2)]);
+
+        assert_eq!(copy(&mut d), ["line4\nline5\nline6"]);
+    }
+
+    #[test]
+    fn a_drag_after_wide_characters_selects_what_was_dragged_over() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  日本🙂abc\n");
+
+        // From 本 (cell 2) to just after 'b' (cell 8).
+        d.drag(&[(BODY_X + 2, BODY_Y), (BODY_X + 8, BODY_Y)]);
+
+        assert_eq!(copy(&mut d), ["本🙂ab"]);
+    }
+
+    #[test]
+    fn a_drag_that_leaves_the_field_keeps_the_last_in_field_endpoint() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  hello world\n");
+
+        // Over "hello", then up into the Title field: ignored, not redirected.
+        d.drag(&[
+            (BODY_X, BODY_Y),
+            (BODY_X + 5, BODY_Y),
+            (BODY_X + 2, BODY_Y - 3),
+        ]);
+
+        assert_eq!(copy(&mut d), ["hello"]);
+    }
+
+    #[test]
+    fn a_click_past_the_end_of_a_line_lands_at_its_end() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  hello\n");
+
+        d.click(BODY_X + 20, BODY_Y);
+        d.type_str("X");
+        save(&mut d);
+
+        assert!(d.feed().contains("  helloX\n"), "got: {}", d.feed());
+    }
+
+    #[test]
+    fn a_click_in_the_title_lands_under_the_pointer() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha beta\n");
+
+        d.click(BODY_X + 6, 8); // Title text row; the 'b' of "beta"
+        d.type_str("X");
+        save(&mut d);
+
+        assert_eq!(d.feed(), "# Feed\n\n- [ ] Alpha Xbeta\n");
+    }
+
+    #[test]
+    fn a_save_after_an_agent_claims_the_item_keeps_the_edit_and_the_claim() {
+        let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n", 40, 24);
+        d.click(6, 0);
+        d.key(KeyCode::Tab, KeyModifiers::NONE); // Category -> Title
+        d.type_str(" fixed");
+        d.key(KeyCode::Tab, KeyModifiers::NONE); // Title -> Body
+        d.type_str("notes");
+
+        // An agent claims the item while the modal is open.
+        std::fs::write(d.feed_path(), "# Feed\n\n- [~] Alpha @agent(claude:abc)\n").unwrap();
+        d.push(AppEvent::FeedChanged);
+        d.key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            d.feed(),
+            "# Feed\n\n- [~] Alpha fixed @agent(claude:abc)\n  notes\n"
+        );
+        assert!(!d.screen().iter().any(|l| l.contains("Edit item")));
+    }
+
+    #[test]
+    fn a_save_after_the_item_was_deleted_on_disk_says_so_and_keeps_the_modal() {
+        let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n- [ ] Beta\n", 40, 24);
+        d.click(6, 0);
+        d.key(KeyCode::Tab, KeyModifiers::NONE);
+        d.type_str(" fixed");
+
+        std::fs::write(d.feed_path(), "# Feed\n\n- [ ] Beta\n").unwrap();
+        d.push(AppEvent::FeedChanged);
+        d.key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        assert_eq!(d.feed(), "# Feed\n\n- [ ] Beta\n", "nothing written");
+        let screen = d.screen();
+        assert!(
+            screen.last().unwrap().contains("deleted on disk"),
+            "status row reports the miss: {screen:#?}"
+        );
+        assert!(
+            screen.iter().any(|l| l.contains("Alpha fixed")),
+            "the typed edit stays in the open modal"
+        );
+    }
+
     #[test]
     fn a_pushed_feed_change_redraws_from_disk() {
         let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n", 40, 12);
@@ -313,6 +538,26 @@ mod tests {
     fn sweep_stamps_the_injected_clock_date() {
         let mut d = Driver::new("# Feed\n\n- [x] Alpha\n", 40, 12);
         d.click(2, 10); // "clear completed" on the toolbar (row h-2)
+        assert!(d.feed().contains("@done(2026-01-15)"), "got: {}", d.feed());
+    }
+
+    #[test]
+    fn a_sidebar_write_waits_on_the_shared_feed_lock() {
+        let mut d = Driver::new("# Feed\n\n- [x] Alpha\n", 100, 12);
+        let before = d.feed();
+        let held = std::fs::File::create(d.feed_path().with_file_name("feed.md.lock")).unwrap();
+        held.lock().unwrap();
+
+        d.click(2, 10); // "clear completed" while another writer holds the lock
+        assert_eq!(d.feed(), before, "no write without the lock");
+        assert!(
+            d.screen().iter().any(|l| l.contains("feed.md.lock")),
+            "the status line names the lock: {:#?}",
+            d.screen()
+        );
+
+        drop(held);
+        d.click(2, 10);
         assert!(d.feed().contains("@done(2026-01-15)"), "got: {}", d.feed());
     }
 

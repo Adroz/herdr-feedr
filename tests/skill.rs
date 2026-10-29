@@ -142,3 +142,26 @@ fn the_skill_stamp_matches_the_crate_and_the_plugin_manifest() {
         "herdr-plugin.toml vs Cargo.toml"
     );
 }
+
+#[test]
+fn the_skill_names_the_today_flag_the_cli_prints() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = dir.path().join("feed.md");
+    std::fs::write(&feed, "# Feed\n\n- [ ] Fix auth @today\n").unwrap();
+    let out = common::feedr_in(dir.path())
+        .arg("--file")
+        .arg(&feed)
+        .arg("list")
+        .output()
+        .unwrap();
+    let line = String::from_utf8(out.stdout).unwrap();
+    let flag = line
+        .trim_end()
+        .strip_prefix("[ ] Fix auth  ")
+        .unwrap_or_else(|| panic!("unexpected list line {line:?}"));
+    assert!(
+        SKILL.contains(&format!("`{flag}`")),
+        "`feedr list` flags Today items with `{flag}`, but the skill never says so — \
+         an agent can't prefer what it can't recognise"
+    );
+}

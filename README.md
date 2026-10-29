@@ -8,7 +8,7 @@ Planned shape: one Rust binary — a ratatui sidebar pane (via the herdr plugin 
 
 ## Install as a herdr plugin
 
-herdr-feedr ships a `herdr-plugin.toml` manifest (see [docs/SPEC.md §8](docs/SPEC.md)) that packages the sidebar as a herdr plugin pane, plus two actions to open it: `open-feedr` (open-or-focus, docked to the left edge) and `toggle-feedr` (close if open, else open). v1 supports Linux and macOS; there's no Windows packaging yet.
+herdr-feedr ships a `herdr-plugin.toml` manifest (see [docs/SPEC.md §8](docs/SPEC.md)) that packages the sidebar as a herdr plugin pane, plus two actions to open it: `open-feedr` (open-or-focus, docked to the `[sidebar]` side, left by default) and `toggle-feedr` (close if open, else open). v1 supports Linux and macOS; there's no Windows packaging yet.
 
 ### Published install
 

@@ -748,3 +748,183 @@ fn a_hermetic_command_does_not_see_the_developers_feed_or_home() {
         .success()
         .stdout(contains("Fix auth redirect loop").not());
 }
+
+const TODAY_FEED: &str = "\
+# Feed
+
+- [ ] Fix auth redirect loop @today
+  Repro: bounces forever.
+- [ ] Write onboarding doc
+
+## Agent
+
+- [~] Backfill migration test @agent(claude:abc) @today
+";
+
+fn today_seed(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("feed.md");
+    std::fs::write(&path, TODAY_FEED).unwrap();
+    path
+}
+
+#[test]
+fn list_flags_today_items_and_only_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = today_seed(dir.path());
+    let out = feedr(&feed).arg("list").output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for line in [
+        "[ ] Fix auth redirect loop  ★ Today\n",
+        "[ ] Write onboarding doc\n",
+        "[~] Backfill migration test  @claude:abc  ★ Today\n",
+    ] {
+        assert!(stdout.contains(line), "want {line:?} in:\n{stdout}");
+    }
+    assert!(
+        !stdout.contains("@today"),
+        "the raw token is not the flag:\n{stdout}"
+    );
+}
+
+#[test]
+fn show_flags_a_today_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = today_seed(dir.path());
+    feedr(&feed)
+        .args(["show", "auth"])
+        .assert()
+        .success()
+        .stdout(contains("[ ] Fix auth redirect loop  ★ Today\n"))
+        .stdout(contains("Repro: bounces forever."));
+    feedr(&feed)
+        .args(["show", "onboarding"])
+        .assert()
+        .success()
+        .stdout(contains("Today").not());
+}
+
+#[test]
+fn done_strips_today_in_the_same_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = today_seed(dir.path());
+    feedr(&feed)
+        .args(["done", "Backfill", "--note", "landed"])
+        .assert()
+        .success();
+    feedr(&feed)
+        .args(["done", "auth", "--as-human"])
+        .assert()
+        .success();
+    let text = std::fs::read_to_string(&feed).unwrap();
+    assert!(
+        text.contains("- [x] Fix auth redirect loop\n"),
+        "got:\n{text}"
+    );
+    assert!(
+        text.contains("- [x] Backfill migration test @agent(claude:abc)\n"),
+        "got:\n{text}"
+    );
+    assert!(!text.contains("@today"), "got:\n{text}");
+}
+
+#[test]
+fn a_cli_write_leaves_an_over_cap_today_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = dir.path().join("feed.md");
+    let text = "# Feed\n\n- [ ] A @today\n- [ ] B @today\n- [ ] C @today\n- [ ] D @today\n";
+    std::fs::write(&feed, text).unwrap();
+    feedr(&feed).args(["add", "E"]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(&feed).unwrap(),
+        format!("{text}- [ ] E\n")
+    );
+}
+
+#[test]
+fn no_cli_command_sets_or_unsets_today() {
+    let home = tempfile::tempdir().unwrap();
+    let help = common::feedr_in(home.path())
+        .arg("--help")
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&help.stdout).to_lowercase();
+    assert!(
+        !help.contains("today"),
+        "Today is the human's alone:\n{help}"
+    );
+}
+
+// --- Write locking (SPEC §6) ------------------------------------------------
+
+#[test]
+fn parallel_adds_all_land() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    const N: usize = 24;
+    let outputs = common::feedr_parallel(dir.path(), N, |i| {
+        vec![
+            "--file".into(),
+            feed.display().to_string(),
+            "add".into(),
+            format!("Parallel item {i}"),
+        ]
+    });
+    for (i, out) in outputs.iter().enumerate() {
+        assert!(
+            out.status.success(),
+            "add {i} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let text = std::fs::read_to_string(&feed).unwrap();
+    let missing: Vec<_> = (0..N)
+        .filter(|i| !text.contains(&format!("- [ ] Parallel item {i}\n")))
+        .collect();
+    assert!(missing.is_empty(), "lost updates {missing:?} in:\n{text}");
+    assert!(text.contains("- [ ] Fix auth redirect loop\n"));
+}
+
+/// Hold `feed.md.lock` beside `feed` as another writer would.
+fn hold_lock(feed: &std::path::Path) -> std::fs::File {
+    let lock = std::fs::File::create(feed.with_file_name("feed.md.lock")).unwrap();
+    lock.lock().unwrap();
+    lock
+}
+
+#[test]
+fn a_write_that_cannot_get_the_lock_fails_naming_the_lock_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    let before = std::fs::read_to_string(&feed).unwrap();
+    let _held = hold_lock(&feed);
+    feedr(&feed)
+        .env("FEEDR_LOCK_TIMEOUT_MS", "200")
+        .args(["add", "Blocked"])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .failure()
+        .stderr(contains("feed.md.lock"))
+        .stderr(contains("timed out"));
+    assert_eq!(std::fs::read_to_string(&feed).unwrap(), before);
+}
+
+#[test]
+fn reads_do_not_wait_for_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    let _held = hold_lock(&feed);
+    feedr(&feed)
+        .env("FEEDR_LOCK_TIMEOUT_MS", "60000")
+        .arg("list")
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .success()
+        .stdout(contains("Fix auth redirect loop"));
+    feedr(&feed)
+        .env("FEEDR_LOCK_TIMEOUT_MS", "60000")
+        .args(["show", "auth"])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .success();
+}

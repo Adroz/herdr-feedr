@@ -202,7 +202,7 @@ fn draw_modal(f: &mut Frame, app: &mut App) {
     match &app.modal {
         Modal::None | Modal::Edit(_) => {}
         Modal::ConfirmDelete(m) => {
-            let area = modal::centered(f.area(), 80, 20);
+            let area = modal::confirm_rect(f.area());
             f.render_widget(Clear, area);
             let outer = Block::bordered()
                 .style(theme::modal_panel_style())
@@ -257,7 +257,8 @@ fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
     let is_edit = m.original.is_some();
     let layout = modal::edit_layout(f.area(), is_edit, m.claimed, m.dropdown_rows());
 
-    // Re-derive each field's viewport from origin every frame: tui-textarea
+    // Re-derive each field's viewport from origin whenever the fields' rects
+    // change (first frame, resize, the pre-zoom → zoomed jump): tui-textarea
     // only ever adjusts its viewport minimally to keep the cursor visible,
     // and never scrolls back when space frees up — so a scroll acquired at
     // the modal's first (narrow, pre-zoom) frame would otherwise stick for
@@ -265,6 +266,9 @@ fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
     // cursor-visibility pass compute the scroll fresh for the CURRENT size:
     // start-parked (unfocused) fields render unscrolled, and the focused
     // field's end-parked cursor is safe at any first-frame width.
+    // At an unchanged size the scroll is left alone: resetting it every
+    // frame would yank a scrolled body back to the top as soon as a click
+    // moved the cursor up, away from the text the user was pointing at.
     // (`i16::MIN + 1`, not `i16::MIN`: tui-textarea negates the delta
     // internally and `-i16::MIN` overflows. 32767 rows/cols is still far
     // beyond any feed item. And `scroll()` drags the CURSOR along to keep
@@ -274,10 +278,14 @@ fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
     // and restored around the reset. `Jump` back to the same spot is a
     // no-op for an active selection: the anchor is kept and the cursor
     // ends where it already was.)
-    for ta in [&mut m.category, &mut m.title, &mut m.body] {
-        let (row, col) = ta.cursor();
-        ta.scroll((i16::MIN + 1, i16::MIN + 1));
-        ta.move_cursor(tui_textarea::CursorMove::Jump(row as u16, col as u16));
+    let fields = [layout.category, layout.title, layout.body];
+    if m.drawn_fields != Some(fields) {
+        m.drawn_fields = Some(fields);
+        for ta in [&mut m.category, &mut m.title, &mut m.body] {
+            let (row, col) = ta.cursor();
+            ta.scroll((i16::MIN + 1, i16::MIN + 1));
+            ta.move_cursor(tui_textarea::CursorMove::Jump(row as u16, col as u16));
+        }
     }
 
     f.render_widget(Clear, layout.outer);
@@ -353,7 +361,7 @@ fn render_button(f: &mut Frame, area: Rect, label: &str, focused: bool) {
 }
 
 fn draw_viewer(f: &mut Frame, title: &str, text: &str, scroll: u16) {
-    let area = modal::centered(f.area(), 90, 80);
+    let area = modal::viewer_rect(f.area());
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(text.to_string())
@@ -560,6 +568,7 @@ mod tests {
             state: State::Open,
             title: "T".into(),
             agent: None,
+            today: false,
             style: Default::default(),
             done_date: None,
             body: vec![
@@ -1051,6 +1060,7 @@ mod tests {
             state: State::Open,
             title: "T".into(),
             agent: None,
+            today: false,
             style: Default::default(),
             done_date: None,
             body,
@@ -1091,6 +1101,7 @@ mod tests {
             state: State::Open,
             title: "A title long enough to overflow a narrow docked pane".into(),
             agent: None,
+            today: false,
             style: Default::default(),
             done_date: None,
             body: Vec::new(),

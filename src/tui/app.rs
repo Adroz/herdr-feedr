@@ -247,7 +247,8 @@ pub struct App {
     /// modal presses feed it, so the list click that opens a modal never
     /// pairs with a first click inside it.
     clicks: crate::tui::selection::ClickTracker,
-    /// How long a write waits for the feed lock held by another writer.
+    /// How long a write waits for the feed lock held by another writer
+    /// ([`lock::SIDEBAR_TIMEOUT`]; short, as the UI is frozen meanwhile).
     pub lock_timeout: std::time::Duration,
 }
 
@@ -279,7 +280,7 @@ impl App {
             herdr_cli: Box::new(HerdrCli::from_env()),
             auto_close: Default::default(),
             clicks: Default::default(),
-            lock_timeout: lock::timeout_from_env(),
+            lock_timeout: lock::SIDEBAR_TIMEOUT,
         }
     }
 
@@ -1281,6 +1282,29 @@ mod tests {
     /// mid-action NotFound must proceed with an empty Document instead of
     /// dropping, letting `save_atomic` create the file via its
     /// `create_dir_all`.
+    /// The sidebar can't redraw while it waits for the lock, so it gives up
+    /// fast — well inside the CLI's 5 s — and says the feed is busy.
+    #[test]
+    fn a_sidebar_write_on_a_held_lock_gives_up_within_a_quarter_second() {
+        let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [x] Alpha\n");
+        let held = std::fs::File::create(lock::lock_path(&app.feed_path)).unwrap();
+        held.lock().unwrap();
+
+        let start = std::time::Instant::now();
+        app.apply(Action::Sweep);
+        let waited = start.elapsed();
+
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "waited {waited:?}"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(200),
+            "waited {waited:?}"
+        );
+        assert!(app.status_msg.as_deref().unwrap().contains("feed busy"));
+    }
+
     #[test]
     fn with_feed_proceeds_on_missing_file_when_in_memory_doc_has_no_items() {
         let dir = tempfile::tempdir().unwrap();

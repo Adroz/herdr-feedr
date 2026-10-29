@@ -15,16 +15,21 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// How long a writer waits for the lock before giving up.
+/// How long a CLI writer waits for the lock before giving up.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Overrides [`DEFAULT_TIMEOUT`], in milliseconds.
+/// How long the sidebar waits. It can't redraw while waiting, so it gives
+/// up fast, reports the feed busy, and the user simply retries; the
+/// environment override does not apply to it.
+pub const SIDEBAR_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Overrides the CLI's [`DEFAULT_TIMEOUT`], in milliseconds.
 pub const TIMEOUT_ENV: &str = "FEEDR_LOCK_TIMEOUT_MS";
 
 const POLL: Duration = Duration::from_millis(10);
 
-/// The write-lock timeout: [`TIMEOUT_ENV`] when it's a valid number of
-/// milliseconds, else [`DEFAULT_TIMEOUT`].
+/// The CLI's write-lock timeout: [`TIMEOUT_ENV`] when it's a valid number
+/// of milliseconds, else [`DEFAULT_TIMEOUT`].
 pub fn timeout_from_env() -> Duration {
     std::env::var(TIMEOUT_ENV)
         .ok()

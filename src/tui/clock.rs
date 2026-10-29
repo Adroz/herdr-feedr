@@ -6,8 +6,6 @@ use std::time::Instant;
 
 pub trait Clock {
     /// Monotonic now, for measuring intervals.
-    // First consumers (multi-click, auto-close debounce) land later in spec #22.
-    #[allow(dead_code)]
     fn now(&self) -> Instant;
     /// The local calendar date, for stamping swept items.
     fn today(&self) -> chrono::NaiveDate;

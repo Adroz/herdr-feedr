@@ -88,6 +88,51 @@ pub fn parse_agent_list(result: &Value) -> Vec<AgentInfo> {
         .collect()
 }
 
+/// One `pane.list` entry: where a pane lives and what it shows. herdr's
+/// `PaneInfo` (0.9.3) carries no plugin id or zoom flag; zoomed and overlay
+/// panes are listed like any other, and a feedr sidebar is recognised by the
+/// title it sets on itself (`dock::PANE_TITLE_MARKER`). Popups are never
+/// listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneEntry {
+    pub pane_id: String,
+    pub tab_id: String,
+    pub workspace_id: String,
+    pub title: Option<String>,
+}
+
+impl PaneEntry {
+    /// A feedr sidebar: never company for auto-close.
+    pub fn is_feedr(&self) -> bool {
+        self.title.as_deref() == Some(crate::tui::dock::PANE_TITLE_MARKER)
+    }
+}
+
+/// Our pane's current tab in a `pane.list` answer. `HERDR_TAB_ID` is only
+/// a hint fixed at spawn (`pane.move` changes the tab), so resolve it live.
+/// `None` when our id no longer resolves (e.g. moved across workspaces).
+pub fn own_tab<'a>(panes: &'a [PaneEntry], own_pane: &str) -> Option<&'a str> {
+    panes
+        .iter()
+        .find(|p| p.pane_id == own_pane)
+        .map(|p| p.tab_id.as_str())
+}
+
+pub fn parse_pane_list(result: &Value) -> Vec<PaneEntry> {
+    result_entries(result)
+        .into_iter()
+        .filter_map(|v| {
+            let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+            Some(PaneEntry {
+                pane_id: s("pane_id")?,
+                tab_id: s("tab_id")?,
+                workspace_id: s("workspace_id").unwrap_or_default(),
+                title: s("terminal_title_stripped").or_else(|| s("terminal_title")),
+            })
+        })
+        .collect()
+}
+
 /// Pass-through args that resume a session for an agent kind (spec §3:
 /// "kind prefix selects the command"). These ride in `agent.start`'s `args`
 /// field, appended to the agent binary the kind selects.
@@ -134,6 +179,11 @@ pub trait Herdr {
     /// first child, `true` = second (verified live, herdr 0.9.3). Unlike
     /// `pane swap`, it doesn't activate the tab.
     fn set_split_ratio(&mut self, tab_id: &str, path: &[bool], ratio: f64) -> Result<()>;
+    /// `pane.list {}` — every pane in every workspace (there is no tab
+    /// filter; callers filter on `tab_id`).
+    fn list_panes(&mut self) -> Result<Vec<PaneEntry>>;
+    /// `server.stop {}` — shut herdr down (auto-close's last-pane quit).
+    fn stop_server(&mut self) -> Result<()>;
 
     /// Resume a session in a fresh tab (spec §3: @agent click with the pane
     /// gone): create a tab, then start the agent in its pane with the kind's
@@ -317,6 +367,17 @@ impl Herdr for UnixSocketClient {
             "layout.set_split_ratio",
             serde_json::json!({"tab_id": tab_id, "path": path, "ratio": ratio}),
         )?;
+        Ok(())
+    }
+    fn list_panes(&mut self) -> Result<Vec<PaneEntry>> {
+        Ok(parse_pane_list(&request(
+            &self.socket_path,
+            "pane.list",
+            serde_json::json!({}),
+        )?))
+    }
+    fn stop_server(&mut self) -> Result<()> {
+        request(&self.socket_path, "server.stop", serde_json::json!({}))?;
         Ok(())
     }
     // open_resume_tab: the trait's provided create_tab + agent_start
@@ -516,6 +577,9 @@ pub struct FakeHerdr {
     pub log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
     /// What `layout_export` returns; `None` makes it fail.
     pub layout: Option<Value>,
+    /// What `list_panes` returns; `None` makes it fail. Shared so a test
+    /// can change herdr's panes after the fake is boxed into the app.
+    pub panes: std::rc::Rc<std::cell::RefCell<Option<Vec<PaneEntry>>>>,
 }
 
 #[cfg(test)]
@@ -582,6 +646,17 @@ impl Herdr for FakeHerdr {
             "set_split_ratio {tab_id} [{}] {ratio:.4}",
             path.join(",")
         ));
+        Ok(())
+    }
+    fn list_panes(&mut self) -> Result<Vec<PaneEntry>> {
+        self.log.borrow_mut().push("list_panes".into());
+        self.panes
+            .borrow()
+            .clone()
+            .context("pane.list failed in fake")
+    }
+    fn stop_server(&mut self) -> Result<()> {
+        self.log.borrow_mut().push("stop_server".into());
         Ok(())
     }
     // open_resume_tab: provided method — the fake exercises the real
@@ -1148,5 +1223,58 @@ mod tests {
             agent_batches, 2,
             "expected the initial resync plus one stall self-heal resync"
         );
+    }
+
+    #[test]
+    fn list_panes_reads_herdrs_pane_list_and_resolves_our_live_tab() {
+        let fake = FakeHerdrSocket::start();
+        // PaneInfo shape per `herdr api schema --json` (0.9.3), trimmed.
+        fake.reply(
+            "pane.list",
+            json!({"type": "pane_list", "panes": [
+                {"pane_id": "w1:p1", "tab_id": "w1:t3", "workspace_id": "w1", "focused": false,
+                 "terminal_id": "t1", "agent_status": "unknown", "revision": 1,
+                 "terminal_title_stripped": "feedr-sidebar"},
+                {"pane_id": "w1:p2", "tab_id": "w1:t3", "workspace_id": "w1", "focused": true,
+                 "terminal_id": "t2", "agent_status": "unknown", "revision": 1,
+                 "terminal_title": "zsh"}]}),
+        );
+        let mut client = UnixSocketClient {
+            socket_path: fake.path().to_path_buf(),
+        };
+        let panes = client.list_panes().unwrap();
+        assert_eq!(
+            panes,
+            vec![
+                PaneEntry {
+                    pane_id: "w1:p1".into(),
+                    tab_id: "w1:t3".into(),
+                    workspace_id: "w1".into(),
+                    title: Some("feedr-sidebar".into()),
+                },
+                PaneEntry {
+                    pane_id: "w1:p2".into(),
+                    tab_id: "w1:t3".into(),
+                    workspace_id: "w1".into(),
+                    title: Some("zsh".into()),
+                },
+            ]
+        );
+        assert!(panes[0].is_feedr() && !panes[1].is_feedr());
+        assert_eq!(own_tab(&panes, "w1:p1"), Some("w1:t3"));
+        assert_eq!(own_tab(&panes, "w2:p1"), None);
+        assert_eq!(fake.requests_for("pane.list")[0]["params"], json!({}));
+    }
+
+    #[test]
+    fn stop_server_sends_server_stop_and_surfaces_errors() {
+        let fake = FakeHerdrSocket::start();
+        let mut client = UnixSocketClient {
+            socket_path: fake.path().to_path_buf(),
+        };
+        assert!(client.stop_server().is_err(), "unscripted: herdr error");
+        fake.reply("server.stop", json!({"type": "ok"}));
+        client.stop_server().unwrap();
+        assert_eq!(fake.requests_for("server.stop").len(), 2);
     }
 }

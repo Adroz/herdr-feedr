@@ -678,6 +678,8 @@ mod tests {
             width: 0.18,
             max_width: 46,
             auto_dock: false,
+            auto_close: true,
+            quit_herdr_when_last: true,
         }
     }
 

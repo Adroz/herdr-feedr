@@ -20,6 +20,13 @@ pub struct SidebarConfig {
     pub max_width: u16,
     /// Read for Plan 3's tab.created auto-dock hook; the TUI itself ignores it.
     pub auto_dock: bool,
+    /// Exit once the sidebar is the only pane left in its tab, so herdr
+    /// closes the tab (spec #22). `false` disables auto-close entirely.
+    pub auto_close: bool,
+    /// When auto-close leaves no other pane anywhere in herdr, stop the
+    /// server so herdr quits instead of opening a fresh default workspace.
+    /// Ignored when `auto_close` is off.
+    pub quit_herdr_when_last: bool,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -28,6 +35,8 @@ struct SidebarToml {
     width: Option<f64>,
     max_width: Option<u16>,
     auto_dock: Option<bool>,
+    auto_close: Option<bool>,
+    quit_herdr_when_last: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -68,6 +77,8 @@ pub fn load_sidebar_config(config_dir: &std::path::Path) -> SidebarConfig {
         width: s.width.unwrap_or(0.18),
         max_width: s.max_width.unwrap_or(46),
         auto_dock: s.auto_dock.unwrap_or(false),
+        auto_close: s.auto_close.unwrap_or(true),
+        quit_herdr_when_last: s.quit_herdr_when_last.unwrap_or(true),
     }
 }
 
@@ -142,7 +153,9 @@ mod tests {
                 side: Side::Left,
                 width: 0.18,
                 max_width: 46,
-                auto_dock: false
+                auto_dock: false,
+                auto_close: true,
+                quit_herdr_when_last: true,
             }
         );
         // Parsed values:
@@ -157,7 +170,9 @@ mod tests {
                 side: Side::Right,
                 width: 0.25,
                 max_width: 60,
-                auto_dock: true
+                auto_dock: true,
+                auto_close: true,
+                quit_herdr_when_last: true,
             }
         );
         // Invalid side falls back to left:
@@ -167,6 +182,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_sidebar_config(dir.path()).side, Side::Left);
+        // Auto-close keys parse independently:
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[sidebar]\nauto_close = false\nquit_herdr_when_last = false\n",
+        )
+        .unwrap();
+        let c = load_sidebar_config(dir.path());
+        assert!(!c.auto_close && !c.quit_herdr_when_last);
+        // A wrong-typed key is rejected like the existing ones (the file is
+        // ignored with a warning), so the safe defaults stand:
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[sidebar]\nauto_close = \"no\"\n",
+        )
+        .unwrap();
+        assert!(load_sidebar_config(dir.path()).auto_close);
         // feed_path resolution still works with [sidebar] present:
         std::fs::write(
             dir.path().join("config.toml"),

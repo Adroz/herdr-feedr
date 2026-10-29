@@ -94,6 +94,8 @@ impl Driver {
         app.clock = Box::new(clock.clone());
         app.clipboard = Box::new(clipboard.clone());
         app.herdr_cli = Box::new(RecordingCli(herdr_log.clone()));
+        // Short, and never from the env: a held lock fails fast in tests.
+        app.lock_timeout = Duration::from_millis(50);
         app.reload();
         let (tx, rx) = mpsc::channel();
         let mut d = Driver {
@@ -316,6 +318,26 @@ mod tests {
     fn sweep_stamps_the_injected_clock_date() {
         let mut d = Driver::new("# Feed\n\n- [x] Alpha\n", 40, 12);
         d.click(2, 10); // "clear completed" on the toolbar (row h-2)
+        assert!(d.feed().contains("@done(2026-01-15)"), "got: {}", d.feed());
+    }
+
+    #[test]
+    fn a_sidebar_write_waits_on_the_shared_feed_lock() {
+        let mut d = Driver::new("# Feed\n\n- [x] Alpha\n", 100, 12);
+        let before = d.feed();
+        let held = std::fs::File::create(d.feed_path().with_file_name("feed.md.lock")).unwrap();
+        held.lock().unwrap();
+
+        d.click(2, 10); // "clear completed" while another writer holds the lock
+        assert_eq!(d.feed(), before, "no write without the lock");
+        assert!(
+            d.screen().iter().any(|l| l.contains("feed.md.lock")),
+            "the status line names the lock: {:#?}",
+            d.screen()
+        );
+
+        drop(held);
+        d.click(2, 10);
         assert!(d.feed().contains("@done(2026-01-15)"), "got: {}", d.feed());
     }
 

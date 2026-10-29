@@ -11,7 +11,7 @@
 
 use crate::feed::{Item, State};
 use crate::tui::app::ItemKey;
-use crate::tui::theme;
+use crate::tui::{selection, theme};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -79,6 +79,10 @@ pub struct EditModal {
     /// drains it after every `step` call and does the actual spawn (mirrors
     /// `App`'s `editor_request`/`take_editor_request` one-shot pattern).
     pub pending_clipboard: Option<String>,
+    /// The Category, Title and Body rects of the last draw. The view resets
+    /// each field's scroll only when these change, so a scroll the user is
+    /// looking at (and clicking into) stays put from frame to frame.
+    pub drawn_fields: Option<[Rect; 3]>,
     /// Category, title and body lines as the modal opened — the baseline
     /// `is_dirty` compares against.
     loaded: [Vec<String>; 3],
@@ -100,6 +104,7 @@ impl EditModal {
             focus: EditFocus::Category,
             claimed: false,
             pending_clipboard: None,
+            drawn_fields: None,
             loaded: Default::default(),
         };
         // Bodies are prose: wrap them. Title and category stay unwrapped —
@@ -168,6 +173,7 @@ impl EditModal {
             focus,
             claimed: item.state == State::InProgress && item.agent.is_some(),
             pending_clipboard: None,
+            drawn_fields: None,
             loaded: Default::default(),
         };
         m.mark_loaded();
@@ -736,31 +742,6 @@ fn outside_click(modal: Modal) -> ModalStep {
     }
 }
 
-/// Click-to-position: map the click to a cursor location. Coordinates are
-/// viewport-relative under the assumption the field isn't horizontally
-/// scrolled — with the focused-field cursor fix the common case — and
-/// `CursorMove::Jump` clamps past-end coordinates to the line/text end
-/// (`tui-textarea` 0.7 `cursor.rs`'s `Jump` arm: row clamps to the last
-/// line, col clamps to that line's length via `fit_col`).
-///
-/// `field_rect` is the field's full bordered `Rect` (as drawn); a click
-/// inside the border but outside the text-bearing inner rect (i.e. on the
-/// border itself) focuses the field without moving its cursor — there is no
-/// clicked character to jump to there.
-///
-/// Caveat: if the field IS horizontally scrolled (its current line is
-/// longer than the field's width), the jump is offset by the hidden
-/// scroll — the same unexposed-viewport limitation the cursor-rendering fix
-/// works around for the focused field's own cursor cell. This is an
-/// acceptable degradation: the click still lands inside the right field,
-/// just not necessarily on the exact character under the mouse.
-fn jump_cursor_to_click(ta: &mut TextArea<'static>, field_rect: Rect, x: u16, y: u16) {
-    let inner = Block::bordered().inner(field_rect);
-    if rect_contains(inner, x, y) {
-        ta.move_cursor(CursorMove::Jump(y - inner.y, x - inner.x));
-    }
-}
-
 /// The textarea backing whichever field currently has focus — `None` when
 /// focus is on a button (Save/Cancel/Delete), which has no textarea.
 /// Shared by the selection-clipboard key arms, the Esc selection-cancel
@@ -980,32 +961,24 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                     m.focus = EditFocus::Category;
                     m.dropdown = None;
                     m.sync_blocks();
-                    // A plain click always clears any existing selection
-                    // first — otherwise `jump_cursor_to_click`'s
-                    // `move_cursor(Jump(..))` would inherit
-                    // `shift = selection_start.is_some()` and EXTEND the
-                    // stale selection to the click point instead of just
-                    // repositioning the cursor there (normal editor
-                    // behavior: a non-shift click always replaces the
-                    // selection).
-                    m.category.cancel_selection();
-                    jump_cursor_to_click(&mut m.category, layout.category, mev.column, mev.row);
+                    // A plain click replaces any selection. A click on the
+                    // field's border focuses it but has no character to land
+                    // on, so the cursor stays put.
+                    selection::press(&mut m.category, mev.column, mev.row);
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Title) => {
                     m.focus = EditFocus::Title;
                     m.dropdown = None;
                     m.sync_blocks();
-                    m.title.cancel_selection();
-                    jump_cursor_to_click(&mut m.title, layout.title, mev.column, mev.row);
+                    selection::press(&mut m.title, mev.column, mev.row);
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Body) => {
                     m.focus = EditFocus::Body;
                     m.dropdown = None;
                     m.sync_blocks();
-                    m.body.cancel_selection();
-                    jump_cursor_to_click(&mut m.body, layout.body, mev.column, mev.row);
+                    selection::press(&mut m.body, mev.column, mev.row);
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Save) => ModalStep::Save(m),
@@ -1019,36 +992,13 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
             };
         }
         // Mouse drag selection: only the FOCUSED field's own drag extends a
-        // selection (a drag that wanders outside it is ignored, not
-        // redirected — dragging into a different field shouldn't steal
-        // focus or start a second selection there). Reuses
-        // `jump_cursor_to_click`'s math and its horizontal-scroll caveat.
-        // Lazily starts the anchor at the CURRENT cursor position (which the
-        // preceding Down click already placed) the first time a Drag arrives
-        // with no active (non-empty) selection yet — `selection_range()`,
-        // not `is_selecting()`, so a same-cell first Drag frame re-anchors
-        // rather than being mistaken for an already-extending selection.
+        // selection. A drag that wanders outside its text area is ignored,
+        // not redirected: dragging into a different field shouldn't steal
+        // focus or start a second selection there. Endpoints go through the
+        // same cell → (line, char) mapping as the press that anchored them.
         if mev.kind == MouseEventKind::Drag(MouseButton::Left) {
-            let is_edit = m.original.is_some();
-            let layout = edit_layout(area, is_edit, m.claimed, m.dropdown_rows());
-            let field_rect = match m.focus {
-                EditFocus::Category => Some(layout.category),
-                EditFocus::Title => Some(layout.title),
-                EditFocus::Body => Some(layout.body),
-                EditFocus::Save | EditFocus::Cancel | EditFocus::Delete | EditFocus::Release => {
-                    None
-                }
-            };
-            if let Some(rect) = field_rect {
-                let inner = Block::bordered().inner(rect);
-                if rect_contains(inner, mev.column, mev.row) {
-                    if let Some(ta) = focused_textarea_mut(&mut m) {
-                        if ta.selection_range().is_none() {
-                            ta.start_selection();
-                        }
-                        jump_cursor_to_click(ta, rect, mev.column, mev.row);
-                    }
-                }
+            if let Some(ta) = focused_textarea_mut(&mut m) {
+                selection::drag_to(ta, mev.column, mev.row);
             }
             return ModalStep::Continue(Modal::Edit(m));
         }
@@ -1125,15 +1075,6 @@ mod tests {
 
     fn ctrl_key(c: char) -> Event {
         Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
-    }
-
-    fn drag(x: u16, y: u16) -> Event {
-        Event::Mouse(MouseEvent {
-            kind: MouseEventKind::Drag(MouseButton::Left),
-            column: x,
-            row: y,
-            modifiers: KeyModifiers::NONE,
-        })
     }
 
     fn step_edit(m: EditModal, ev: Event) -> EditModal {
@@ -2038,37 +1979,12 @@ mod tests {
         );
     }
 
-    // --- Task 3: click-to-position cursor -----------------------------------
-
-    #[test]
-    fn clicking_body_text_places_cursor_at_the_clicked_character() {
-        let mut m = create_modal();
-        m.body = TextArea::new(vec!["hello world".to_string()]);
-        let layout = edit_layout(TEST_AREA, false, false, 0);
-        let inner = Block::bordered().inner(layout.body);
-        // Column 6 is the 'w' of "world" ("hello " is 6 columns wide).
-        let m = step_edit(m, click(inner.x + 6, inner.y));
-        assert_eq!(m.focus, EditFocus::Body);
-        assert_eq!(m.body.cursor(), (0, 6));
-    }
-
-    #[test]
-    fn clicking_past_end_of_body_text_clamps_cursor_to_line_end() {
-        let mut m = create_modal();
-        m.body = TextArea::new(vec!["hello world".to_string()]);
-        let layout = edit_layout(TEST_AREA, false, false, 0);
-        let inner = Block::bordered().inner(layout.body);
-        // Last column of the (much wider than the text) inner rect — well
-        // past "hello world"'s 11 characters, but still inside the field so
-        // the click actually lands on Body rather than missing it.
-        let m = step_edit(m, click(inner.x + inner.width - 1, inner.y));
-        assert_eq!(m.focus, EditFocus::Body);
-        assert_eq!(
-            m.body.cursor(),
-            (0, "hello world".chars().count()),
-            "CursorMove::Jump clamps a past-end column to the line's end"
-        );
-    }
+    // --- Click-to-position cursor -------------------------------------------
+    //
+    // Where a click or drag lands depends on how the field was last DRAWN
+    // (wrap, scroll, wide chars), so placement is tested through the
+    // headless driver (`driver.rs`), which draws between events. These pure
+    // `step` tests only cover what holds without a draw.
 
     /// Clicking the field's own BORDER (not its inner text area) must still
     /// move focus there like today, but must NOT jump the cursor — there is
@@ -2090,16 +2006,14 @@ mod tests {
     }
 
     #[test]
-    fn clicking_category_text_places_cursor_and_resets_dropdown() {
+    fn clicking_category_text_resets_dropdown() {
         let mut m = create_modal();
         m.category = TextArea::new(vec!["alpha beta".to_string()]);
         m.dropdown = Some(0); // simulate an open dropdown highlight
         let layout = edit_layout(TEST_AREA, false, false, 0);
         let inner = Block::bordered().inner(layout.category);
-        // Column 6 is the 'b' of "beta" ("alpha " is 6 columns wide).
         let m = step_edit(m, click(inner.x + 6, inner.y));
         assert_eq!(m.focus, EditFocus::Category);
-        assert_eq!(m.category.cursor(), (0, 6));
         assert_eq!(
             m.dropdown, None,
             "existing behavior preserved: a field click resets the dropdown highlight"
@@ -2198,27 +2112,6 @@ mod tests {
         m.sync_blocks();
         let m = step_edit(m, ctrl_key('v'));
         assert_eq!(m.body.lines(), ["hello world"]);
-    }
-
-    #[test]
-    fn dragging_in_body_selects_the_dragged_span() {
-        let mut m = create_modal();
-        m.body = TextArea::new(vec!["hello world".to_string()]);
-        let layout = edit_layout(TEST_AREA, false, false, 0);
-        let inner = Block::bordered().inner(layout.body);
-        // Down at col 0 focuses Body and anchors the (not-yet-started)
-        // cursor at (0, 0).
-        let m = step_edit(m, click(inner.x, inner.y));
-        assert_eq!(m.focus, EditFocus::Body);
-        assert_eq!(
-            m.body.selection_range(),
-            None,
-            "a plain click selects nothing yet"
-        );
-        // Drag to col 5 ('w' of "world") lazily starts the selection at the
-        // anchor and extends it to the drag point.
-        let m = step_edit(m, drag(inner.x + 5, inner.y));
-        assert_eq!(m.body.selection_range(), Some(((0, 0), (0, 5))));
     }
 
     #[test]

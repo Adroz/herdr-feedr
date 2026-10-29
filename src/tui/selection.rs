@@ -57,6 +57,43 @@ pub fn drag_to(ta: &mut TextArea<'_>, x: u16, y: u16) -> Option<TextPos> {
     Some(pos)
 }
 
+/// The selected text, lines joined by `\n`. `None` when nothing is selected,
+/// including a zero-length selection (anchor and cursor on the same spot).
+pub fn selected_text(ta: &TextArea<'_>) -> Option<String> {
+    let ((sl, sc), (el, ec)) = ta.selection_range()?;
+    if (sl, sc) == (el, ec) {
+        return None;
+    }
+    let lines = ta.lines();
+    let slice = |l: usize, from: usize, to: usize| -> String {
+        lines[l]
+            .chars()
+            .skip(from)
+            .take(to.saturating_sub(from))
+            .collect()
+    };
+    if sl == el {
+        return Some(slice(sl, sc, ec));
+    }
+    let mut out = slice(sl, sc, usize::MAX);
+    for line in &lines[sl + 1..el] {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out.push('\n');
+    out.push_str(&slice(el, 0, ec));
+    Some(out)
+}
+
+/// Copy: the selected text, also put in the field's own yank buffer (so
+/// Ctrl+V pastes it). Unlike `TextArea::copy`, the selection stays
+/// highlighted: it goes on the next click or key, not on copying.
+pub fn copy(ta: &mut TextArea<'_>) -> Option<String> {
+    let text = selected_text(ta)?;
+    ta.set_yank_text(text.clone());
+    Some(text)
+}
+
 fn jump(ta: &mut TextArea<'_>, (line, ch): TextPos) {
     let clamp = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
     ta.move_cursor(CursorMove::Jump(clamp(line), clamp(ch)));

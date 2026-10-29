@@ -1,0 +1,20 @@
+---
+source: src/tui/driver.rs
+expression: "d.screen().join(\"\\n\")"
+---
+[ ] Alpha
++ add
+  ┌Done archive — Esc closes─────────┐
+  │                                  │
+  │ # Done                           │
+  │                                  │
+  │ ## 2026-01-14                    │
+  │                                  │
+  │ - [x] Ship the sidebar @done(    │
+  │ 2026-01-14)                      │
+  │ - [x] Write the glossary @done(  │
+  │ 2026-01-14)                      │
+  │                                  │
+Do└──────────────────────────────────┘
+clear completed
+                                       «

@@ -29,6 +29,8 @@ pub const GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
 pub const OVERLAY1: Color = Color::Rgb(0x7f, 0x84, 0x9c);
 pub const OVERLAY0: Color = Color::Rgb(0x6c, 0x70, 0x86);
 pub const RED: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
+/// Today's accent: the panel outline and the modal's `★ Today`.
+pub const PEACH: Color = Color::Rgb(0xfa, 0xb3, 0x87);
 
 /// Normal body text (item titles, viewer contents, "+ add").
 pub fn normal_text() -> Style {
@@ -56,6 +58,23 @@ pub fn muted_row() -> Style {
 /// `@agent` sub-line base color (overridden per-glyph by `agent_status`).
 pub fn agent_subline() -> Style {
     Style::default().fg(OVERLAY1)
+}
+
+/// The Today panel's outline and ` Today ` title — red when a hand edit
+/// has put more than three items in Today.
+pub fn today_border(over_cap: bool) -> Style {
+    Style::default().fg(if over_cap { RED } else { PEACH })
+}
+
+/// A Today item's home-section sub-line.
+pub fn today_category() -> Style {
+    Style::default().fg(OVERLAY1)
+}
+
+/// The edit modal's Today toggle: `★ Today` in peach when set, a muted
+/// `☆ Today` when not.
+pub fn today_toggle(on: bool) -> Style {
+    Style::default().fg(if on { PEACH } else { OVERLAY1 })
 }
 
 /// Item checkbox glyph color by state. Open uses the same color as normal

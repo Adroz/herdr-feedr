@@ -1,29 +1,59 @@
 pub mod app;
+pub mod auto_close;
 pub mod clipboard;
+#[cfg(test)]
+mod clipboard_e2e;
+pub mod clock;
 pub mod dock;
+#[cfg(test)]
+pub mod driver;
+#[cfg(test)]
+pub mod fake_socket;
 pub mod input;
 pub mod modal;
+#[cfg(test)]
+mod reload_tests;
+pub mod selection;
 pub mod socket;
 #[cfg(test)]
 pub mod test_util;
 pub mod theme;
 pub mod view;
+pub mod viewer;
 pub mod watch;
 
 use crate::config::SidebarConfig;
 use anyhow::{bail, Result};
 use app::App;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event,
+};
 use crossterm::tty::IsTty;
+use ratatui::backend::Backend;
+use ratatui::Terminal;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
 /// Events pushed by background threads (file watcher: Task 11; socket
 /// subscriber: Task 12).
+#[derive(Debug, PartialEq)]
 pub enum AppEvent {
     FeedChanged,
+    /// Full agent resync (`agent.list`).
     Agents(Vec<socket::AgentInfo>),
+    /// One pane's agent status, pushed by herdr.
+    AgentStatus {
+        pane_id: String,
+        status: socket::AgentStatus,
+    },
+    /// A tab's layout changed (`layout.updated`): the panes now in it.
+    /// Drives sidebar auto-close (`auto_close.rs`).
+    Layout {
+        tab_id: String,
+        pane_ids: Vec<String>,
+    },
     SocketDown,
 }
 
@@ -70,22 +100,30 @@ pub fn run(feed_path: PathBuf, cfg: SidebarConfig) -> Result<()> {
 
     let mut terminal = ratatui::init();
     let _ = reinit_terminal_commands(&mut std::io::stdout());
-    let res = event_loop(&mut terminal, &mut app, &rx);
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let res = event_loop(&mut terminal, &mut app, &rx, &mut CrosstermHost);
+    let _ = teardown_terminal_commands(&mut std::io::stdout());
     ratatui::restore();
     res
 }
 
 /// Re-assert terminal output state that an external program (e.g. $EDITOR,
 /// during the resume path in `event_loop`) is free to clobber while it holds
-/// the tty: mouse capture and the dock pane-title marker. Writes to `w` so
-/// the exact command bytes can be asserted in tests without a live terminal.
+/// the tty: mouse capture, bracketed paste and the dock pane-title marker.
+/// Writes to `w` so the exact command bytes can be asserted in tests without
+/// a live terminal.
 /// Both startup (`run`) and every editor-resume go through this one helper,
 /// so the two paths can't drift out of sync again.
 fn reinit_terminal_commands<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
-    crossterm::execute!(w, EnableMouseCapture)?;
+    crossterm::execute!(w, EnableMouseCapture, EnableBracketedPaste)?;
     crossterm::execute!(w, crossterm::terminal::SetTitle(dock::PANE_TITLE_MARKER))?;
     Ok(())
+}
+
+/// Undo `reinit_terminal_commands`' input modes before handing the tty back
+/// (to the shell on exit, or to $EDITOR), so neither inherits mouse capture
+/// or bracketed paste.
+fn teardown_terminal_commands<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
+    crossterm::execute!(w, DisableBracketedPaste, DisableMouseCapture)
 }
 
 /// Run $EDITOR (may carry args, e.g. "code -w") on the feed file.
@@ -121,40 +159,108 @@ fn drain_events(app: &mut App, rx: &mpsc::Receiver<AppEvent>) -> bool {
     feed_changed
 }
 
-fn event_loop(
-    terminal: &mut ratatui::DefaultTerminal,
+/// What the loop needs from the outside world besides herdr and the feed:
+/// terminal input, and suspending the terminal to run $EDITOR. Production
+/// uses crossterm and the real tty; the headless test driver scripts both.
+pub trait Host<B: Backend> {
+    /// Wait up to `timeout` for the next terminal event.
+    fn next_event(&mut self, timeout: Duration) -> Result<Option<Event>>;
+    /// Hand the tty to `editor` on `path`, then take it back.
+    fn run_editor(&mut self, terminal: &mut Terminal<B>, editor: &str, path: &Path) -> Result<()>;
+}
+
+struct CrosstermHost;
+
+impl Host<ratatui::backend::CrosstermBackend<std::io::Stdout>> for CrosstermHost {
+    fn next_event(&mut self, timeout: Duration) -> Result<Option<Event>> {
+        Ok(if event::poll(timeout)? {
+            Some(event::read()?)
+        } else {
+            None
+        })
+    }
+
+    fn run_editor(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        editor: &str,
+        path: &Path,
+    ) -> Result<()> {
+        let _ = teardown_terminal_commands(&mut std::io::stdout());
+        ratatui::restore();
+        let result = spawn_editor(editor, path);
+        *terminal = ratatui::init();
+        let _ = reinit_terminal_commands(&mut std::io::stdout());
+        result
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    Continue,
+    Exit,
+}
+
+/// How long one step waits for terminal input before looping again (so
+/// pushed herdr events and clock-driven work still get serviced).
+const POLL_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// One turn of the sidebar's event loop: apply pushed events (reloading at
+/// most once), run a requested editor, handle at most one terminal event,
+/// then redraw. The real run loop and the headless test driver both call
+/// this, so tests exercise exactly the production path.
+pub fn step<B, H>(
+    terminal: &mut Terminal<B>,
     app: &mut App,
     rx: &mpsc::Receiver<AppEvent>,
-) -> Result<()> {
-    loop {
-        terminal.draw(|f| view::draw(f, app))?;
-        if app.should_quit {
-            return Ok(());
+    host: &mut H,
+) -> Result<Flow>
+where
+    B: Backend,
+    B::Error: Send + Sync + 'static,
+    H: Host<B>,
+{
+    if drain_events(app, rx) {
+        app.reload();
+    }
+    app.tick();
+    if let Some(path) = app.take_editor_request() {
+        let editor = app.editor_cmd.clone().unwrap_or_default();
+        if let Err(e) = host.run_editor(terminal, &editor, &path) {
+            app.status_msg = Some(format!("editor: {e}"));
         }
-        if drain_events(app, rx) {
-            app.reload();
-        }
-        if let Some(path) = app.take_editor_request() {
-            let editor = app.editor_cmd.clone().unwrap_or_default();
-            ratatui::restore();
-            let result = spawn_editor(&editor, &path);
-            *terminal = ratatui::init();
-            let _ = reinit_terminal_commands(&mut std::io::stdout());
-            if let Err(e) = result {
-                app.status_msg = Some(format!("editor: {e}"));
-            }
-            app.reload(); // editor's save wins (spec §6, accepted for v1)
-        }
-        if event::poll(Duration::from_millis(100))? {
-            let ev = event::read()?;
-            let size = terminal.size()?;
-            if app.modal_active() {
-                app.handle_modal_event(ev, (size.width, size.height));
-            } else if let Some(action) = input::translate(&ev, app, (size.width, size.height)) {
-                app.apply(action);
-            }
+        app.reload(); // editor's save wins (spec §6, accepted for v1)
+    }
+    if let Some(ev) = host.next_event(POLL_TIMEOUT)? {
+        let size = terminal.size()?;
+        if app.modal_active() {
+            app.handle_modal_event(ev, (size.width, size.height));
+        } else if let Some(action) = input::translate(&ev, app, (size.width, size.height)) {
+            app.apply(action);
         }
     }
+    terminal.draw(|f| view::draw(f, app))?;
+    Ok(if app.should_quit {
+        Flow::Exit
+    } else {
+        Flow::Continue
+    })
+}
+
+fn event_loop<B, H>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    rx: &mpsc::Receiver<AppEvent>,
+    host: &mut H,
+) -> Result<()>
+where
+    B: Backend,
+    B::Error: Send + Sync + 'static,
+    H: Host<B>,
+{
+    terminal.draw(|f| view::draw(f, app))?;
+    while step(terminal, app, rx, host)? == Flow::Continue {}
+    Ok(())
 }
 
 #[cfg(test)]
@@ -182,6 +288,25 @@ mod tests {
             out.contains(&want_title),
             "must re-assert the dock pane-title marker, got: {out:?}"
         );
+    }
+
+    /// Bracketed paste makes a terminal paste arrive as one `Event::Paste`
+    /// instead of keystrokes (whose newlines would act as Enter). Setup and
+    /// every editor-resume enable it; teardown (exit and editor-suspend)
+    /// turns it and mouse capture back off so the shell/editor isn't left
+    /// with them.
+    #[test]
+    fn terminal_setup_enables_and_teardown_disables_bracketed_paste() {
+        let mut up: Vec<u8> = Vec::new();
+        reinit_terminal_commands(&mut up).unwrap();
+        let up = String::from_utf8(up).unwrap();
+        assert!(up.contains("\x1B[?2004h"), "setup got: {up:?}");
+
+        let mut down: Vec<u8> = Vec::new();
+        teardown_terminal_commands(&mut down).unwrap();
+        let down = String::from_utf8(down).unwrap();
+        assert!(down.contains("\x1B[?2004l"), "teardown got: {down:?}");
+        assert!(down.contains("\x1B[?1000l"), "teardown got: {down:?}");
     }
 
     #[test]
@@ -239,6 +364,8 @@ mod tests {
             width: 0.18,
             max_width: 46,
             auto_dock: false,
+            auto_close: true,
+            quit_herdr_when_last: true,
         };
         let mut app = App::new(path.clone(), cfg, Box::new(socket::FakeHerdr::default()));
         app.reload();

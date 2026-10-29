@@ -3,7 +3,7 @@ use super::*;
 /// Lossless for lines the parser does not own (they become [`Node::Raw`] and
 /// re-emit verbatim). Recognized lines (headings, items, bodies) are
 /// normalized: trailing whitespace is trimmed and token spacing and order are
-/// canonicalized (agent before done), so render∘parse is byte-exact only for
+/// canonicalized (agent, then today, then done), so render∘parse is byte-exact only for
 /// canonical input.
 pub fn parse(text: &str) -> Document {
     let lines: Vec<&str> = text.lines().collect();
@@ -23,11 +23,14 @@ pub fn parse(text: &str) -> Document {
             });
         } else if let Some(item) = parse_item_line(line) {
             nodes.push(Node::Item(item));
-        } else if line.starts_with("  ") && !line.trim().is_empty() {
+        } else if let Some((indent, content)) = split_body_indent(line) {
             // Body line: attach to the most recent item if one directly precedes
             // (an item's body is contiguous).
             if let Some(Node::Item(item)) = nodes.last_mut() {
-                item.body.push(line[2..].to_string());
+                if item.body.is_empty() {
+                    item.style.tab_body = indent == BodyIndent::Tab;
+                }
+                item.body.push(content.to_string());
             } else {
                 nodes.push(Node::Raw(line.to_string()));
             }
@@ -42,7 +45,7 @@ pub fn parse(text: &str) -> Document {
             let next_is_body_line = lines[idx + 1..]
                 .iter()
                 .find(|l| !l.trim().is_empty())
-                .is_some_and(|l| l.starts_with("  ") && !l.trim().is_empty());
+                .is_some_and(|l| split_body_indent(l).is_some());
             if preceding_is_body_context && next_is_body_line {
                 if let Some(Node::Item(item)) = nodes.last_mut() {
                     item.body.push(String::new());
@@ -55,22 +58,58 @@ pub fn parse(text: &str) -> Document {
         }
         idx += 1;
     }
-    Document { nodes }
+    Document {
+        nodes,
+        style: file_style(text),
+    }
+}
+
+/// Line endings follow the first line break; a file with none is LF.
+/// An empty file counts as newline-terminated so the first write is canonical.
+fn file_style(text: &str) -> FileStyle {
+    FileStyle {
+        crlf: text.find('\n').is_some_and(|i| text[..i].ends_with('\r')),
+        no_trailing_newline: !text.is_empty() && !text.ends_with('\n'),
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum BodyIndent {
+    TwoSpaces,
+    Tab,
+}
+
+/// A non-blank line indented by two spaces or one tab is body; returns the
+/// indent and the content after it.
+fn split_body_indent(line: &str) -> Option<(BodyIndent, &str)> {
+    if line.trim().is_empty() {
+        return None;
+    }
+    if let Some(rest) = line.strip_prefix("  ") {
+        Some((BodyIndent::TwoSpaces, rest))
+    } else {
+        line.strip_prefix('\t').map(|rest| (BodyIndent::Tab, rest))
+    }
 }
 
 fn parse_item_line(line: &str) -> Option<Item> {
     let rest = line.strip_prefix("- [")?;
     let mut chars = rest.chars();
-    let state = State::from_char(chars.next()?)?;
+    let mark = chars.next()?;
+    let state = State::from_char(mark)?;
     let rest = chars.as_str().strip_prefix("] ")?;
 
     let mut title = rest.trim_end().to_string();
     let mut agent = None;
     let mut done_date = None;
-    // Strip trailing @key(value) tokens, rightmost first.
+    let mut today = false;
+    // Strip trailing @key(value) / @today tokens, rightmost first.
     loop {
         let t = title.trim_end();
-        if let Some((head, tok)) = split_trailing_token(t) {
+        if let Some(head) = strip_today(t).filter(|_| !today) {
+            today = true;
+            title = head.trim_end().to_string();
+        } else if let Some((head, tok)) = split_trailing_token(t) {
             match tok {
                 Token::Agent(a) if agent.is_none() => agent = Some(a),
                 Token::Done(d) if done_date.is_none() => done_date = Some(d),
@@ -89,9 +128,21 @@ fn parse_item_line(line: &str) -> Option<Item> {
         state,
         title,
         agent,
+        today,
         done_date,
         body: Vec::new(),
+        style: ItemStyle {
+            mark: (mark != state.to_char()).then_some(mark),
+            tab_body: false,
+        },
     })
+}
+
+/// `@today` as a whole trailing word (the whole title, or after whitespace),
+/// returning what precedes it.
+fn strip_today(s: &str) -> Option<&str> {
+    let head = s.strip_suffix("@today")?;
+    (head.is_empty() || head.ends_with(char::is_whitespace)).then_some(head)
 }
 
 enum Token {
@@ -214,6 +265,34 @@ mod tests {
                 assert_eq!(it.title, "Foo");
                 assert_eq!(it.agent.as_ref().unwrap().to_string(), "claude:123");
                 assert_eq!(it.done_date.as_deref(), Some("2026-09-01"));
+            }
+            n => panic!("expected item, got {n:?}"),
+        }
+    }
+
+    #[test]
+    fn today_token_is_a_flag_in_any_trailing_position() {
+        for line in [
+            "- [~] Ship it @agent(claude:1) @today\n",
+            "- [~] Ship it @today @agent(claude:1)\n",
+        ] {
+            match &parse(line).nodes[0] {
+                Node::Item(it) => {
+                    assert_eq!(it.title, "Ship it", "from {line:?}");
+                    assert!(it.today, "from {line:?}");
+                    assert_eq!(it.agent.as_ref().unwrap().to_string(), "claude:1");
+                }
+                n => panic!("expected item, got {n:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn today_inside_a_title_word_is_not_the_token() {
+        match &parse("- [ ] Plan for@today\n").nodes[0] {
+            Node::Item(it) => {
+                assert_eq!(it.title, "Plan for@today");
+                assert!(!it.today);
             }
             n => panic!("expected item, got {n:?}"),
         }

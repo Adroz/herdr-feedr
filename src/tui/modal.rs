@@ -11,25 +11,35 @@
 
 use crate::feed::{Item, State};
 use crate::tui::app::ItemKey;
-use crate::tui::theme;
+use crate::tui::viewer::Viewer;
+use crate::tui::{selection, theme};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Padding};
 use tui_textarea::{CursorMove, TextArea, WrapMode};
+use unicode_width::UnicodeWidthStr;
 
 pub enum Modal {
     None,
     Edit(EditModal),
     ConfirmDelete(EditModal),
     /// Read-only view of the `# Done` archive (spec §3).
-    DoneView {
-        scroll: u16,
-    },
+    DoneView(Viewer),
     /// Read-only view of the whole feed file; `e` requests `$EDITOR`.
-    FileView {
-        scroll: u16,
-    },
+    FileView(Viewer),
+}
+
+impl Modal {
+    /// Text copied in this step and not yet pushed to the system clipboard
+    /// (one-shot; `App::handle_modal_event` drains it).
+    pub fn take_pending_clipboard(&mut self) -> Option<String> {
+        match self {
+            Modal::Edit(m) => m.pending_clipboard.take(),
+            Modal::DoneView(v) | Modal::FileView(v) => v.pending_clipboard.take(),
+            Modal::None | Modal::ConfirmDelete(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +53,21 @@ pub enum EditFocus {
     Release,
     /// Edit mode only — create mode has no item to delete.
     Delete,
+}
+
+/// The modal's top-border heading, left of the Today toggle.
+pub const EDIT_HEADING: &str = "Edit item";
+pub const CREATE_HEADING: &str = "New item";
+/// Between the heading and the Today toggle in the top border.
+pub const HEADING_SEP: &str = " ── ";
+
+/// The Today toggle's label as drawn in the top border.
+pub fn today_label(on: bool) -> &'static str {
+    if on {
+        "★ Today"
+    } else {
+        "☆ Today"
+    }
 }
 
 pub const SAVE_LABEL: &str = "[ Save ]";
@@ -79,6 +104,23 @@ pub struct EditModal {
     /// drains it after every `step` call and does the actual spawn (mirrors
     /// `App`'s `editor_request`/`take_editor_request` one-shot pattern).
     pub pending_clipboard: Option<String>,
+    /// The Category, Title and Body rects of the last draw. The view resets
+    /// each field's scroll only when these change, so a scroll the user is
+    /// looking at (and clicking into) stays put from frame to frame.
+    pub drawn_fields: Option<[Rect; 3]>,
+    /// Category, title and body lines as the modal opened — the baseline
+    /// `is_dirty` compares against.
+    loaded: [Vec<String>; 3],
+    /// The pending Today toggle (`☆`/`★ Today` in the top border, Ctrl+T or
+    /// a click on it), applied on save — in create mode too.
+    pub today: bool,
+    /// Whether the item was in Today when the modal opened — save touches
+    /// `@today` only when `today` differs, and it counts toward dirty.
+    pub loaded_today: bool,
+    /// Today was already full of OTHER items when the modal opened (any
+    /// items, for a new one), so the toggle refuses to mark this one. Save
+    /// re-checks against the disk.
+    pub today_full: bool,
 }
 
 impl EditModal {
@@ -97,13 +139,39 @@ impl EditModal {
             focus: EditFocus::Category,
             claimed: false,
             pending_clipboard: None,
+            drawn_fields: None,
+            loaded: Default::default(),
+            today: false,
+            loaded_today: false,
+            today_full: false,
         };
         // Bodies are prose: wrap them. Title and category stay unwrapped —
         // they're single-line fields in a 3-row box, where a wrapped second
         // visual row would push the text out of view.
         m.body.set_wrap_mode(WrapMode::Word);
         m.sync_blocks();
+        m.mark_loaded();
         m
+    }
+
+    fn fields(&self) -> [Vec<String>; 3] {
+        [
+            self.category.lines().to_vec(),
+            self.title.lines().to_vec(),
+            self.body.lines().to_vec(),
+        ]
+    }
+
+    /// Take the current field contents as the "as opened" baseline.
+    fn mark_loaded(&mut self) {
+        self.loaded = self.fields();
+    }
+
+    /// Whether the title, body, category or Today toggle differ from what
+    /// was loaded. Typing a change and then undoing it by hand is clean
+    /// again.
+    pub fn is_dirty(&self) -> bool {
+        self.fields() != self.loaded || self.today != self.loaded_today
     }
 
     /// Create with the category pre-filled (clicking a section header):
@@ -113,6 +181,7 @@ impl EditModal {
         m.set_category(category);
         m.focus = EditFocus::Title;
         m.sync_blocks();
+        m.mark_loaded();
         m
     }
 
@@ -143,7 +212,13 @@ impl EditModal {
             focus,
             claimed: item.state == State::InProgress && item.agent.is_some(),
             pending_clipboard: None,
+            drawn_fields: None,
+            loaded: Default::default(),
+            today: item.today,
+            loaded_today: item.today,
+            today_full: false,
         };
+        m.mark_loaded();
         // Unfocused fields keep `TextArea::new`'s (0,0) cursor so they
         // render unscrolled (their viewport follows their cursor); only the
         // INITIALLY FOCUSED field parks at the end, exactly like a Tab-entry
@@ -394,6 +469,9 @@ pub struct EditLayout {
     pub delete: Option<Rect>,
     /// Present only while the modal's item is claimed.
     pub release: Option<Rect>,
+    /// The `☆`/`★ Today` label's cells in the top border — where
+    /// `view::draw_edit_modal` paints it and what `edit_click` hit-tests.
+    pub today: Rect,
 }
 
 /// Percentage-centered rect within `area` (shared by the edit modal, the
@@ -497,6 +575,7 @@ pub fn edit_layout(
         .then(|| Rect::new(x, buttons.y, DELETE_LABEL.len() as u16, 1).intersection(term_area));
 
     EditLayout {
+        today: today_label_rect(outer, is_edit).intersection(term_area),
         outer,
         category,
         dropdown,
@@ -509,6 +588,27 @@ pub fn edit_layout(
         delete,
         release,
     }
+}
+
+/// The Today label's cells: right of the heading and separator on the top
+/// border, which a block title starts one cell in from the corner. Clipped
+/// so it never covers the corners.
+fn today_label_rect(outer: Rect, is_edit: bool) -> Rect {
+    let heading = if is_edit {
+        EDIT_HEADING
+    } else {
+        CREATE_HEADING
+    };
+    let offset = 1 + heading.width() + HEADING_SEP.width();
+    let x = outer.x.saturating_add(offset as u16);
+    let label = Rect::new(x, outer.y, today_label(false).width() as u16, 1);
+    let border = Rect::new(
+        outer.x.saturating_add(1),
+        outer.y,
+        outer.width.saturating_sub(2),
+        1,
+    );
+    label.intersection(border)
 }
 
 /// The suggestion dropdown's row-bearing area, inside its own border — the
@@ -524,6 +624,8 @@ pub(crate) fn dropdown_inner_of(outer: Rect) -> Rect {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditClickTarget {
+    /// The `☆`/`★ Today` label in the top border.
+    Today,
     Category,
     Suggestion(u16),
     Title,
@@ -552,6 +654,9 @@ pub fn edit_click(layout: &EditLayout, is_edit: bool, x: u16, y: u16) -> Option<
             return Some(EditClickTarget::Suggestion(y - layout.dropdown_inner.y));
         }
         return None;
+    }
+    if rect_contains(layout.today, x, y) {
+        return Some(EditClickTarget::Today);
     }
     if rect_contains(layout.category, x, y) {
         return Some(EditClickTarget::Category);
@@ -598,22 +703,42 @@ pub enum ModalStep {
     /// request (it needs `editor_cmd`/`status_msg`), so hand it back like
     /// `Save`/`Delete`.
     OpenEditor,
+    /// An outside click on a dirty edit modal: it stays open, and only `App`
+    /// can put the "how to leave" hint on the status line.
+    Unsaved(EditModal),
+    /// Ctrl+T or a label click while Today is full of others: the toggle stays
+    /// unset, and only `App` can say so on the status line.
+    TodayFull(EditModal),
 }
+
+/// Status hint for an outside click that a dirty edit modal refused.
+pub const UNSAVED_HINT: &str = "unsaved — Esc to discard, Ctrl+S to save";
 
 /// Pure modal transition: `(modal, event, terminal area) -> ModalStep`.
 /// Never touches the filesystem — mirrors `input::translate`. `area` is the
 /// full terminal area (as drawn by `view::draw`); only `Modal::Edit`'s mouse
 /// handling needs it, to re-derive `edit_layout` for hit-testing.
-pub fn step(modal: Modal, ev: Event, area: Rect) -> ModalStep {
+///
+/// `clicks` is where a left press falls in a multi-click run (1, 2 or 3,
+/// from `selection::ClickTracker`, which needs a clock and so lives in
+/// `App`); it's ignored for every other event.
+pub fn step_with_clicks(modal: Modal, ev: Event, area: Rect, clicks: u8) -> ModalStep {
     // Ignore key releases (Windows terminals emit them).
     if let Event::Key(k) = &ev {
         if k.kind == KeyEventKind::Release {
             return ModalStep::Continue(modal);
         }
     }
+    if let Event::Mouse(mev) = &ev {
+        if mev.kind == MouseEventKind::Down(MouseButton::Left)
+            && !rect_contains(panel_rect(&modal, area), mev.column, mev.row)
+        {
+            return outside_click(modal);
+        }
+    }
     match modal {
         Modal::None => ModalStep::Continue(Modal::None),
-        Modal::Edit(m) => edit_step(m, ev, area),
+        Modal::Edit(m) => edit_step(m, ev, area, clicks),
         Modal::ConfirmDelete(m) => match ev {
             Event::Key(k) if k.code == KeyCode::Char('y') => {
                 let key = m
@@ -627,56 +752,75 @@ pub fn step(modal: Modal, ev: Event, area: Rect) -> ModalStep {
             }
             _ => ModalStep::Continue(Modal::ConfirmDelete(m)),
         },
-        Modal::DoneView { scroll } => match ev {
+        // Esc closes a viewer even with text selected: unlike an edit
+        // field, there's nothing to keep typing into, so a selection is not
+        // a layer worth peeling first.
+        Modal::DoneView(mut v) => match ev {
             Event::Key(k) if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) => {
                 ModalStep::Continue(Modal::None)
             }
-            Event::Key(k) if k.code == KeyCode::Down => ModalStep::Continue(Modal::DoneView {
-                scroll: scroll.saturating_add(1),
-            }),
-            Event::Key(k) if k.code == KeyCode::Up => ModalStep::Continue(Modal::DoneView {
-                scroll: scroll.saturating_sub(1),
-            }),
-            _ => ModalStep::Continue(Modal::DoneView { scroll }),
+            ev => {
+                v.handle(&ev, clicks);
+                ModalStep::Continue(Modal::DoneView(v))
+            }
         },
-        Modal::FileView { scroll } => match ev {
+        Modal::FileView(mut v) => match ev {
             Event::Key(k) if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) => {
                 ModalStep::Continue(Modal::None)
             }
             Event::Key(k) if k.code == KeyCode::Char('e') => ModalStep::OpenEditor,
-            Event::Key(k) if k.code == KeyCode::Down => ModalStep::Continue(Modal::FileView {
-                scroll: scroll.saturating_add(1),
-            }),
-            Event::Key(k) if k.code == KeyCode::Up => ModalStep::Continue(Modal::FileView {
-                scroll: scroll.saturating_sub(1),
-            }),
-            _ => ModalStep::Continue(Modal::FileView { scroll }),
+            ev => {
+                v.handle(&ev, clicks);
+                ModalStep::Continue(Modal::FileView(v))
+            }
         },
     }
 }
 
-/// Click-to-position: map the click to a cursor location. Coordinates are
-/// viewport-relative under the assumption the field isn't horizontally
-/// scrolled — with the focused-field cursor fix the common case — and
-/// `CursorMove::Jump` clamps past-end coordinates to the line/text end
-/// (`tui-textarea` 0.7 `cursor.rs`'s `Jump` arm: row clamps to the last
-/// line, col clamps to that line's length via `fit_col`).
-///
-/// `field_rect` is the field's full bordered `Rect` (as drawn); a click
-/// inside the border but outside the text-bearing inner rect (i.e. on the
-/// border itself) focuses the field without moving its cursor — there is no
-/// clicked character to jump to there.
-///
-/// Caveat: if the field IS horizontally scrolled (its current line is
-/// longer than the field's width), the jump is offset by the hidden
-/// scroll — the same unexposed-viewport limitation the cursor-rendering fix
-/// works around for the focused field's own cursor cell. This is an
-/// acceptable degradation: the click still lands inside the right field,
-/// just not necessarily on the exact character under the mouse.
-fn jump_cursor_to_click(ta: &mut TextArea<'static>, field_rect: Rect, x: u16, y: u16) {
-    let inner = Block::bordered().inner(field_rect);
-    if rect_contains(inner, x, y) {
-        ta.move_cursor(CursorMove::Jump(y - inner.y, x - inner.x));
+/// [`step_with_clicks`] for an event that isn't part of a multi-click run.
+#[cfg(test)]
+pub fn step(modal: Modal, ev: Event, area: Rect) -> ModalStep {
+    step_with_clicks(modal, ev, area, 1)
+}
+
+/// The read-only viewers' panel (Done archive, file view).
+pub(crate) fn viewer_rect(area: Rect) -> Rect {
+    centered(area, 90, 80)
+}
+
+/// The delete-confirmation panel.
+pub(crate) fn confirm_rect(area: Rect) -> Rect {
+    centered(area, 80, 20)
+}
+
+/// The panel `view::draw_modal` paints for this modal — anything outside
+/// it is an "outside" click.
+fn panel_rect(modal: &Modal, area: Rect) -> Rect {
+    match modal {
+        Modal::None => area,
+        Modal::Edit(m) => {
+            edit_layout(area, m.original.is_some(), m.claimed, m.dropdown_rows()).outer
+        }
+        Modal::ConfirmDelete(_) => confirm_rect(area),
+        Modal::DoneView(_) | Modal::FileView(_) => viewer_rect(area),
+    }
+}
+
+/// A left click outside the panel. Peels back one layer, like Esc, and is
+/// always consumed — returning a step (never falling through) is what keeps
+/// the click off the list underneath.
+fn outside_click(modal: Modal) -> ModalStep {
+    match modal {
+        Modal::DoneView(_) | Modal::FileView(_) => ModalStep::Continue(Modal::None),
+        Modal::ConfirmDelete(m) => ModalStep::Continue(Modal::Edit(m)), // = "n"
+        // Same layer test as Esc's dropdown arm in `edit_step`.
+        Modal::Edit(mut m) if m.focus == EditFocus::Category && m.dropdown.is_some() => {
+            m.dropdown = None;
+            ModalStep::Continue(Modal::Edit(m))
+        }
+        Modal::Edit(m) if m.is_dirty() => ModalStep::Unsaved(m),
+        Modal::Edit(_) => ModalStep::Continue(Modal::None),
+        Modal::None => ModalStep::Continue(Modal::None),
     }
 }
 
@@ -694,19 +838,13 @@ fn focused_textarea_mut(m: &mut EditModal) -> Option<&mut TextArea<'static>> {
     }
 }
 
-/// Ctrl+C: copy the focused field's selection into tui-textarea's own yank
-/// buffer (`TextArea::copy`, native — a no-op without a selection) and
-/// report the yanked text so the caller can also push it to the SYSTEM
-/// clipboard via `EditModal::pending_clipboard`. Returns `None` — leaving
-/// `pending_clipboard` untouched — when there's nothing to copy: no field
-/// focused, or no active (non-empty) selection. Gated on `selection_range()`
-/// rather than `is_selecting()` so a degenerate zero-length selection
-/// (cursor back at its anchor) doesn't falsely report a copy.
+/// Ctrl+C and drag release: copy the focused field's selection into its yank
+/// buffer, keeping the highlight (`selection::copy`), and report the text so
+/// the caller can also push it to the SYSTEM clipboard via
+/// `EditModal::pending_clipboard`. `None` when there's nothing to copy: no
+/// field focused, or no non-empty selection (a zero-length one included).
 fn copy_focused(m: &mut EditModal) -> Option<String> {
-    let ta = focused_textarea_mut(m)?;
-    let had_selection = ta.selection_range().is_some();
-    ta.copy();
-    had_selection.then(|| ta.yank_text())
+    selection::copy(focused_textarea_mut(m)?)
 }
 
 /// Ctrl+X: same gating as `copy_focused`, via `TextArea::cut` (native —
@@ -731,7 +869,41 @@ fn paste_focused(m: &mut EditModal) {
     }
 }
 
-fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
+/// Terminal (bracketed) paste: the whole paste lands in the focused field as
+/// one insert, replacing any selection. Category and Title are single-line,
+/// so each CR, LF or CRLF becomes one space; Body keeps line breaks (a lone
+/// CR is normalised to LF, since `insert_str` only splits on LF/CRLF).
+fn paste_text_focused(m: &mut EditModal, text: &str) {
+    let single_line = matches!(m.focus, EditFocus::Category | EditFocus::Title);
+    let Some(ta) = focused_textarea_mut(m) else {
+        return;
+    };
+    let unified = text.replace("\r\n", "\n").replace('\r', "\n");
+    if single_line {
+        ta.insert_str(unified.replace('\n', " "));
+    } else {
+        ta.insert_str(unified);
+    }
+    if m.focus == EditFocus::Category {
+        m.dropdown = None; // paste refilters the suggestions
+    }
+}
+
+/// Ctrl+T and a click on the label: flip the pending Today toggle, refusing
+/// to mark while Today is already full of other items.
+fn toggle_today(mut m: EditModal) -> ModalStep {
+    if !m.today && m.today_full {
+        return ModalStep::TodayFull(m);
+    }
+    m.today = !m.today;
+    ModalStep::Continue(Modal::Edit(m))
+}
+
+fn edit_step(mut m: EditModal, ev: Event, area: Rect, clicks: u8) -> ModalStep {
+    if let Event::Paste(text) = &ev {
+        paste_text_focused(&mut m, text);
+        return ModalStep::Continue(Modal::Edit(m));
+    }
     if let Event::Key(k) = &ev {
         match (k.code, k.modifiers) {
             // Esc layering: an active selection in the focused field cancels
@@ -770,12 +942,15 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
             (KeyCode::Char('s'), mods) if mods.contains(KeyModifiers::CONTROL) => {
                 return ModalStep::Save(m);
             }
+            (KeyCode::Char('t'), mods) if mods.contains(KeyModifiers::CONTROL) => {
+                return toggle_today(m);
+            }
             (KeyCode::Char('d'), mods)
                 if mods.contains(KeyModifiers::CONTROL) && m.original.is_some() =>
             {
                 return ModalStep::Continue(Modal::ConfirmDelete(m));
             }
-            // Ctrl+C/Ctrl+X: native `TextArea::copy`/`cut` do the in-memory
+            // Ctrl+C/Ctrl+X: `selection::copy` / native `TextArea::cut` do the in-memory
             // work (selection → yank buffer); we additionally stash the
             // yanked text in `pending_clipboard` so `App::handle_modal_event`
             // can push it to the SYSTEM clipboard (`edit_step` stays pure —
@@ -866,7 +1041,19 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
         if mev.kind == MouseEventKind::Down(MouseButton::Left) {
             let is_edit = m.original.is_some();
             let layout = edit_layout(area, is_edit, m.claimed, m.dropdown_rows());
-            return match edit_click(&layout, is_edit, mev.column, mev.row) {
+            let target = edit_click(&layout, is_edit, mev.column, mev.row);
+            // The toggle is a button on the border: fields, cursors and
+            // selections stay exactly as they were.
+            if target == Some(EditClickTarget::Today) {
+                return toggle_today(m);
+            }
+            // Any other click drops every field's highlight, including one
+            // left standing by a copy in a field the click moves focus away
+            // from.
+            for ta in [&mut m.category, &mut m.title, &mut m.body] {
+                ta.cancel_selection();
+            }
+            return match target {
                 Some(EditClickTarget::Suggestion(row)) => {
                     m.accept_suggestion(row as usize);
                     ModalStep::Continue(Modal::Edit(m))
@@ -875,32 +1062,42 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                     m.focus = EditFocus::Category;
                     m.dropdown = None;
                     m.sync_blocks();
-                    // A plain click always clears any existing selection
-                    // first — otherwise `jump_cursor_to_click`'s
-                    // `move_cursor(Jump(..))` would inherit
-                    // `shift = selection_start.is_some()` and EXTEND the
-                    // stale selection to the click point instead of just
-                    // repositioning the cursor there (normal editor
-                    // behavior: a non-shift click always replaces the
-                    // selection).
-                    m.category.cancel_selection();
-                    jump_cursor_to_click(&mut m.category, layout.category, mev.column, mev.row);
+                    // A plain click replaces any selection. A click on the
+                    // field's border focuses it but has no character to land
+                    // on, so the cursor stays put.
+                    selection::press_n(
+                        &mut m.category,
+                        mev.column,
+                        mev.row,
+                        clicks,
+                        selection::Triple::Field,
+                    );
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Title) => {
                     m.focus = EditFocus::Title;
                     m.dropdown = None;
                     m.sync_blocks();
-                    m.title.cancel_selection();
-                    jump_cursor_to_click(&mut m.title, layout.title, mev.column, mev.row);
+                    selection::press_n(
+                        &mut m.title,
+                        mev.column,
+                        mev.row,
+                        clicks,
+                        selection::Triple::Field,
+                    );
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Body) => {
                     m.focus = EditFocus::Body;
                     m.dropdown = None;
                     m.sync_blocks();
-                    m.body.cancel_selection();
-                    jump_cursor_to_click(&mut m.body, layout.body, mev.column, mev.row);
+                    selection::press_n(
+                        &mut m.body,
+                        mev.column,
+                        mev.row,
+                        clicks,
+                        selection::Triple::Line,
+                    );
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Save) => ModalStep::Save(m),
@@ -910,40 +1107,27 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                     Some(key) => ModalStep::Release(key),
                     None => ModalStep::Continue(Modal::Edit(m)),
                 },
-                None => ModalStep::Continue(Modal::Edit(m)),
+                // Today was handled above, before the selections dropped.
+                Some(EditClickTarget::Today) | None => ModalStep::Continue(Modal::Edit(m)),
             };
         }
         // Mouse drag selection: only the FOCUSED field's own drag extends a
-        // selection (a drag that wanders outside it is ignored, not
-        // redirected — dragging into a different field shouldn't steal
-        // focus or start a second selection there). Reuses
-        // `jump_cursor_to_click`'s math and its horizontal-scroll caveat.
-        // Lazily starts the anchor at the CURRENT cursor position (which the
-        // preceding Down click already placed) the first time a Drag arrives
-        // with no active (non-empty) selection yet — `selection_range()`,
-        // not `is_selecting()`, so a same-cell first Drag frame re-anchors
-        // rather than being mistaken for an already-extending selection.
+        // selection. A drag that wanders outside its text area is ignored,
+        // not redirected: dragging into a different field shouldn't steal
+        // focus or start a second selection there. Endpoints go through the
+        // same cell → (line, char) mapping as the press that anchored them.
         if mev.kind == MouseEventKind::Drag(MouseButton::Left) {
-            let is_edit = m.original.is_some();
-            let layout = edit_layout(area, is_edit, m.claimed, m.dropdown_rows());
-            let field_rect = match m.focus {
-                EditFocus::Category => Some(layout.category),
-                EditFocus::Title => Some(layout.title),
-                EditFocus::Body => Some(layout.body),
-                EditFocus::Save | EditFocus::Cancel | EditFocus::Delete | EditFocus::Release => {
-                    None
-                }
-            };
-            if let Some(rect) = field_rect {
-                let inner = Block::bordered().inner(rect);
-                if rect_contains(inner, mev.column, mev.row) {
-                    if let Some(ta) = focused_textarea_mut(&mut m) {
-                        if ta.selection_range().is_none() {
-                            ta.start_selection();
-                        }
-                        jump_cursor_to_click(ta, rect, mev.column, mev.row);
-                    }
-                }
+            if let Some(ta) = focused_textarea_mut(&mut m) {
+                selection::drag_to(ta, mev.column, mev.row);
+            }
+            return ModalStep::Continue(Modal::Edit(m));
+        }
+        // Copy-on-select: releasing a drag copies what it selected. A plain
+        // click's release has nothing selected (the press cleared it), so it
+        // copies nothing. The highlight stays until the next click or key.
+        if mev.kind == MouseEventKind::Up(MouseButton::Left) {
+            if let Some(text) = copy_focused(&mut m) {
+                m.pending_clipboard = Some(text);
             }
             return ModalStep::Continue(Modal::Edit(m));
         }
@@ -1022,15 +1206,6 @@ mod tests {
         Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
     }
 
-    fn drag(x: u16, y: u16) -> Event {
-        Event::Mouse(MouseEvent {
-            kind: MouseEventKind::Drag(MouseButton::Left),
-            column: x,
-            row: y,
-            modifiers: KeyModifiers::NONE,
-        })
-    }
-
     fn step_edit(m: EditModal, ev: Event) -> EditModal {
         match step(Modal::Edit(m), ev, TEST_AREA) {
             ModalStep::Continue(Modal::Edit(m)) => m,
@@ -1052,6 +1227,8 @@ mod tests {
                 state: State::Open,
                 title: "A".into(),
                 agent: None,
+                today: false,
+                style: Default::default(),
                 done_date: None,
                 body: vec![],
             },
@@ -1069,34 +1246,30 @@ mod tests {
 
     /// Rider from Task 10's review: the viewer scroll `Down` arms used plain
     /// `scroll + 1` (u16), which debug-panics on overflow at 65,535 presses.
-    /// Hammer both DoneView and FileView well past u16::MAX to prove
-    /// `saturating_add` holds instead of panicking.
+    /// Hammer both DoneView and FileView well past u16::MAX to prove the
+    /// scroll saturates instead of panicking.
     #[test]
     fn done_view_scroll_down_saturates_past_u16_max() {
-        let mut modal = Modal::DoneView {
-            scroll: u16::MAX - 5,
-        };
+        let mut modal = Modal::DoneView(Viewer::default());
         for _ in 0..70_000 {
             modal = match step(modal, down(), TEST_AREA) {
                 ModalStep::Continue(m) => m,
                 _ => panic!("DoneView Down must stay in Continue"),
             };
         }
-        assert!(matches!(modal, Modal::DoneView { scroll } if scroll == u16::MAX));
+        assert!(matches!(modal, Modal::DoneView(_)));
     }
 
     #[test]
     fn file_view_scroll_down_saturates_past_u16_max() {
-        let mut modal = Modal::FileView {
-            scroll: u16::MAX - 5,
-        };
+        let mut modal = Modal::FileView(Viewer::default());
         for _ in 0..70_000 {
             modal = match step(modal, down(), TEST_AREA) {
                 ModalStep::Continue(m) => m,
                 _ => panic!("FileView Down must stay in Continue"),
             };
         }
-        assert!(matches!(modal, Modal::FileView { scroll } if scroll == u16::MAX));
+        assert!(matches!(modal, Modal::FileView(_)));
     }
 
     #[test]
@@ -1411,6 +1584,8 @@ mod tests {
             state: State::InProgress,
             title: "Migrate CI".into(),
             agent: Some(crate::feed::AgentRef::parse("claude:sess-1").unwrap()),
+            today: false,
+            style: Default::default(),
             done_date: None,
             body: Vec::new(),
         };
@@ -1435,6 +1610,8 @@ mod tests {
             state: State::Open,
             title: "T".into(),
             agent: None,
+            today: false,
+            style: Default::default(),
             done_date: None,
             body: vec!["a very long line of prose that would otherwise scroll".into()],
         };
@@ -1469,6 +1646,8 @@ mod tests {
             state: State::Open,
             title: "T".into(),
             agent: None,
+            today: false,
+            style: Default::default(),
             done_date: None,
             body: Vec::new(),
         };
@@ -1532,6 +1711,8 @@ mod tests {
             state: State::Open,
             title: "T".into(),
             agent: None,
+            today: false,
+            style: Default::default(),
             done_date: None,
             body: Vec::new(),
         };
@@ -1579,6 +1760,8 @@ mod tests {
             state: State::Open,
             title: "A very long title that would have scrolled the field horizontally".into(),
             agent: None,
+            today: false,
+            style: Default::default(),
             done_date: None,
             body: vec![
                 "A very long first line of body text that would have scrolled".into(),
@@ -1756,6 +1939,8 @@ mod tests {
             state: State::Open,
             title: "abc".into(),
             agent: None,
+            today: false,
+            style: Default::default(),
             done_date: None,
             body: vec!["alpha beta gamma".into(), "line two".into()],
         };
@@ -1919,37 +2104,12 @@ mod tests {
         );
     }
 
-    // --- Task 3: click-to-position cursor -----------------------------------
-
-    #[test]
-    fn clicking_body_text_places_cursor_at_the_clicked_character() {
-        let mut m = create_modal();
-        m.body = TextArea::new(vec!["hello world".to_string()]);
-        let layout = edit_layout(TEST_AREA, false, false, 0);
-        let inner = Block::bordered().inner(layout.body);
-        // Column 6 is the 'w' of "world" ("hello " is 6 columns wide).
-        let m = step_edit(m, click(inner.x + 6, inner.y));
-        assert_eq!(m.focus, EditFocus::Body);
-        assert_eq!(m.body.cursor(), (0, 6));
-    }
-
-    #[test]
-    fn clicking_past_end_of_body_text_clamps_cursor_to_line_end() {
-        let mut m = create_modal();
-        m.body = TextArea::new(vec!["hello world".to_string()]);
-        let layout = edit_layout(TEST_AREA, false, false, 0);
-        let inner = Block::bordered().inner(layout.body);
-        // Last column of the (much wider than the text) inner rect — well
-        // past "hello world"'s 11 characters, but still inside the field so
-        // the click actually lands on Body rather than missing it.
-        let m = step_edit(m, click(inner.x + inner.width - 1, inner.y));
-        assert_eq!(m.focus, EditFocus::Body);
-        assert_eq!(
-            m.body.cursor(),
-            (0, "hello world".chars().count()),
-            "CursorMove::Jump clamps a past-end column to the line's end"
-        );
-    }
+    // --- Click-to-position cursor -------------------------------------------
+    //
+    // Where a click or drag lands depends on how the field was last DRAWN
+    // (wrap, scroll, wide chars), so placement is tested through the
+    // headless driver (`driver.rs`), which draws between events. These pure
+    // `step` tests only cover what holds without a draw.
 
     /// Clicking the field's own BORDER (not its inner text area) must still
     /// move focus there like today, but must NOT jump the cursor — there is
@@ -1971,16 +2131,14 @@ mod tests {
     }
 
     #[test]
-    fn clicking_category_text_places_cursor_and_resets_dropdown() {
+    fn clicking_category_text_resets_dropdown() {
         let mut m = create_modal();
         m.category = TextArea::new(vec!["alpha beta".to_string()]);
         m.dropdown = Some(0); // simulate an open dropdown highlight
         let layout = edit_layout(TEST_AREA, false, false, 0);
         let inner = Block::bordered().inner(layout.category);
-        // Column 6 is the 'b' of "beta" ("alpha " is 6 columns wide).
         let m = step_edit(m, click(inner.x + 6, inner.y));
         assert_eq!(m.focus, EditFocus::Category);
-        assert_eq!(m.category.cursor(), (0, 6));
         assert_eq!(
             m.dropdown, None,
             "existing behavior preserved: a field click resets the dropdown highlight"
@@ -2082,27 +2240,6 @@ mod tests {
     }
 
     #[test]
-    fn dragging_in_body_selects_the_dragged_span() {
-        let mut m = create_modal();
-        m.body = TextArea::new(vec!["hello world".to_string()]);
-        let layout = edit_layout(TEST_AREA, false, false, 0);
-        let inner = Block::bordered().inner(layout.body);
-        // Down at col 0 focuses Body and anchors the (not-yet-started)
-        // cursor at (0, 0).
-        let m = step_edit(m, click(inner.x, inner.y));
-        assert_eq!(m.focus, EditFocus::Body);
-        assert_eq!(
-            m.body.selection_range(),
-            None,
-            "a plain click selects nothing yet"
-        );
-        // Drag to col 5 ('w' of "world") lazily starts the selection at the
-        // anchor and extends it to the drag point.
-        let m = step_edit(m, drag(inner.x + 5, inner.y));
-        assert_eq!(m.body.selection_range(), Some(((0, 0), (0, 5))));
-    }
-
-    #[test]
     fn down_click_clears_an_existing_selection() {
         let mut m = create_modal();
         m.focus = EditFocus::Body;
@@ -2179,5 +2316,247 @@ mod tests {
         assert_eq!(m.category.selection_style(), theme::selection());
         assert_eq!(m.title.selection_style(), theme::selection());
         assert_eq!(m.body.selection_style(), theme::selection());
+    }
+}
+
+/// Outside-click dismissal (spec #22, issue #31), driven end to end through
+/// the headless sidebar driver. On the 60x24 sidebar used here, every modal
+/// box sits clear of the top-left cells, which hold the first item's
+/// checkbox — so a click there is "outside" and, if it fell through, would
+/// toggle that item in the feed.
+#[cfg(test)]
+mod outside_click_tests {
+    use crate::tui::driver::Driver;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    const FEED: &str = "# Work\n\n- [ ] Alpha\n\n# Done\n\n- [x] Old @done(2026-01-01)\n";
+    const W: u16 = 60;
+    const H: u16 = 24;
+    /// Over the first item's checkbox, outside every modal box.
+    const OUTSIDE: (u16, u16) = (1, 0);
+
+    fn shows(d: &Driver, text: &str) -> bool {
+        d.screen().iter().any(|l| l.contains(text))
+    }
+
+    fn click_outside(d: &mut Driver) {
+        d.click(OUTSIDE.0, OUTSIDE.1);
+    }
+
+    #[test]
+    fn clicking_outside_the_done_archive_closes_it() {
+        let mut d = Driver::new(FEED, W, H);
+        d.click(0, H - 3); // the Done(n) row
+        assert!(shows(&d, "Done archive"));
+
+        click_outside(&mut d);
+
+        assert!(!shows(&d, "Done archive"), "{}", d.screen().join("\n"));
+        assert_eq!(d.feed(), FEED);
+    }
+
+    #[test]
+    fn clicking_outside_the_file_view_closes_it() {
+        let mut d = Driver::new(FEED, W, H);
+        d.key(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert!(shows(&d, "feed file"));
+
+        click_outside(&mut d);
+
+        assert!(!shows(&d, "feed file"), "{}", d.screen().join("\n"));
+        assert_eq!(d.feed(), FEED);
+    }
+
+    #[test]
+    fn clicking_outside_the_delete_confirmation_cancels_back_to_the_edit_modal() {
+        let mut d = Driver::new(FEED, W, H);
+        d.click(6, 0); // Alpha's title
+        d.key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(shows(&d, "Confirm delete"), "{}", d.screen().join("\n"));
+
+        click_outside(&mut d);
+
+        assert!(!shows(&d, "Confirm delete"), "{}", d.screen().join("\n"));
+        assert!(shows(&d, "Edit item"), "{}", d.screen().join("\n"));
+        assert_eq!(d.feed(), FEED);
+    }
+
+    #[test]
+    fn clicking_outside_a_clean_edit_modal_closes_it_like_esc() {
+        let mut d = Driver::new(FEED, W, H);
+        d.click(6, 0); // Alpha's title
+        assert!(shows(&d, "Edit item"));
+
+        click_outside(&mut d);
+
+        assert!(!shows(&d, "Edit item"), "{}", d.screen().join("\n"));
+        assert_eq!(
+            d.herdr_calls(),
+            ["zoom_pane w1:p1 on", "zoom_pane w1:p1 off"],
+            "closing unzooms, exactly as Esc does"
+        );
+    }
+
+    #[test]
+    fn clicking_outside_a_dirty_edit_modal_keeps_it_open_and_says_how_to_leave() {
+        let mut d = Driver::new(FEED, W, H);
+        d.click(6, 0); // Alpha's edit modal, Category focused
+        d.key(KeyCode::Tab, KeyModifiers::NONE); // -> Title
+        d.type_str("!");
+
+        click_outside(&mut d);
+
+        assert!(shows(&d, "Edit item"), "{}", d.screen().join("\n"));
+        assert!(
+            shows(&d, "unsaved — Esc to discard, Ctrl+S to save"),
+            "{}",
+            d.screen().join("\n")
+        );
+        assert_eq!(d.feed(), FEED);
+        // The typing survived: saving now writes it.
+        d.key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(d.feed().contains("- [ ] Alpha!"), "{}", d.feed());
+    }
+
+    #[test]
+    fn an_edit_typed_back_to_its_loaded_text_is_clean_again() {
+        let mut d = Driver::new(FEED, W, H);
+        d.click(6, 0);
+        d.type_str("!");
+        d.key(KeyCode::Backspace, KeyModifiers::NONE);
+
+        click_outside(&mut d);
+
+        assert!(!shows(&d, "Edit item"), "{}", d.screen().join("\n"));
+    }
+
+    #[test]
+    fn clicking_outside_with_the_category_dropdown_open_closes_only_the_dropdown() {
+        let feed = "# Work\n\n- [ ] Alpha\n\n## Errands\n\n- [ ] Milk\n";
+        let mut d = Driver::new(feed, W, H);
+        d.key(KeyCode::Char('a'), KeyModifiers::NONE); // New item, Category focused
+        d.key(KeyCode::Down, KeyModifiers::NONE); // highlight "Errands"
+        assert!(shows(&d, "Errands"));
+
+        click_outside(&mut d);
+        assert!(shows(&d, "New item"), "{}", d.screen().join("\n"));
+        // The highlight is gone: Enter now advances to Title instead of
+        // accepting "Errands" into Category.
+        d.key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(shows(&d, "Title*"), "{}", d.screen().join("\n"));
+
+        click_outside(&mut d); // next layer: the (clean) modal itself
+        assert!(!shows(&d, "New item"), "{}", d.screen().join("\n"));
+        assert_eq!(d.feed(), feed);
+    }
+
+    #[test]
+    fn an_outside_click_over_a_checkbox_never_reaches_the_list() {
+        // Control: with no modal open, this very click toggles Alpha.
+        let mut control = Driver::new(FEED, W, H);
+        click_outside(&mut control);
+        assert_ne!(control.feed(), FEED, "OUTSIDE must sit on a checkbox");
+
+        let mut d = Driver::new(FEED, W, H);
+        d.click(6, 0); // open Alpha's edit modal
+        click_outside(&mut d);
+
+        assert!(!shows(&d, "Edit item"));
+        assert_eq!(d.feed(), FEED, "the dismissing click must be consumed");
+    }
+}
+
+/// Terminal (bracketed) paste into the edit modal, driven end to end.
+#[cfg(test)]
+mod paste_tests {
+    use crate::tui::driver::Driver;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    /// Open the edit modal on the only item, focused on Title, then paste.
+    fn paste_into_title(text: &str) -> Driver {
+        let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n", 40, 24);
+        d.click(6, 0); // title zone of the first row: edit modal, Category
+        d.key(KeyCode::Tab, KeyModifiers::NONE); // -> Title, cursor at end
+        d.paste(text);
+        d
+    }
+
+    fn save(d: &mut Driver) {
+        d.key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    }
+
+    #[test]
+    fn pasting_lf_lines_into_title_joins_them_with_spaces() {
+        let mut d = paste_into_title(" one\ntwo\nthree");
+        save(&mut d);
+        assert_eq!(d.feed(), "# Feed\n\n- [ ] Alpha one two three\n");
+    }
+
+    #[test]
+    fn pasting_crlf_and_lone_cr_into_title_gives_one_space_per_break() {
+        let mut d = paste_into_title(" one\r\ntwo\rthree");
+        save(&mut d);
+        assert_eq!(d.feed(), "# Feed\n\n- [ ] Alpha one two three\n");
+    }
+
+    #[test]
+    fn a_multi_line_paste_into_title_does_not_act_as_enter() {
+        let mut d = paste_into_title("\n");
+        d.type_str("x");
+        save(&mut d);
+        assert_eq!(
+            d.feed(),
+            "# Feed\n\n- [ ] Alpha x\n",
+            "focus stays on Title; the newline is a space, not Enter-to-Body"
+        );
+    }
+
+    #[test]
+    fn pasting_into_category_flattens_newlines() {
+        let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n", 40, 24);
+        d.click(6, 0); // edit modal opens on Category
+        d.paste("Big\r\nRocks");
+        save(&mut d);
+        assert!(
+            d.feed().contains("## Big Rocks\n\n- [ ] Alpha\n"),
+            "got: {:?}",
+            d.feed()
+        );
+    }
+
+    #[test]
+    fn pasting_into_body_keeps_lf_and_crlf_line_breaks() {
+        let mut d = paste_into_title("");
+        d.key(KeyCode::Tab, KeyModifiers::NONE); // Title -> Body
+        d.paste("first\r\nsecond\nthird");
+        save(&mut d);
+        assert_eq!(
+            d.feed(),
+            "# Feed\n\n- [ ] Alpha\n  first\n  second\n  third\n"
+        );
+    }
+
+    #[test]
+    fn pasted_text_replaces_the_active_selection() {
+        let mut d = paste_into_title("");
+        // Select the whole title "Alpha" (cursor parked at its end).
+        for _ in 0..5 {
+            d.key(KeyCode::Left, KeyModifiers::SHIFT);
+        }
+        d.paste("Beta\nGamma");
+        save(&mut d);
+        assert_eq!(d.feed(), "# Feed\n\n- [ ] Beta Gamma\n");
+    }
+
+    #[test]
+    fn a_paste_in_the_list_view_triggers_no_keybindings() {
+        let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n", 40, 24);
+        d.paste("q\na\ne");
+        assert!(!d.exit_requested(), "a pasted 'q' must not quit");
+        assert!(
+            !d.screen().iter().any(|l| l.contains("item")),
+            "a pasted 'a' must not open the add modal"
+        );
+        assert_eq!(d.feed(), "# Feed\n\n- [ ] Alpha\n");
     }
 }

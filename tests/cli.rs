@@ -1,9 +1,12 @@
+mod common;
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
+/// A hermetic `feedr` on `feed`, with the fixture's own dir as HOME.
 fn feedr(feed: &std::path::Path) -> Command {
-    let mut cmd = Command::cargo_bin("feedr").unwrap();
+    let mut cmd = common::feedr_in(feed.parent().unwrap());
     cmd.arg("--file").arg(feed);
     cmd
 }
@@ -46,6 +49,28 @@ fn show_prints_title_and_body() {
         .success()
         .stdout(contains("Fix auth redirect loop"))
         .stdout(contains("Repro: bounces forever."));
+}
+
+#[test]
+fn an_exact_title_is_addressable_when_it_is_a_substring_of_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = dir.path().join("feed.md");
+    std::fs::write(
+        &feed,
+        "# Feed\n\n- [ ] Fix auth redirect\n  Other one.\n- [ ] Fix auth\n  The short one.\n",
+    )
+    .unwrap();
+    feedr(&feed)
+        .args(["show", "fix auth"])
+        .assert()
+        .success()
+        .stdout(contains("The short one."))
+        .stdout(contains("Other one.").not());
+    feedr(&feed)
+        .args(["show", "fix"])
+        .assert()
+        .failure()
+        .stderr(contains("ambiguous"));
 }
 
 #[test]
@@ -144,8 +169,7 @@ fn unreadable_feed_errors_instead_of_clobbering() {
 fn feedr_feed_env_selects_feed() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());
-    let mut cmd = Command::cargo_bin("feedr").unwrap();
-    cmd.env_remove("FEEDR_FEED");
+    let mut cmd = common::feedr_in(dir.path());
     cmd.env("FEEDR_FEED", &feed);
     cmd.arg("list")
         .assert()
@@ -258,7 +282,8 @@ fn add_with_reserved_section_fails() {
 
 #[test]
 fn sidebar_subcommand_is_wired() {
-    let mut cmd = Command::cargo_bin("feedr").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = common::feedr_in(home.path());
     cmd.args(["sidebar", "--help"])
         .assert()
         .success()
@@ -269,22 +294,16 @@ fn sidebar_subcommand_is_wired() {
 // hook entry point) --------------------------------------------------------
 //
 // `config::default_config_dir()` is hardcoded to `dirs::config_dir()` (not
-// injectable like `--file`/`FEEDR_FEED`), so these tests sandbox it by
-// setting HOME for the child process to a fresh tempdir — on macOS
-// `dirs::config_dir()` resolves under `$HOME/Library/Application Support`,
-// so this never touches the real user config.
-
-fn sandboxed_config_dir(home: &std::path::Path) -> std::path::PathBuf {
-    home.join("Library/Application Support/herdr-feedr")
-}
+// injectable like `--file`/`FEEDR_FEED`), so these tests sandbox it through
+// the hermetic HOME (see `common::config_dir`) and never touch the real
+// user config.
 
 #[test]
 fn auto_dock_hook_is_noop_when_auto_dock_disabled() {
     let home = tempfile::tempdir().unwrap();
     // No config.toml at all -> auto_dock defaults to false (config.rs).
-    let mut cmd = Command::cargo_bin("feedr").unwrap();
-    cmd.env("HOME", home.path())
-        .args(["auto-dock-hook", "--tab-id", "w1:t9"])
+    let mut cmd = common::feedr_in(home.path());
+    cmd.args(["auto-dock-hook", "--tab-id", "w1:t9"])
         .assert()
         .success()
         .stdout(""); // silent no-op — never even shells out to herdr
@@ -293,14 +312,12 @@ fn auto_dock_hook_is_noop_when_auto_dock_disabled() {
 #[test]
 fn auto_dock_hook_requires_a_tab_id_when_enabled() {
     let home = tempfile::tempdir().unwrap();
-    let cfg_dir = sandboxed_config_dir(home.path());
+    let cfg_dir = common::config_dir(home.path());
     std::fs::create_dir_all(&cfg_dir).unwrap();
     std::fs::write(cfg_dir.join("config.toml"), "[sidebar]\nauto_dock = true\n").unwrap();
 
-    let mut cmd = Command::cargo_bin("feedr").unwrap();
-    cmd.env("HOME", home.path())
-        .env_remove("HERDR_TAB_ID")
-        .arg("auto-dock-hook")
+    let mut cmd = common::feedr_in(home.path());
+    cmd.arg("auto-dock-hook")
         .assert()
         .failure()
         .stderr(contains("no tab id"));
@@ -313,7 +330,7 @@ fn auto_dock_hook_requires_a_tab_id_when_enabled() {
 #[test]
 fn auto_dock_hook_docks_into_the_named_tab_via_plugin_pane_open() {
     let home = tempfile::tempdir().unwrap();
-    let cfg_dir = sandboxed_config_dir(home.path());
+    let cfg_dir = common::config_dir(home.path());
     std::fs::create_dir_all(&cfg_dir).unwrap();
     std::fs::write(cfg_dir.join("config.toml"), "[sidebar]\nauto_dock = true\n").unwrap();
 
@@ -337,9 +354,8 @@ esac
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&fake_herdr, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut cmd = Command::cargo_bin("feedr").unwrap();
-    cmd.env("HOME", home.path())
-        .env("HERDR_BIN_PATH", &fake_herdr)
+    let mut cmd = common::feedr_in(home.path());
+    cmd.env("HERDR_BIN_PATH", &fake_herdr)
         .args(["auto-dock-hook", "--tab-id", "w1:t9"])
         .assert()
         .success()
@@ -369,7 +385,7 @@ esac
 #[test]
 fn auto_dock_hook_falls_back_to_split_and_absolute_exec_when_plugin_pane_open_fails() {
     let home = tempfile::tempdir().unwrap();
-    let cfg_dir = sandboxed_config_dir(home.path());
+    let cfg_dir = common::config_dir(home.path());
     std::fs::create_dir_all(&cfg_dir).unwrap();
     std::fs::write(cfg_dir.join("config.toml"), "[sidebar]\nauto_dock = true\n").unwrap();
 
@@ -394,9 +410,8 @@ esac
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&fake_herdr, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut cmd = Command::cargo_bin("feedr").unwrap();
-    cmd.env("HOME", home.path())
-        .env("HERDR_BIN_PATH", &fake_herdr)
+    let mut cmd = common::feedr_in(home.path());
+    cmd.env("HERDR_BIN_PATH", &fake_herdr)
         .args(["auto-dock-hook", "--tab-id", "w1:t9"])
         .assert()
         .success()
@@ -423,29 +438,19 @@ esac
 
 #[test]
 fn auto_dock_hook_subcommand_is_wired() {
-    let mut cmd = Command::cargo_bin("feedr").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = common::feedr_in(home.path());
     cmd.args(["auto-dock-hook", "--help"])
         .assert()
         .success()
         .stdout(contains("--tab-id"));
 }
 
-/// The test process itself often runs inside herdr with a live Claude session,
-/// so identity tests must start from a blank environment or they'd resolve
-/// against the developer's own session instead of the fixture.
-fn feedr_bare_env(feed: &std::path::Path) -> Command {
-    let mut cmd = feedr(feed);
-    cmd.env_remove("FEEDR_AGENT")
-        .env_remove("HERDR_ENV")
-        .env_remove("CLAUDE_CODE_SESSION_ID");
-    cmd
-}
-
 #[test]
 fn whoami_prints_the_resolved_ref_and_its_source() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());
-    feedr_bare_env(&feed)
+    feedr(&feed)
         .env("FEEDR_AGENT", "codex:sess-7")
         .arg("whoami")
         .assert()
@@ -457,7 +462,7 @@ fn whoami_prints_the_resolved_ref_and_its_source() {
 fn whoami_fails_loudly_when_no_source_resolves() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());
-    feedr_bare_env(&feed)
+    feedr(&feed)
         .arg("whoami")
         .assert()
         .failure()
@@ -468,7 +473,7 @@ fn whoami_fails_loudly_when_no_source_resolves() {
 fn claim_without_the_agent_flag_resolves_identity_from_the_environment() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());
-    feedr_bare_env(&feed)
+    feedr(&feed)
         .env("CLAUDE_CODE_SESSION_ID", "sess-42")
         .args(["claim", "auth"])
         .assert()
@@ -483,7 +488,7 @@ fn an_unresolvable_claim_fails_and_leaves_the_feed_untouched() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());
     let before = std::fs::read_to_string(&feed).unwrap();
-    feedr_bare_env(&feed)
+    feedr(&feed)
         .args(["claim", "auth"])
         .assert()
         .failure()
@@ -553,8 +558,9 @@ fn skill_install_writes_both_targets_and_says_what_it_did() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());
     let home = tempfile::tempdir().unwrap();
-    feedr(&feed)
-        .env("HOME", home.path())
+    common::feedr_in(home.path())
+        .arg("--file")
+        .arg(&feed)
         .args(["skill", "install"])
         .assert()
         .success()
@@ -570,8 +576,9 @@ fn skill_install_refresh_only_creates_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());
     let home = tempfile::tempdir().unwrap();
-    feedr(&feed)
-        .env("HOME", home.path())
+    common::feedr_in(home.path())
+        .arg("--file")
+        .arg(&feed)
         .args(["skill", "install", "--refresh-only"])
         .assert()
         .success();
@@ -584,13 +591,15 @@ fn skill_status_reports_the_installed_copy() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());
     let home = tempfile::tempdir().unwrap();
-    feedr(&feed)
-        .env("HOME", home.path())
+    common::feedr_in(home.path())
+        .arg("--file")
+        .arg(&feed)
         .args(["skill", "install"])
         .assert()
         .success();
-    feedr(&feed)
-        .env("HOME", home.path())
+    common::feedr_in(home.path())
+        .arg("--file")
+        .arg(&feed)
         .args(["skill", "status"])
         .assert()
         .success()
@@ -602,8 +611,9 @@ fn skill_status_says_so_when_nothing_is_installed() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());
     let home = tempfile::tempdir().unwrap();
-    feedr(&feed)
-        .env("HOME", home.path())
+    common::feedr_in(home.path())
+        .arg("--file")
+        .arg(&feed)
         .args(["skill", "status"])
         .assert()
         .success()
@@ -614,12 +624,12 @@ fn skill_status_says_so_when_nothing_is_installed() {
 fn an_agent_unclaims_its_own_item() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());
-    feedr_bare_env(&feed)
+    feedr(&feed)
         .env("CLAUDE_CODE_SESSION_ID", "sess-42")
         .args(["claim", "auth"])
         .assert()
         .success();
-    feedr_bare_env(&feed)
+    feedr(&feed)
         .env("CLAUDE_CODE_SESSION_ID", "sess-42")
         .args(["unclaim", "auth"])
         .assert()
@@ -633,12 +643,12 @@ fn an_agent_unclaims_its_own_item() {
 fn an_agent_cannot_unclaim_someone_elses_item() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());
-    feedr_bare_env(&feed)
+    feedr(&feed)
         .args(["claim", "auth", "--agent", "claude:sess-1"])
         .assert()
         .success();
     let before = std::fs::read_to_string(&feed).unwrap();
-    feedr_bare_env(&feed)
+    feedr(&feed)
         .env("CLAUDE_CODE_SESSION_ID", "sess-99")
         .args(["unclaim", "auth"])
         .assert()
@@ -651,11 +661,11 @@ fn an_agent_cannot_unclaim_someone_elses_item() {
 fn the_human_unclaims_anything() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());
-    feedr_bare_env(&feed)
+    feedr(&feed)
         .args(["claim", "auth", "--agent", "claude:sess-1"])
         .assert()
         .success();
-    feedr_bare_env(&feed)
+    feedr(&feed)
         .args(["unclaim", "auth", "--as-human"])
         .assert()
         .success();
@@ -666,9 +676,255 @@ fn the_human_unclaims_anything() {
 fn unclaiming_an_unclaimed_item_fails() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());
-    feedr_bare_env(&feed)
+    feedr(&feed)
         .args(["unclaim", "auth", "--as-human"])
         .assert()
         .failure()
         .stderr(contains("isn't claimed"));
+}
+
+#[test]
+fn a_cli_write_keeps_hand_edited_formatting() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = dir.path().join("feed.md");
+    std::fs::write(&feed, "# Feed\r\n\r\n- [X] Shipped\r\n- [ ] Fix auth").unwrap();
+    feedr(&feed)
+        .args(["claim", "auth", "--agent", "claude:abc123"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(&feed).unwrap(),
+        "# Feed\r\n\r\n- [X] Shipped\r\n- [~] Fix auth @agent(claude:abc123)"
+    );
+}
+
+// --- Hermeticity -----------------------------------------------------------
+//
+// These tests run from inside herdr with a live agent session more often than
+// not. `common::hermetic` must hold the child to the fixture no matter what
+// the parent shell exports, so each test here starts from a simulated
+// developer shell and checks nothing of it leaks through.
+
+/// What a developer's shell inside herdr, running Claude Code, looks like.
+fn developer_shell(feed: &std::path::Path) -> Command {
+    let mut std_cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("feedr"));
+    std_cmd
+        .env("HERDR_ENV", "1")
+        .env("HERDR_SOCKET_PATH", "/nonexistent/herdr.sock")
+        .env("HERDR_BIN_PATH", "/nonexistent/herdr")
+        .env("HERDR_PANE_ID", "w9:p9")
+        .env("HERDR_TAB_ID", "w9:t9")
+        .env("FEEDR_AGENT", "claude:dev-session")
+        .env("CLAUDE_CODE_SESSION_ID", "dev-session")
+        .env("FEEDR_FEED", feed);
+    Command::from_std(std_cmd)
+}
+
+#[test]
+fn a_hermetic_command_does_not_see_the_developers_agent_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    let mut cmd = developer_shell(&feed);
+    common::hermetic(&mut cmd, dir.path());
+    cmd.arg("--file")
+        .arg(&feed)
+        .arg("whoami")
+        .assert()
+        .failure()
+        .stderr(contains("--agent").and(contains("dev-session").not()));
+}
+
+#[test]
+fn a_hermetic_command_does_not_see_the_developers_feed_or_home() {
+    let dev = tempfile::tempdir().unwrap();
+    let dev_feed = seed(dev.path());
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = developer_shell(&dev_feed);
+    common::hermetic(&mut cmd, home.path());
+    // No --file: the feed must resolve to the sandboxed config dir's default,
+    // which doesn't exist yet, so nothing from the developer's feed is listed.
+    cmd.arg("list")
+        .assert()
+        .success()
+        .stdout(contains("Fix auth redirect loop").not());
+}
+
+const TODAY_FEED: &str = "\
+# Feed
+
+- [ ] Fix auth redirect loop @today
+  Repro: bounces forever.
+- [ ] Write onboarding doc
+
+## Agent
+
+- [~] Backfill migration test @agent(claude:abc) @today
+";
+
+fn today_seed(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("feed.md");
+    std::fs::write(&path, TODAY_FEED).unwrap();
+    path
+}
+
+#[test]
+fn list_flags_today_items_and_only_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = today_seed(dir.path());
+    let out = feedr(&feed).arg("list").output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for line in [
+        "[ ] Fix auth redirect loop  ★ Today\n",
+        "[ ] Write onboarding doc\n",
+        "[~] Backfill migration test  @claude:abc  ★ Today\n",
+    ] {
+        assert!(stdout.contains(line), "want {line:?} in:\n{stdout}");
+    }
+    assert!(
+        !stdout.contains("@today"),
+        "the raw token is not the flag:\n{stdout}"
+    );
+}
+
+#[test]
+fn show_flags_a_today_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = today_seed(dir.path());
+    feedr(&feed)
+        .args(["show", "auth"])
+        .assert()
+        .success()
+        .stdout(contains("[ ] Fix auth redirect loop  ★ Today\n"))
+        .stdout(contains("Repro: bounces forever."));
+    feedr(&feed)
+        .args(["show", "onboarding"])
+        .assert()
+        .success()
+        .stdout(contains("Today").not());
+}
+
+#[test]
+fn done_strips_today_in_the_same_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = today_seed(dir.path());
+    feedr(&feed)
+        .args(["done", "Backfill", "--note", "landed"])
+        .assert()
+        .success();
+    feedr(&feed)
+        .args(["done", "auth", "--as-human"])
+        .assert()
+        .success();
+    let text = std::fs::read_to_string(&feed).unwrap();
+    assert!(
+        text.contains("- [x] Fix auth redirect loop\n"),
+        "got:\n{text}"
+    );
+    assert!(
+        text.contains("- [x] Backfill migration test @agent(claude:abc)\n"),
+        "got:\n{text}"
+    );
+    assert!(!text.contains("@today"), "got:\n{text}");
+}
+
+#[test]
+fn a_cli_write_leaves_an_over_cap_today_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = dir.path().join("feed.md");
+    let text = "# Feed\n\n- [ ] A @today\n- [ ] B @today\n- [ ] C @today\n- [ ] D @today\n";
+    std::fs::write(&feed, text).unwrap();
+    feedr(&feed).args(["add", "E"]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(&feed).unwrap(),
+        format!("{text}- [ ] E\n")
+    );
+}
+
+#[test]
+fn no_cli_command_sets_or_unsets_today() {
+    let home = tempfile::tempdir().unwrap();
+    let help = common::feedr_in(home.path())
+        .arg("--help")
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&help.stdout).to_lowercase();
+    assert!(
+        !help.contains("today"),
+        "Today is the human's alone:\n{help}"
+    );
+}
+
+// --- Write locking (SPEC §6) ------------------------------------------------
+
+#[test]
+fn parallel_adds_all_land() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    const N: usize = 24;
+    let outputs = common::feedr_parallel(dir.path(), N, |i| {
+        vec![
+            "--file".into(),
+            feed.display().to_string(),
+            "add".into(),
+            format!("Parallel item {i}"),
+        ]
+    });
+    for (i, out) in outputs.iter().enumerate() {
+        assert!(
+            out.status.success(),
+            "add {i} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let text = std::fs::read_to_string(&feed).unwrap();
+    let missing: Vec<_> = (0..N)
+        .filter(|i| !text.contains(&format!("- [ ] Parallel item {i}\n")))
+        .collect();
+    assert!(missing.is_empty(), "lost updates {missing:?} in:\n{text}");
+    assert!(text.contains("- [ ] Fix auth redirect loop\n"));
+}
+
+/// Hold `feed.md.lock` beside `feed` as another writer would.
+fn hold_lock(feed: &std::path::Path) -> std::fs::File {
+    let lock = std::fs::File::create(feed.with_file_name("feed.md.lock")).unwrap();
+    lock.lock().unwrap();
+    lock
+}
+
+#[test]
+fn a_write_that_cannot_get_the_lock_fails_naming_the_lock_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    let before = std::fs::read_to_string(&feed).unwrap();
+    let _held = hold_lock(&feed);
+    feedr(&feed)
+        .env("FEEDR_LOCK_TIMEOUT_MS", "200")
+        .args(["add", "Blocked"])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .failure()
+        .stderr(contains("feed.md.lock"))
+        .stderr(contains("timed out"));
+    assert_eq!(std::fs::read_to_string(&feed).unwrap(), before);
+}
+
+#[test]
+fn reads_do_not_wait_for_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    let _held = hold_lock(&feed);
+    feedr(&feed)
+        .env("FEEDR_LOCK_TIMEOUT_MS", "60000")
+        .arg("list")
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .success()
+        .stdout(contains("Fix auth redirect loop"));
+    feedr(&feed)
+        .env("FEEDR_LOCK_TIMEOUT_MS", "60000")
+        .args(["show", "auth"])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .success();
 }

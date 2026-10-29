@@ -20,7 +20,7 @@ pub fn render(doc: &Document) -> String {
                 // "- [x] @done(...)" (empty title + token) round-trips with a
                 // double space. Items can have empty titles (parser accepts
                 // "- [x] " and token-only lines).
-                out.push_str(&format!("- [{}]", item.state.to_char()));
+                out.push_str(&format!("- [{}]", item.checkbox_char()));
                 if !item.title.is_empty() {
                     out.push(' ');
                     out.push_str(&item.title);
@@ -28,25 +28,40 @@ pub fn render(doc: &Document) -> String {
                 if let Some(a) = &item.agent {
                     out.push_str(&format!(" @agent({a})"));
                 }
+                if item.today {
+                    out.push_str(" @today");
+                }
                 if let Some(d) = &item.done_date {
                     out.push_str(&format!(" @done({d})"));
                 }
-                if item.title.is_empty() && item.agent.is_none() && item.done_date.is_none() {
+                if item.title.is_empty()
+                    && item.agent.is_none()
+                    && !item.today
+                    && item.done_date.is_none()
+                {
                     // "- [ ]" alone re-parses as Raw, losing item-ness and
                     // detaching the body. Keep the trailing space so it
                     // still parses as an item.
                     out.push(' ');
                 }
                 out.push('\n');
+                let indent = if item.style.tab_body { "\t" } else { "  " };
                 for b in &item.body {
                     if !b.is_empty() {
-                        out.push_str("  ");
+                        out.push_str(indent);
                         out.push_str(b);
                     }
                     out.push('\n');
                 }
             }
         }
+    }
+    if doc.style.no_trailing_newline {
+        out.pop();
+    }
+    // Nodes never hold a line break, so every '\n' above is a line ending.
+    if doc.style.crlf {
+        out = out.replace('\n', "\r\n");
     }
     out
 }
@@ -84,6 +99,16 @@ Some stray prose the parser doesn't own.
 
 - [x] Old thing @done(2026-09-01)
 - [x] @done(2026-09-02)
+";
+        assert_eq!(render(&parse(text)), text);
+    }
+
+    #[test]
+    fn today_round_trips_in_the_trailing_token_position() {
+        let text = "\
+- [ ] Fix auth @today
+- [~] Migrate CI @agent(claude:0198f3ab) @today
+- [ ] @today
 ";
         assert_eq!(render(&parse(text)), text);
     }

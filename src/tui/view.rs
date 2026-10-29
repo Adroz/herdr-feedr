@@ -2,6 +2,7 @@ use crate::tui::app::{App, Row};
 use crate::tui::modal::{self, EditFocus, Modal};
 use crate::tui::socket::AgentStatus;
 use crate::tui::theme;
+use crate::tui::viewer::Viewer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
@@ -68,6 +69,40 @@ pub fn ellipsize(s: &str, width: usize) -> String {
     t
 }
 
+/// Where the Today panel and the scrolling list sit inside the list region
+/// (everything above the Done row). Shared with `input::click` so drawn and
+/// clicked rows can never drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListLayout {
+    /// The bordered Today panel, fixed at the top; zero-height when Today
+    /// is empty.
+    pub today: Rect,
+    /// The scrolling list, below the panel and a blank row.
+    pub list: Rect,
+}
+
+pub fn list_layout(area: Rect, today_rows: usize) -> ListLayout {
+    if today_rows == 0 {
+        return ListLayout {
+            today: Rect { height: 0, ..area },
+            list: area,
+        };
+    }
+    let panel_h = (today_rows as u16).saturating_add(2).min(area.height);
+    let today = Rect {
+        height: panel_h,
+        ..area
+    };
+    // One blank row between the panel and the list, when there's room.
+    let taken = panel_h.saturating_add(1).min(area.height);
+    let list = Rect {
+        y: area.y + taken,
+        height: area.height - taken,
+        ..area
+    };
+    ListLayout { today, list }
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     if app.collapsed {
@@ -83,7 +118,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     ])
     .areas(area);
 
-    let w = area.width as usize;
+    let ListLayout { today, list } = list_layout(list, app.today_rows.len());
+    if today.height > 0 {
+        let border = theme::today_border(app.today_over_cap);
+        let block = Block::bordered()
+            .border_style(border)
+            .title(Span::styled(" Today ", border.add_modifier(Modifier::BOLD)));
+        let inner_w = block.inner(today).width as usize;
+        let rows: Vec<Line> = app
+            .today_rows
+            .iter()
+            .map(|r| row_line(app, r, inner_w))
+            .collect();
+        f.render_widget(Paragraph::new(rows).block(block), today);
+    }
+
+    let w = list.width as usize;
     let lines: Vec<Line> = app
         .rows
         .iter()
@@ -202,7 +252,7 @@ fn draw_modal(f: &mut Frame, app: &mut App) {
     match &app.modal {
         Modal::None | Modal::Edit(_) => {}
         Modal::ConfirmDelete(m) => {
-            let area = modal::centered(f.area(), 80, 20);
+            let area = modal::confirm_rect(f.area());
             f.render_widget(Clear, area);
             let outer = Block::bordered()
                 .style(theme::modal_panel_style())
@@ -223,15 +273,18 @@ fn draw_modal(f: &mut Frame, app: &mut App) {
                 inner,
             );
         }
-        Modal::DoneView { scroll } => {
-            draw_viewer(f, "Done archive — Esc closes", &app.archive_text(), *scroll)
+        Modal::DoneView(_) => {
+            let text = app.archive_text();
+            if let Modal::DoneView(v) = &mut app.modal {
+                draw_viewer(f, "Done archive — Esc closes", &text, v);
+            }
         }
-        Modal::FileView { scroll } => draw_viewer(
-            f,
-            "feed file — e edits in $EDITOR, Esc closes",
-            &app.file_text(),
-            *scroll,
-        ),
+        Modal::FileView(_) => {
+            let text = app.file_text();
+            if let Modal::FileView(v) = &mut app.modal {
+                draw_viewer(f, "feed file — e edits in $EDITOR, Esc closes", &text, v);
+            }
+        }
     }
 }
 
@@ -257,7 +310,8 @@ fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
     let is_edit = m.original.is_some();
     let layout = modal::edit_layout(f.area(), is_edit, m.claimed, m.dropdown_rows());
 
-    // Re-derive each field's viewport from origin every frame: tui-textarea
+    // Re-derive each field's viewport from origin whenever the fields' rects
+    // change (first frame, resize, the pre-zoom → zoomed jump): tui-textarea
     // only ever adjusts its viewport minimally to keep the cursor visible,
     // and never scrolls back when space frees up — so a scroll acquired at
     // the modal's first (narrow, pre-zoom) frame would otherwise stick for
@@ -265,6 +319,9 @@ fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
     // cursor-visibility pass compute the scroll fresh for the CURRENT size:
     // start-parked (unfocused) fields render unscrolled, and the focused
     // field's end-parked cursor is safe at any first-frame width.
+    // At an unchanged size the scroll is left alone: resetting it every
+    // frame would yank a scrolled body back to the top as soon as a click
+    // moved the cursor up, away from the text the user was pointing at.
     // (`i16::MIN + 1`, not `i16::MIN`: tui-textarea negates the delta
     // internally and `-i16::MIN` overflows. 32767 rows/cols is still far
     // beyond any feed item. And `scroll()` drags the CURSOR along to keep
@@ -274,20 +331,27 @@ fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
     // and restored around the reset. `Jump` back to the same spot is a
     // no-op for an active selection: the anchor is kept and the cursor
     // ends where it already was.)
-    for ta in [&mut m.category, &mut m.title, &mut m.body] {
-        let (row, col) = ta.cursor();
-        ta.scroll((i16::MIN + 1, i16::MIN + 1));
-        ta.move_cursor(tui_textarea::CursorMove::Jump(row as u16, col as u16));
+    let fields = [layout.category, layout.title, layout.body];
+    if m.drawn_fields != Some(fields) {
+        m.drawn_fields = Some(fields);
+        for ta in [&mut m.category, &mut m.title, &mut m.body] {
+            let (row, col) = ta.cursor();
+            ta.scroll((i16::MIN + 1, i16::MIN + 1));
+            ta.move_cursor(tui_textarea::CursorMove::Jump(row as u16, col as u16));
+        }
     }
 
     f.render_widget(Clear, layout.outer);
     let outer = Block::bordered()
         .style(theme::modal_panel_style())
         .border_style(theme::modal_border())
-        .title_style(theme::modal_title())
-        .title(if is_edit { "Edit item" } else { "New item" })
+        .title(edit_modal_title(is_edit))
         .padding(Padding::uniform(1));
     f.render_widget(outer, layout.outer);
+    f.render_widget(
+        Paragraph::new(modal::today_label(m.today)).style(theme::today_toggle(m.today)),
+        layout.today,
+    );
 
     f.render_widget(&m.category, layout.category);
     f.render_widget(&m.title, layout.title);
@@ -318,9 +382,9 @@ fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
     }
 
     let hint = if is_edit {
-        "Tab field · ^S save · ^D delete · Esc cancel"
+        "Tab field · ^T today · ^S save · ^D delete · Esc cancel"
     } else {
-        "Tab field · ^S save · Esc cancel"
+        "Tab field · ^T today · ^S save · Esc cancel"
     };
     f.render_widget(Paragraph::new(hint).style(theme::muted_row()), layout.hints);
 
@@ -348,27 +412,40 @@ fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
     }
 }
 
+/// "Edit item ── " / "New item ── ": the heading and its separator. The
+/// Today toggle after them is painted separately at `EditLayout::today`, the
+/// same cells `modal::edit_click` hit-tests.
+fn edit_modal_title(is_edit: bool) -> Line<'static> {
+    let heading = if is_edit {
+        modal::EDIT_HEADING
+    } else {
+        modal::CREATE_HEADING
+    };
+    Line::from(vec![
+        Span::styled(heading, theme::modal_title()),
+        Span::styled(modal::HEADING_SEP, theme::modal_border()),
+    ])
+}
+
 fn render_button(f: &mut Frame, area: Rect, label: &str, focused: bool) {
     f.render_widget(Paragraph::new(label).style(theme::button(focused)), area);
 }
 
-fn draw_viewer(f: &mut Frame, title: &str, text: &str, scroll: u16) {
-    let area = modal::centered(f.area(), 90, 80);
+/// The viewer's text goes through its read-only `TextArea` so selection
+/// maps against exactly what is drawn here (wrap and scroll included).
+fn draw_viewer(f: &mut Frame, title: &str, text: &str, v: &mut Viewer) {
+    let area = modal::viewer_rect(f.area());
     f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(text.to_string())
-            .style(theme::normal_text())
-            .block(
-                Block::bordered()
-                    .style(theme::modal_panel_style())
-                    .border_style(theme::modal_border())
-                    .title_style(theme::modal_title())
-                    .title(title.to_string())
-                    .padding(Padding::uniform(1)),
-            )
-            .scroll((scroll, 0)),
-        area,
+    v.sync(text);
+    v.text.set_block(
+        Block::bordered()
+            .style(theme::modal_panel_style())
+            .border_style(theme::modal_border())
+            .title_style(theme::modal_title())
+            .title(title.to_string())
+            .padding(Padding::uniform(1)),
     );
+    f.render_widget(&v.text, area);
 }
 
 fn row_line(app: &App, row: &Row, w: usize) -> Line<'static> {
@@ -407,6 +484,10 @@ fn row_line(app: &App, row: &Row, w: usize) -> Line<'static> {
         }
         // Round-2 item 3: de-emphasized like the toolbar/Done/status rows —
         // it's chrome, not a task.
+        Row::Category(name) => Line::styled(
+            format!("    {}", ellipsize(name, w.saturating_sub(4))),
+            theme::today_category(),
+        ),
         Row::Add => Line::styled("+ add", theme::muted_row()),
     }
 }
@@ -428,6 +509,8 @@ mod tests {
             width: 0.18,
             max_width: 46,
             auto_dock: false,
+            auto_close: true,
+            quit_herdr_when_last: true,
         }
     }
 
@@ -482,9 +565,9 @@ mod tests {
         assert_eq!(rows[6], "+ add");
         assert_eq!(rows[9], "Done (1)"); // bottom-pinned, h-3
         assert_eq!(rows[10], "clear completed"); // under Done, h-2
-                                          // status line, h-1: "hello" on the left, « pinned bottom-right
-                                          // (round-3 item 2 — native-herdr collapse position). 20-col row:
-                                          // "hello" (5) + 14 blank cells + « (1) = 20.
+                                                 // status line, h-1: "hello" on the left, « pinned bottom-right
+                                                 // (round-3 item 2 — native-herdr collapse position). 20-col row:
+                                                 // "hello" (5) + 14 blank cells + « (1) = 20.
         assert_eq!(rows[11], format!("hello{}«", " ".repeat(14)));
     }
 
@@ -558,6 +641,8 @@ mod tests {
             state: State::Open,
             title: "T".into(),
             agent: None,
+            today: false,
+            style: Default::default(),
             done_date: None,
             body: vec![
                 "the quick brown fox jumps over the lazy dog and keeps running well past \
@@ -572,8 +657,7 @@ mod tests {
         let mut m = modal::EditModal::edit(key, &item, None, vec![]);
 
         let (w, h) = (60, 24);
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
         term.draw(|f| draw_edit_modal(f, &mut m)).unwrap();
         let buf = term.backend().buffer().clone();
         let layout = modal::edit_layout(Rect::new(0, 0, w, h), true, false, m.dropdown_rows());
@@ -600,9 +684,9 @@ mod tests {
             filled[0]
         );
         assert!(
-            filled.iter().any(|r| r.contains("running")
-                || r.contains("past")
-                || r.contains("edge")),
+            filled
+                .iter()
+                .any(|r| r.contains("running") || r.contains("past") || r.contains("edge")),
             "later text must appear on a following row, not scrolled away: {rows:?}"
         );
     }
@@ -1049,6 +1133,8 @@ mod tests {
             state: State::Open,
             title: "T".into(),
             agent: None,
+            today: false,
+            style: Default::default(),
             done_date: None,
             body,
         };
@@ -1088,6 +1174,8 @@ mod tests {
             state: State::Open,
             title: "A title long enough to overflow a narrow docked pane".into(),
             agent: None,
+            today: false,
+            style: Default::default(),
             done_date: None,
             body: Vec::new(),
         };

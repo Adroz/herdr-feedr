@@ -30,6 +30,10 @@ pub enum OpError {
     NotClaimed(String),
     #[error("\"{0}\" is claimed by {1} — only they (or you, with --as-human) can release it")]
     NotYours(String, AgentRef),
+    #[error("Today full — unmark one first")]
+    TodayFull,
+    #[error("Today holds only uncompleted items")]
+    TodayDone,
 }
 
 pub fn zone_of(doc: &Document, index: usize) -> Zone {
@@ -68,6 +72,16 @@ pub fn find(doc: &Document, query: &str) -> Result<usize, OpError> {
             _ => None,
         })
         .collect();
+    // An exact title wins so a title that is a substring of another stays
+    // addressable; duplicate exact titles fall through to the ambiguity error.
+    let exact: Vec<usize> = matches
+        .iter()
+        .copied()
+        .filter(|&i| matches!(&doc.nodes[i], Node::Item(it) if it.title.to_lowercase() == q))
+        .collect();
+    if let [only] = exact[..] {
+        return Ok(only);
+    }
     match matches.len() {
         0 => Err(OpError::NotFound(query.to_string())),
         1 => Ok(matches[0]),
@@ -89,16 +103,20 @@ pub fn find(doc: &Document, query: &str) -> Result<usize, OpError> {
 pub fn claim(doc: &mut Document, index: usize, agent: AgentRef) {
     debug_assert!(matches!(doc.nodes[index], Node::Item(_)));
     if let Node::Item(it) = &mut doc.nodes[index] {
-        it.state = State::InProgress;
+        it.set_state(State::InProgress);
         it.agent = Some(agent);
     }
 }
 
-pub fn add(doc: &mut Document, title: &str, body: &[String], zone: Zone) {
+/// Add an open item and return its node index (valid until the next
+/// structural edit), so a caller can go on to mark it — e.g. into Today.
+pub fn add(doc: &mut Document, title: &str, body: &[String], zone: Zone) -> usize {
     let item = Node::Item(Item {
         state: State::Open,
         title: title.to_string(),
         agent: None,
+        today: false,
+        style: Default::default(),
         done_date: None,
         body: trim_blank_edges(body),
     });
@@ -126,6 +144,7 @@ pub fn add(doc: &mut Document, title: &str, body: &[String], zone: Zone) {
         },
     };
     doc.nodes.insert(insert_at, item);
+    insert_at
 }
 
 /// Trims leading/trailing empty lines from a provided body while keeping
@@ -351,13 +370,14 @@ pub fn remove(doc: &mut Document, index: usize) -> Option<Item> {
 
 /// Add an open item at the end of the named `##` section, creating the
 /// section at the end of the human zone when it doesn't exist (archive
-/// sections never match). Reserved names error.
+/// sections never match). Reserved names error. Returns the new item's node
+/// index, like [`add`].
 pub fn add_in_section(
     doc: &mut Document,
     title: &str,
     body: &[String],
     section: &str,
-) -> Result<(), OpError> {
+) -> Result<usize, OpError> {
     let end = ensure_section(doc, section)?;
     doc.nodes.insert(
         end,
@@ -365,11 +385,13 @@ pub fn add_in_section(
             state: State::Open,
             title: title.to_string(),
             agent: None,
+            today: false,
+            style: Default::default(),
             done_date: None,
             body: trim_blank_edges(body),
         }),
     );
-    Ok(())
+    Ok(end)
 }
 
 /// Move an item (state, body, and tokens intact) to the end of the named
@@ -406,9 +428,56 @@ pub fn set_state(
         return Err(OpError::NotAuthorised);
     }
     if let Node::Item(it) = &mut doc.nodes[index] {
-        it.state = state;
+        it.set_state(state);
     }
     Ok(())
+}
+
+/// Most uncompleted items Today may hold. A hand edit can exceed it; feedr
+/// then refuses new marks but never rewrites the excess away.
+pub const TODAY_CAP: usize = 3;
+
+/// Whether the item at `index` holds a Today slot: an uncompleted
+/// (`[ ]`/`[~]`/`[?]`) item carrying `@today`, outside the Done archive.
+/// The one rule both the Today panel and [`TODAY_CAP`] go by — a hand-typed
+/// `[x] … @today`, or an `@today` left under `# Done`, holds none.
+pub fn in_today(doc: &Document, index: usize) -> bool {
+    matches!(&doc.nodes[index], Node::Item(it) if it.today && it.state != State::Done)
+        && zone_of(doc, index) != Zone::Archive
+}
+
+/// How many items hold a Today slot (see [`in_today`]).
+pub fn today_count(doc: &Document) -> usize {
+    (0..doc.nodes.len()).filter(|&i| in_today(doc, i)).count()
+}
+
+/// Put an item in Today. It stays in its home section; only the `@today`
+/// token is added. Refused for a completed item (Today holds uncompleted
+/// items only) and when Today already holds [`TODAY_CAP`] items; an item
+/// already in Today is left as is.
+pub fn set_today(doc: &mut Document, index: usize) -> Result<(), OpError> {
+    debug_assert!(matches!(doc.nodes[index], Node::Item(_)));
+    if matches!(&doc.nodes[index], Node::Item(it) if it.state == State::Done) {
+        return Err(OpError::TodayDone);
+    }
+    if matches!(&doc.nodes[index], Node::Item(it) if it.today) {
+        return Ok(());
+    }
+    if today_count(doc) >= TODAY_CAP {
+        return Err(OpError::TodayFull);
+    }
+    if let Node::Item(it) = &mut doc.nodes[index] {
+        it.today = true;
+    }
+    Ok(())
+}
+
+/// Take an item out of Today.
+pub fn clear_today(doc: &mut Document, index: usize) {
+    debug_assert!(matches!(doc.nodes[index], Node::Item(_)));
+    if let Node::Item(it) = &mut doc.nodes[index] {
+        it.today = false;
+    }
 }
 
 /// The `##` section an item sits under, or None when it's uncategorized
@@ -427,8 +496,9 @@ pub fn item_section(doc: &Document, index: usize) -> Option<String> {
     current
 }
 
-/// Section name an item sits under, for mirroring in the Done archive.
-fn section_name(doc: &Document, index: usize) -> String {
+/// Section name an item sits under: its `##` heading, else its `#` zone
+/// heading. Mirrored in the Done archive and shown as a Today item's home.
+pub fn section_name(doc: &Document, index: usize) -> String {
     let mut name = "Feed".to_string();
     for node in &doc.nodes[..index] {
         match node {
@@ -600,7 +670,7 @@ pub fn unclaim(doc: &mut Document, index: usize, by: &Unclaimer) -> Result<(), O
         }
     }
     if let Node::Item(it) = &mut doc.nodes[index] {
-        it.state = State::Open;
+        it.set_state(State::Open);
         it.agent = None;
     }
     Ok(())
@@ -783,6 +853,15 @@ mod tests {
         assert!(matches!(&doc.nodes[i], Node::Item(it) if it.title.contains("auth")));
         assert!(matches!(find(&doc, "old fixed"), Err(OpError::NotFound(_))));
         assert!(matches!(find(&doc, "o"), Err(OpError::Ambiguous(..))));
+    }
+
+    #[test]
+    fn find_prefers_an_exact_title_over_substring_matches() {
+        let doc =
+            parse("# Feed\n\n- [ ] Fix auth redirect\n- [ ] Fix auth\n- [ ] Fix auth flake\n");
+        let i = find(&doc, "fix AUTH").unwrap();
+        assert!(matches!(&doc.nodes[i], Node::Item(it) if it.title == "Fix auth"));
+        assert!(matches!(find(&doc, "fix au"), Err(OpError::Ambiguous(..))));
     }
 
     #[test]
@@ -1159,6 +1238,8 @@ Some prose.
                 state: State::Open,
                 title: "New".into(),
                 agent: None,
+                today: false,
+                style: Default::default(),
                 done_date: None,
                 body: Vec::new(),
             }),
@@ -1182,6 +1263,8 @@ Some prose.
                 state: State::Open,
                 title: "X".into(),
                 agent: None,
+                today: false,
+                style: Default::default(),
                 done_date: None,
                 body: Vec::new(),
             }),
@@ -1346,5 +1429,120 @@ Some prose.
             Err(OpError::Reserved(_))
         ));
         assert_eq!(render(&doc), before);
+    }
+
+    mod today {
+        use super::*;
+
+        #[test]
+        fn setting_today_tags_the_item_where_it_stands() {
+            let mut doc = parse("# Feed\n\n## Work\n\n- [ ] A\n- [ ] B\n");
+            let b = find(&doc, "B").unwrap();
+            set_today(&mut doc, b).unwrap();
+            assert_eq!(
+                render(&doc),
+                "# Feed\n\n## Work\n\n- [ ] A\n- [ ] B @today\n"
+            );
+        }
+
+        #[test]
+        fn a_fourth_uncompleted_today_item_is_refused_and_nothing_changes() {
+            let mut doc = parse(
+                "# Feed\n\n- [ ] A @today\n- [~] B @agent(claude:1) @today\n- [?] C @today\n- [ ] D\n",
+            );
+            let before = render(&doc);
+            let d = find(&doc, "D").unwrap();
+            assert!(matches!(set_today(&mut doc, d), Err(OpError::TodayFull)));
+            assert_eq!(render(&doc), before);
+        }
+
+        #[test]
+        fn done_items_do_not_hold_a_today_slot() {
+            // A hand-typed `[x] … @today` is left alone but doesn't count.
+            let mut doc =
+                parse("# Feed\n\n- [ ] A @today\n- [ ] B @today\n- [x] C @today\n- [ ] D\n");
+            assert_eq!(today_count(&doc), 2);
+            let d = find(&doc, "D").unwrap();
+            set_today(&mut doc, d).unwrap();
+            assert_eq!(today_count(&doc), 3);
+        }
+
+        #[test]
+        fn archived_items_do_not_hold_a_today_slot() {
+            // A hand edit can leave `@today` on an item under `# Done`; the
+            // panel doesn't show it, so the cap mustn't count it either.
+            let mut doc = parse(
+                "# Feed\n\n- [ ] A @today\n- [ ] B @today\n- [ ] D\n\n# Done\n\n- [ ] C @today\n",
+            );
+            assert_eq!(today_count(&doc), 2);
+            let d = find(&doc, "D").unwrap();
+            set_today(&mut doc, d).unwrap();
+        }
+
+        #[test]
+        fn a_done_item_cannot_be_put_in_today() {
+            let mut doc = parse("# Feed\n\n- [x] A\n");
+            let before = render(&doc);
+            let a = find(&doc, "A").unwrap();
+            assert!(matches!(set_today(&mut doc, a), Err(OpError::TodayDone)));
+            assert_eq!(render(&doc), before);
+        }
+
+        #[test]
+        fn re_setting_an_item_already_in_a_full_today_is_a_no_op() {
+            let mut doc = parse("# Feed\n\n- [ ] A @today\n- [ ] B @today\n- [ ] C @today\n");
+            let a = find(&doc, "A").unwrap();
+            set_today(&mut doc, a).unwrap();
+            assert_eq!(today_count(&doc), 3);
+        }
+
+        #[test]
+        fn clearing_frees_a_slot() {
+            let mut doc =
+                parse("# Feed\n\n- [ ] A @today\n- [ ] B @today\n- [ ] C @today\n- [ ] D\n");
+            let a = find(&doc, "A").unwrap();
+            clear_today(&mut doc, a);
+            assert_eq!(
+                render(&doc),
+                "# Feed\n\n- [ ] A\n- [ ] B @today\n- [ ] C @today\n- [ ] D\n"
+            );
+            let d = find(&doc, "D").unwrap();
+            set_today(&mut doc, d).unwrap();
+        }
+
+        #[test]
+        fn completing_strips_today_in_the_same_write() {
+            let mut doc = parse("# Feed\n\n## Agent\n\n- [?] A @agent(claude:1) @today\n");
+            let a = find(&doc, "A").unwrap();
+            set_state(&mut doc, a, State::Done, Authority::Agent).unwrap();
+            assert_eq!(
+                render(&doc),
+                "# Feed\n\n## Agent\n\n- [x] A @agent(claude:1)\n"
+            );
+        }
+
+        #[test]
+        fn non_completing_transitions_keep_today() {
+            let mut doc = parse("# Feed\n\n- [ ] A @today\n");
+            let a = find(&doc, "A").unwrap();
+            claim(&mut doc, a, AgentRef::parse("claude:1").unwrap());
+            set_state(&mut doc, a, State::Review, Authority::Agent).unwrap();
+            assert_eq!(render(&doc), "# Feed\n\n- [?] A @agent(claude:1) @today\n");
+        }
+
+        #[test]
+        fn an_over_cap_hand_edit_parses_and_survives_unrelated_writes() {
+            let text = "# Feed\n\n- [ ] A @today\n- [ ] B @today\n- [~] C @today\n- [?] D @today\n- [ ] E\n";
+            let mut doc = parse(text);
+            assert_eq!(today_count(&doc), 4);
+            let e = find(&doc, "E").unwrap();
+            edit(&mut doc, e, "E2", &[]);
+            add(&mut doc, "F", &[], Zone::Human);
+            assert_eq!(
+                render(&doc),
+                "# Feed\n\n- [ ] A @today\n- [ ] B @today\n- [~] C @today\n- [?] D @today\n- [ ] E2\n- [ ] F\n"
+            );
+            assert!(matches!(set_today(&mut doc, e), Err(OpError::TodayFull)));
+        }
     }
 }

@@ -88,6 +88,49 @@ pub fn parse_agent_list(result: &Value) -> Vec<AgentInfo> {
         .collect()
 }
 
+/// One `pane.list` entry: where a pane lives and what it shows. herdr's
+/// `PaneInfo` (0.9.3) carries no plugin id or zoom flag; zoomed and overlay
+/// panes are listed like any other, and a feedr sidebar is recognised by the
+/// title it sets on itself (`dock::PANE_TITLE_MARKER`). Popups are never
+/// listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneEntry {
+    pub pane_id: String,
+    pub tab_id: String,
+    pub title: Option<String>,
+}
+
+impl PaneEntry {
+    /// A feedr sidebar: never company for auto-close.
+    pub fn is_feedr(&self) -> bool {
+        self.title.as_deref() == Some(crate::tui::dock::PANE_TITLE_MARKER)
+    }
+}
+
+/// Our pane's current tab in a `pane.list` answer. `HERDR_TAB_ID` is only
+/// a hint fixed at spawn (`pane.move` changes the tab), so resolve it live.
+/// `None` when our id no longer resolves (e.g. moved across workspaces).
+pub fn own_tab<'a>(panes: &'a [PaneEntry], own_pane: &str) -> Option<&'a str> {
+    panes
+        .iter()
+        .find(|p| p.pane_id == own_pane)
+        .map(|p| p.tab_id.as_str())
+}
+
+pub fn parse_pane_list(result: &Value) -> Vec<PaneEntry> {
+    result_entries(result)
+        .into_iter()
+        .filter_map(|v| {
+            let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+            Some(PaneEntry {
+                pane_id: s("pane_id")?,
+                tab_id: s("tab_id")?,
+                title: s("terminal_title_stripped").or_else(|| s("terminal_title")),
+            })
+        })
+        .collect()
+}
+
 /// Pass-through args that resume a session for an agent kind (spec §3:
 /// "kind prefix selects the command"). These ride in `agent.start`'s `args`
 /// field, appended to the agent binary the kind selects.
@@ -134,6 +177,11 @@ pub trait Herdr {
     /// first child, `true` = second (verified live, herdr 0.9.3). Unlike
     /// `pane swap`, it doesn't activate the tab.
     fn set_split_ratio(&mut self, tab_id: &str, path: &[bool], ratio: f64) -> Result<()>;
+    /// `pane.list {}` — every pane in every workspace (there is no tab
+    /// filter; callers filter on `tab_id`).
+    fn list_panes(&mut self) -> Result<Vec<PaneEntry>>;
+    /// `server.stop {}` — shut herdr down (auto-close's last-pane quit).
+    fn stop_server(&mut self) -> Result<()>;
 
     /// Resume a session in a fresh tab (spec §3: @agent click with the pane
     /// gone): create a tab, then start the agent in its pane with the kind's
@@ -319,6 +367,17 @@ impl Herdr for UnixSocketClient {
         )?;
         Ok(())
     }
+    fn list_panes(&mut self) -> Result<Vec<PaneEntry>> {
+        Ok(parse_pane_list(&request(
+            &self.socket_path,
+            "pane.list",
+            serde_json::json!({}),
+        )?))
+    }
+    fn stop_server(&mut self) -> Result<()> {
+        request(&self.socket_path, "server.stop", serde_json::json!({}))?;
+        Ok(())
+    }
     // open_resume_tab: the trait's provided create_tab + agent_start
     // composition (Task 3) — no override needed.
 }
@@ -335,12 +394,10 @@ pub fn spawn_event_thread(socket_path: PathBuf, tx: mpsc::Sender<crate::tui::App
     });
 }
 
-/// Read timeout on the event-stream connection — and, since
-/// `pane.agent_status_changed` can't be subscribed globally, the interval at
-/// which agent statuses actually refresh: each timeout triggers a resync. Kept
-/// short enough that a glyph isn't visibly stale, long enough that an idle
-/// sidebar isn't hammering the socket. It also still does its original job:
-/// unwedging a stalled connection that never closes.
+/// Read timeout on the event-stream connection. Statuses now arrive as
+/// per-pane pushes; each timeout still triggers a full resync as a fallback
+/// poll until the push path is proven (spec #22), and keeps doing its
+/// original job: unwedging a stalled connection that never closes.
 const SUBSCRIBE_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Blocks streaming events until the connection drops (or the app goes away).
@@ -349,10 +406,85 @@ pub fn subscribe_loop(path: &Path, tx: &mpsc::Sender<crate::tui::AppEvent>) -> R
     subscribe_loop_with_timeout(path, tx, SUBSCRIBE_READ_TIMEOUT)
 }
 
-fn resync(path: &Path, tx: &mpsc::Sender<crate::tui::AppEvent>) -> Result<()> {
+fn send(tx: &mpsc::Sender<crate::tui::AppEvent>, ev: crate::tui::AppEvent) -> Result<()> {
+    tx.send(ev).map_err(|_| anyhow::anyhow!("app gone"))
+}
+
+/// Push a full agent list to the app; returns the agent pane ids (sorted),
+/// which decide the per-pane status subscriptions.
+fn resync(path: &Path, tx: &mpsc::Sender<crate::tui::AppEvent>) -> Result<Vec<String>> {
     let agents = parse_agent_list(&request(path, "agent.list", serde_json::json!({}))?);
-    tx.send(crate::tui::AppEvent::Agents(agents))
-        .map_err(|_| anyhow::anyhow!("app gone"))
+    let mut panes: Vec<String> = agents.iter().map(|a| a.pane_id.clone()).collect();
+    panes.sort();
+    send(tx, crate::tui::AppEvent::Agents(agents))?;
+    Ok(panes)
+}
+
+/// The `events.subscribe` request. `pane.agent_status_changed` is PER-PANE in
+/// herdr (0.9.x rejects the whole request if it lacks a `pane_id`), so it is
+/// asked for once per known agent pane; everything else is global.
+fn subscribe_request(agent_panes: &[String]) -> Value {
+    let mut subs = vec![
+        serde_json::json!({"type": "pane.created"}),
+        serde_json::json!({"type": "pane.closed"}),
+        serde_json::json!({"type": "pane.agent_detected"}),
+        serde_json::json!({"type": "layout.updated"}),
+    ];
+    subs.extend(
+        agent_panes
+            .iter()
+            .map(|p| serde_json::json!({"type": "pane.agent_status_changed", "pane_id": p})),
+    );
+    serde_json::json!({"id": "sub", "method": "events.subscribe",
+                       "params": {"subscriptions": subs}})
+}
+
+/// A pushed frame, decoded. Only what feedr acts on.
+#[derive(Debug, PartialEq)]
+enum Pushed {
+    AgentStatus {
+        pane_id: String,
+        status: AgentStatus,
+    },
+    Layout {
+        tab_id: String,
+        pane_ids: Vec<String>,
+    },
+    /// A pane came, went or gained an agent: the agent set may have changed.
+    PaneLifecycle,
+}
+
+/// Decode one pushed frame. herdr wraps every push as
+/// `{"event": <name>, "data": {...}}` — never a top-level `type`. Global
+/// subscriptions name events with underscores (`pane_closed`, and repeat it
+/// as `data.type`); per-pane ones use the dotted subscription name
+/// (`pane.agent_status_changed`) with no `data.type`. Both are accepted.
+/// The subscribe ack (`{"id", "result"}`) and unknown events give `None`.
+fn parse_pushed(v: &Value) -> Option<Pushed> {
+    let event = v.get("event")?.as_str()?.replace('.', "_");
+    let data = v.get("data")?;
+    match event.as_str() {
+        "pane_agent_status_changed" => Some(Pushed::AgentStatus {
+            pane_id: data.get("pane_id")?.as_str()?.to_string(),
+            status: AgentStatus::parse(data.get("agent_status")?.as_str()?),
+        }),
+        "layout_updated" => {
+            let layout = data.get("layout")?;
+            Some(Pushed::Layout {
+                tab_id: layout.get("tab_id")?.as_str()?.to_string(),
+                pane_ids: layout
+                    .get("panes")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|p| p.get("pane_id")?.as_str().map(str::to_string))
+                    .collect(),
+            })
+        }
+        "pane_created" | "pane_closed" | "pane_exited" | "pane_agent_detected" => {
+            Some(Pushed::PaneLifecycle)
+        }
+        _ => None,
+    }
 }
 
 /// `true` for the two platform-dependent error kinds a blocking read can
@@ -370,41 +502,65 @@ fn subscribe_loop_with_timeout(
     tx: &mpsc::Sender<crate::tui::AppEvent>,
     read_timeout: Duration,
 ) -> Result<()> {
-    resync(path, tx)?;
+    let mut panes = resync(path, tx)?;
+    // herdr drops a connection that sends a second `events.subscribe`, so
+    // when the agent set changes the stream is replaced with a fresh one
+    // carrying the new per-pane list — without reporting SocketDown.
+    while let Some(changed) = stream_events(path, tx, read_timeout, &panes)? {
+        panes = changed;
+    }
+    Ok(())
+}
+
+/// Stream one subscription. `Ok(None)` at EOF (a genuine disconnect, so the
+/// caller's backoff loop reconnects); `Ok(Some(panes))` when a resync shows
+/// the agent panes changed and the subscription must be rebuilt.
+fn stream_events(
+    path: &Path,
+    tx: &mpsc::Sender<crate::tui::AppEvent>,
+    read_timeout: Duration,
+    panes: &[String],
+) -> Result<Option<Vec<String>>> {
     let mut stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(read_timeout))?;
-    // `pane.agent_status_changed` is deliberately absent: herdr 0.9.0 treats it
-    // as a PER-PANE subscription and rejects it without a `pane_id`, failing
-    // the whole request. Status changes therefore arrive via the periodic
-    // resync below (SUBSCRIBE_READ_TIMEOUT) rather than as pushed events —
-    // a poll we can rely on, instead of per-pane subscription bookkeeping
-    // that would have to be torn down and rebuilt as panes come and go.
-    let sub = serde_json::json!({"id": "sub", "method": "events.subscribe", "params": {"subscriptions": [
-        {"type": "pane.created"},
-        {"type": "pane.closed"},
-        {"type": "pane.agent_detected"}
-    ]}});
-    stream.write_all(format!("{sub}\n").as_bytes())?;
+    stream.write_all(format!("{}\n", subscribe_request(panes)).as_bytes())?;
     let mut reader = BufReader::new(stream);
+    let resync_and_check = || -> Result<Option<Vec<String>>> {
+        let now = resync(path, tx)?;
+        Ok((now != panes).then_some(now))
+    };
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
-            // EOF: a genuine disconnect. Return so the caller's backoff
-            // loop reconnects.
-            Ok(0) => return Ok(()),
+            Ok(0) => return Ok(None),
             Ok(_) => {
                 let Ok(v) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
-                // Pushed events carry "type"; the subscribe ack carries "id" — skip it.
-                if v.get("type").is_some() {
-                    resync(path, tx)?;
+                // The subscribe ack and unknown events parse to None — skip.
+                match parse_pushed(&v) {
+                    Some(Pushed::AgentStatus { pane_id, status }) => {
+                        send(tx, crate::tui::AppEvent::AgentStatus { pane_id, status })?
+                    }
+                    Some(Pushed::Layout { tab_id, pane_ids }) => {
+                        send(tx, crate::tui::AppEvent::Layout { tab_id, pane_ids })?
+                    }
+                    Some(Pushed::PaneLifecycle) => {
+                        if let Some(changed) = resync_and_check()? {
+                            return Ok(Some(changed));
+                        }
+                    }
+                    None => {}
                 }
             }
-            // Stalled-but-open connection: self-heal by resyncing, then
-            // keep reading on this SAME stream — don't wedge the reconnect
-            // loop, and don't tear down a connection that may recover.
-            Err(e) if is_read_timeout(&e) => resync(path, tx)?,
+            // Read timeout: the fallback poll (and the cure for a
+            // stalled-but-open connection). Resync, then keep reading on
+            // this SAME stream unless the agent set changed.
+            Err(e) if is_read_timeout(&e) => {
+                if let Some(changed) = resync_and_check()? {
+                    return Ok(Some(changed));
+                }
+            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -419,6 +575,9 @@ pub struct FakeHerdr {
     pub log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
     /// What `layout_export` returns; `None` makes it fail.
     pub layout: Option<Value>,
+    /// What `list_panes` returns; `None` makes it fail. Shared so a test
+    /// can change herdr's panes after the fake is boxed into the app.
+    pub panes: std::rc::Rc<std::cell::RefCell<Option<Vec<PaneEntry>>>>,
 }
 
 #[cfg(test)]
@@ -485,6 +644,17 @@ impl Herdr for FakeHerdr {
             "set_split_ratio {tab_id} [{}] {ratio:.4}",
             path.join(",")
         ));
+        Ok(())
+    }
+    fn list_panes(&mut self) -> Result<Vec<PaneEntry>> {
+        self.log.borrow_mut().push("list_panes".into());
+        self.panes
+            .borrow()
+            .clone()
+            .context("pane.list failed in fake")
+    }
+    fn stop_server(&mut self) -> Result<()> {
+        self.log.borrow_mut().push("stop_server".into());
         Ok(())
     }
     // open_resume_tab: provided method — the fake exercises the real
@@ -748,9 +918,10 @@ mod tests {
              "agent_session": {"value": "abc"}}]}})
         .to_string();
         let ack = r#"{"id":"sub","result":{}}"#.to_string();
-        let event =
-            r#"{"type":"pane_agent_status_changed","pane_id":"w1:p7","agent_status":"done"}"#
-                .to_string();
+        // herdr's real global-event frame shape (captured live, 0.9.3). The
+        // old top-level-`type` frame here was why the broken dispatch passed.
+        let event = r#"{"event":"pane_closed","data":{"type":"pane_closed","pane_id":"w1:p9","workspace_id":"w1"}}"#
+            .to_string();
         let (_dir, path, _seen) = fake_server(vec![
             vec![list.clone()], // initial resync
             vec![ack, event],   // subscription: ack (skipped), one event, EOF
@@ -765,6 +936,175 @@ mod tests {
             }
         }
         assert_eq!(agent_batches, 2);
+    }
+
+    // ---- Live push path, against the shared fake socket in herdr's real
+    // wire shapes (captured live from herdr 0.9.3). ----
+
+    use crate::tui::fake_socket::FakeHerdrSocket;
+    use crate::tui::AppEvent;
+
+    fn agent_entry(pane: &str, status: &str, session: &str) -> Value {
+        json!({"pane_id": pane, "agent": "claude", "agent_status": status,
+               "agent_session": {"value": session}})
+    }
+
+    /// Start `subscribe_loop` against `fake` on a background thread, with
+    /// the read-timeout poll pushed far out so only pushes can be observed.
+    fn run_subscriber(fake: &FakeHerdrSocket) -> mpsc::Receiver<AppEvent> {
+        let (tx, rx) = mpsc::channel();
+        let path = fake.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = subscribe_loop_with_timeout(&path, &tx, Duration::from_secs(60));
+        });
+        rx
+    }
+
+    /// Receive until `pred` matches, or panic after 3s.
+    fn recv_until(rx: &mpsc::Receiver<AppEvent>, pred: impl Fn(&AppEvent) -> bool) -> AppEvent {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let left = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .expect("timed out waiting for the expected app event");
+            let ev = rx
+                .recv_timeout(left)
+                .expect("timed out waiting for the expected app event");
+            if pred(&ev) {
+                return ev;
+            }
+        }
+    }
+
+    #[test]
+    fn pushed_agent_status_in_herdrs_real_shape_reaches_the_app() {
+        let fake = FakeHerdrSocket::start();
+        fake.reply(
+            "agent.list",
+            json!({"agents": [agent_entry("w1:p7", "working", "abc")]}),
+        );
+        let rx = run_subscriber(&fake);
+        fake.wait_for_subscriptions(1);
+
+        // Per-pane subscription frames: dotted event name, no `data.type`.
+        fake.push(json!({"event": "pane.agent_status_changed", "data": {
+            "agent": "claude", "agent_status": "done", "pane_id": "w1:p7", "workspace_id": "w1"}}));
+
+        let ev = recv_until(&rx, |e| matches!(e, AppEvent::AgentStatus { .. }));
+        assert_eq!(
+            ev,
+            AppEvent::AgentStatus {
+                pane_id: "w1:p7".into(),
+                status: AgentStatus::Done
+            }
+        );
+    }
+
+    /// The `pane.agent_status_changed` entries of each subscribe request.
+    fn status_subs(fake: &FakeHerdrSocket) -> Vec<Vec<Value>> {
+        fake.requests_for("events.subscribe")
+            .iter()
+            .map(|r| {
+                r["params"]["subscriptions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s["type"] == "pane.agent_status_changed")
+                    .cloned()
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn agent_status_is_subscribed_per_known_agent_pane() {
+        let fake = FakeHerdrSocket::start();
+        fake.reply(
+            "agent.list",
+            json!({"agents": [agent_entry("w1:p7", "idle", "a"), agent_entry("w1:p8", "idle", "b")]}),
+        );
+        let _rx = run_subscriber(&fake);
+        fake.wait_for_subscriptions(1);
+
+        assert_eq!(
+            status_subs(&fake),
+            vec![vec![
+                json!({"type": "pane.agent_status_changed", "pane_id": "w1:p7"}),
+                json!({"type": "pane.agent_status_changed", "pane_id": "w1:p8"}),
+            ]]
+        );
+    }
+
+    #[test]
+    fn a_newly_detected_agent_gets_its_own_status_subscription() {
+        let fake = FakeHerdrSocket::start();
+        fake.reply(
+            "agent.list",
+            json!({"agents": [agent_entry("w1:p7", "idle", "a")]}),
+        );
+        let rx = run_subscriber(&fake);
+        fake.wait_for_subscriptions(1);
+
+        fake.reply(
+            "agent.list",
+            json!({"agents": [agent_entry("w1:p7", "idle", "a"), agent_entry("w1:p9", "idle", "c")]}),
+        );
+        fake.push(json!({"event": "pane_agent_detected", "data": {
+            "type": "pane_agent_detected", "pane_id": "w1:p9", "workspace_id": "w1", "agent": "claude"}}));
+        fake.wait_for_subscriptions(2);
+
+        let latest = status_subs(&fake).pop().unwrap();
+        assert!(
+            latest.contains(&json!({"type": "pane.agent_status_changed", "pane_id": "w1:p9"})),
+            "new agent pane not subscribed: {latest:?}"
+        );
+
+        // The resubscribed stream is live: a push for the new pane lands.
+        fake.push(json!({"event": "pane.agent_status_changed", "data": {
+            "agent": "claude", "agent_status": "blocked", "pane_id": "w1:p9", "workspace_id": "w1"}}));
+        let ev = recv_until(&rx, |e| matches!(e, AppEvent::AgentStatus { .. }));
+        assert_eq!(
+            ev,
+            AppEvent::AgentStatus {
+                pane_id: "w1:p9".into(),
+                status: AgentStatus::Blocked
+            }
+        );
+    }
+
+    #[test]
+    fn layout_updates_are_subscribed_and_delivered_with_tab_and_panes() {
+        let fake = FakeHerdrSocket::start();
+        fake.reply("agent.list", json!({"agents": []}));
+        let rx = run_subscriber(&fake);
+        fake.wait_for_subscriptions(1);
+
+        let sub = &fake.requests_for("events.subscribe")[0];
+        assert!(
+            sub["params"]["subscriptions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"type": "layout.updated"})),
+            "layout.updated not subscribed: {sub}"
+        );
+
+        // Trimmed from a live herdr 0.9.3 capture.
+        fake.push(json!({"event": "layout_updated", "data": {"type": "layout_updated", "layout": {
+            "workspace_id": "w4", "tab_id": "w4:tB", "focused_pane_id": "w4:p1J", "zoomed": false,
+            "panes": [
+                {"pane_id": "w4:p1J", "focused": true, "rect": {"x": 0, "y": 0, "width": 40, "height": 20}},
+                {"pane_id": "w4:p1K", "focused": false, "rect": {"x": 40, "y": 0, "width": 40, "height": 20}}
+            ],
+            "splits": []}}}));
+
+        let ev = recv_until(&rx, |e| matches!(e, AppEvent::Layout { .. }));
+        assert_eq!(
+            ev,
+            AppEvent::Layout {
+                tab_id: "w4:tB".into(),
+                pane_ids: vec!["w4:p1J".into(), "w4:p1K".into()],
+            }
+        );
     }
 
     #[test]
@@ -881,5 +1221,56 @@ mod tests {
             agent_batches, 2,
             "expected the initial resync plus one stall self-heal resync"
         );
+    }
+
+    #[test]
+    fn list_panes_reads_herdrs_pane_list_and_resolves_our_live_tab() {
+        let fake = FakeHerdrSocket::start();
+        // PaneInfo shape per `herdr api schema --json` (0.9.3), trimmed.
+        fake.reply(
+            "pane.list",
+            json!({"type": "pane_list", "panes": [
+                {"pane_id": "w1:p1", "tab_id": "w1:t3", "workspace_id": "w1", "focused": false,
+                 "terminal_id": "t1", "agent_status": "unknown", "revision": 1,
+                 "terminal_title_stripped": "feedr-sidebar"},
+                {"pane_id": "w1:p2", "tab_id": "w1:t3", "workspace_id": "w1", "focused": true,
+                 "terminal_id": "t2", "agent_status": "unknown", "revision": 1,
+                 "terminal_title": "zsh"}]}),
+        );
+        let mut client = UnixSocketClient {
+            socket_path: fake.path().to_path_buf(),
+        };
+        let panes = client.list_panes().unwrap();
+        assert_eq!(
+            panes,
+            vec![
+                PaneEntry {
+                    pane_id: "w1:p1".into(),
+                    tab_id: "w1:t3".into(),
+                    title: Some("feedr-sidebar".into()),
+                },
+                PaneEntry {
+                    pane_id: "w1:p2".into(),
+                    tab_id: "w1:t3".into(),
+                    title: Some("zsh".into()),
+                },
+            ]
+        );
+        assert!(panes[0].is_feedr() && !panes[1].is_feedr());
+        assert_eq!(own_tab(&panes, "w1:p1"), Some("w1:t3"));
+        assert_eq!(own_tab(&panes, "w2:p1"), None);
+        assert_eq!(fake.requests_for("pane.list")[0]["params"], json!({}));
+    }
+
+    #[test]
+    fn stop_server_sends_server_stop_and_surfaces_errors() {
+        let fake = FakeHerdrSocket::start();
+        let mut client = UnixSocketClient {
+            socket_path: fake.path().to_path_buf(),
+        };
+        assert!(client.stop_server().is_err(), "unscripted: herdr error");
+        fake.reply("server.stop", json!({"type": "ok"}));
+        client.stop_server().unwrap();
+        assert_eq!(fake.requests_for("server.stop").len(), 2);
     }
 }

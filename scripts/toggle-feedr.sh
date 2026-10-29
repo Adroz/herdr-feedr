@@ -3,12 +3,14 @@
 # `toggle-feedr` action (bind it to a keybinding via a herdr `[[keys.command]]` of type
 # "shell").
 #
-# "Toggle": a feedr-sidebar pane already open anywhere in this workspace -> close it;
-# otherwise delegate to open-feedr.sh (open it, docked left).
+# "Toggle": a feedr-sidebar pane already open in any workspace -> close it; otherwise
+# delegate to open-feedr.sh (`feedr sidebar --dock`, docked per `[sidebar]` config).
 #
-# Existing-pane detection is the same terminal-title match open-feedr.sh uses — see its
-# header comment for why (no `plugin pane list`, and `plugin list --json` only describes
-# manifests, not currently-open panes).
+# Existing-pane detection matches the exact terminal title the running sidebar sets
+# (src/tui/dock.rs's PANE_TITLE_MARKER) in `herdr pane list`: herdr has no `plugin pane
+# list`, and `plugin list --json` only describes manifests, not currently-open panes.
+# `pane list` prints one JSON line with alphabetically-sorted keys, so within each pane
+# object "pane_id" precedes "terminal_title_stripped" and a sed/grep pass is enough.
 set -euo pipefail
 
 herdr_bin="${HERDR_BIN_PATH:-herdr}"

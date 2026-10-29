@@ -1,11 +1,16 @@
 use crate::config::SidebarConfig;
+use crate::feed::lock::{self, LockError};
 use crate::feed::ops::{self, Authority, Zone};
 use crate::feed::write::save_atomic;
 use crate::feed::{AgentRef, Document, Item, Node, State};
+use crate::tui::clipboard::{ClipboardSink, SystemClipboard};
+use crate::tui::clock::{Clock, SystemClock};
+use crate::tui::dock::{HerdrCli, Runner};
 use crate::tui::modal::{EditModal, Modal, ModalStep};
 use crate::tui::socket::{AgentInfo, AgentStatus, Herdr};
+use crate::tui::viewer::Viewer;
 use anyhow::Result;
-use crossterm::event::Event;
+use crossterm::event::{Event, MouseButton, MouseEventKind};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -54,6 +59,38 @@ pub fn relocate(doc: &Document, key: &ItemKey) -> Option<usize> {
     }
 }
 
+/// Relocate the item an open edit modal was opened on. Its checkbox state
+/// may have moved on since (an agent claimed it, a human ticked it), and
+/// the typed edit must still land — so after an exact title+state miss,
+/// fall back to a unique active item with the same title, whatever its
+/// state. With no active match at all, the item may have been completed and
+/// swept meanwhile: fall back to a unique archived item of that title
+/// stamped `@done(today)` — an older same-titled entry is a past item, not
+/// this one. Still never guesses between two same-titled items.
+pub fn relocate_for_edit(doc: &Document, key: &ItemKey, today: &str) -> Option<usize> {
+    if let Some(i) = relocate(doc, key) {
+        return Some(i);
+    }
+    let (active, archived): (Vec<usize>, Vec<usize>) = doc
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| matches!(n, Node::Item(it) if it.title == key.title))
+        .map(|(i, _)| i)
+        .partition(|&i| ops::zone_of(doc, i) != Zone::Archive);
+    let swept_today: Vec<usize> = archived
+        .into_iter()
+        .filter(
+            |&i| matches!(&doc.nodes[i], Node::Item(it) if it.done_date.as_deref() == Some(today)),
+        )
+        .collect();
+    // Two active hits are ambiguous, not a reason to reach into the archive.
+    match (active.as_slice(), swept_today.as_slice()) {
+        ([i], _) | ([], [i]) => Some(*i),
+        _ => None,
+    }
+}
+
 /// One display row of the sidebar list.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
@@ -66,7 +103,41 @@ pub enum Row {
         key: ItemKey,
         agent: AgentRef,
     },
+    /// A Today item's home section, on the muted sub-line under its title.
+    Category(String),
     Add,
+}
+
+/// An item's title row, plus its `@agent` sub-line when claimed.
+fn push_item_rows(rows: &mut Vec<Row>, it: &Item) {
+    let key = ItemKey::of(it);
+    rows.push(Row::Item {
+        key: key.clone(),
+        agent: it.agent.clone(),
+    });
+    if let Some(a) = &it.agent {
+        rows.push(Row::AgentLine {
+            key,
+            agent: a.clone(),
+        });
+    }
+}
+
+/// The Today panel's rows, in file order: each item's title row, its home
+/// section sub-line, then its `@agent` sub-line when claimed. Empty when
+/// nothing is in Today (the panel is then not drawn).
+pub fn build_today_rows(doc: &Document) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for (i, n) in doc.nodes.iter().enumerate() {
+        if let Node::Item(it) = n {
+            if ops::in_today(doc, i) {
+                let start = rows.len();
+                push_item_rows(&mut rows, it);
+                rows.insert(start + 1, Row::Category(ops::section_name(doc, i)));
+            }
+        }
+    }
+    rows
 }
 
 /// Flatten the active feed into display rows; count archived items for Done(n).
@@ -85,21 +156,13 @@ pub fn build_rows(doc: &Document) -> (Vec<Row>, usize) {
             }
             // Any other heading (a level-1 zone) ends the pending section.
             Node::Heading { .. } => pending_section = None,
+            // Today items show only in the Today panel.
+            Node::Item(_) if ops::in_today(doc, i) => {}
             Node::Item(it) => {
                 if let Some(t) = pending_section.take() {
                     rows.push(Row::Section(t));
                 }
-                let key = ItemKey::of(it);
-                rows.push(Row::Item {
-                    key: key.clone(),
-                    agent: it.agent.clone(),
-                });
-                if let Some(a) = &it.agent {
-                    rows.push(Row::AgentLine {
-                        key,
-                        agent: a.clone(),
-                    });
-                }
+                push_item_rows(&mut rows, it);
             }
             _ => {}
         }
@@ -141,6 +204,11 @@ pub struct App {
     pub cfg: SidebarConfig,
     pub doc: Document,
     pub rows: Vec<Row>,
+    /// The Today panel's rows, drawn above `rows` (empty = no panel).
+    pub today_rows: Vec<Row>,
+    /// More than `ops::TODAY_CAP` items in Today (only a hand edit gets
+    /// there): the panel's outline turns red.
+    pub today_over_cap: bool,
     pub done_count: usize,
     pub scroll: usize,
     pub collapsed: bool,
@@ -162,14 +230,26 @@ pub struct App {
     /// guess), so a pane driven to herdr's minimum over several iterations
     /// still returns to its original width.
     collapse_resize_steps: usize,
-    /// System-clipboard write for the edit modal's Ctrl+C/Ctrl+X
-    /// (`handle_modal_event` drains `EditModal::pending_clipboard` through
-    /// this after every `modal::step`). Injectable in tests — mirrors
-    /// `editor_cmd`'s "avoid a real process/env dependency in tests"
-    /// pattern, here avoiding spawning a real `pbcopy`/`xclip`/`wl-copy` (and
-    /// touching the developer's actual clipboard) on every `cargo test` run.
-    /// Defaults to `clipboard::copy`.
-    pub clipboard_copy: fn(&str) -> anyhow::Result<()>,
+    /// System-clipboard sink for the edit modal's copies (drag release,
+    /// Ctrl+C, Ctrl+X; `handle_modal_event` drains
+    /// `EditModal::pending_clipboard` through this after every `modal::step`).
+    /// Injected so tests record writes instead of emitting OSC 52 and
+    /// spawning a real `pbcopy`/`xclip`/`wl-copy`. Defaults to
+    /// `clipboard::SystemClipboard`.
+    pub clipboard: Box<dyn ClipboardSink>,
+    /// Wall and monotonic time; injected so tests can drive time by hand.
+    pub clock: Box<dyn Clock>,
+    /// `herdr` CLI runner for the collapse/expand pane resize. Injected so
+    /// tests record the calls instead of spawning the real binary.
+    pub herdr_cli: Box<dyn Runner>,
+    auto_close: crate::tui::auto_close::AutoClose,
+    /// Counts left presses inside a modal into double/triple clicks. Only
+    /// modal presses feed it, so the list click that opens a modal never
+    /// pairs with a first click inside it.
+    clicks: crate::tui::selection::ClickTracker,
+    /// How long a write waits for the feed lock held by another writer
+    /// ([`lock::SIDEBAR_TIMEOUT`]; short, as the UI is frozen meanwhile).
+    pub lock_timeout: std::time::Duration,
 }
 
 impl App {
@@ -179,6 +259,8 @@ impl App {
             cfg,
             doc: Document::default(),
             rows: Vec::new(),
+            today_rows: Vec::new(),
+            today_over_cap: false,
             done_count: 0,
             scroll: 0,
             collapsed: false,
@@ -193,13 +275,20 @@ impl App {
                 .ok()
                 .filter(|p| !p.is_empty()),
             collapse_resize_steps: 0,
-            clipboard_copy: crate::tui::clipboard::copy,
+            clipboard: Box::new(SystemClipboard::new()),
+            clock: Box::new(SystemClock),
+            herdr_cli: Box::new(HerdrCli::from_env()),
+            auto_close: Default::default(),
+            clicks: Default::default(),
+            lock_timeout: lock::SIDEBAR_TIMEOUT,
         }
     }
 
     pub fn rebuild(&mut self) {
         let (rows, done) = build_rows(&self.doc);
         self.rows = rows;
+        self.today_rows = build_today_rows(&self.doc);
+        self.today_over_cap = ops::today_count(&self.doc) > ops::TODAY_CAP;
         self.done_count = done;
         self.scroll = self.scroll.min(self.rows.len().saturating_sub(1));
     }
@@ -242,6 +331,20 @@ impl App {
     where
         F: FnOnce(&mut Document) -> Result<Outcome>,
     {
+        // Held across read -> apply -> save, shared with the CLI (spec §6).
+        let _lock = match lock::acquire(&self.feed_path, self.lock_timeout) {
+            Ok(l) => l,
+            // The status row is narrow: name the lock file, not its path.
+            Err(LockError::Timeout { path, .. }) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                self.status_msg = Some(format!("feed busy ({name} held); action dropped"));
+                return;
+            }
+            Err(e) => {
+                self.status_msg = Some(format!("action dropped: {e}"));
+                return;
+            }
+        };
         let mut doc = match std::fs::read_to_string(&self.feed_path) {
             Ok(t) => crate::feed::parse::parse(&t),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -277,13 +380,15 @@ impl App {
                 // Best-effort real pane resize; outside herdr there is no
                 // pane id and the rendered rail alone carries the collapse.
                 if let Some(pane) = self.herdr_pane_id.clone() {
-                    let mut runner = crate::tui::dock::HerdrCli::from_env();
                     if self.collapsed {
-                        self.collapse_resize_steps =
-                            crate::tui::dock::collapse_pane(&mut runner, &self.cfg, &pane);
+                        self.collapse_resize_steps = crate::tui::dock::collapse_pane(
+                            self.herdr_cli.as_mut(),
+                            &self.cfg,
+                            &pane,
+                        );
                     } else {
                         crate::tui::dock::expand_pane(
-                            &mut runner,
+                            self.herdr_cli.as_mut(),
                             &self.cfg,
                             &pane,
                             self.collapse_resize_steps,
@@ -299,7 +404,7 @@ impl App {
             }
             Action::Advance(key) => self.advance(key),
             Action::Sweep => {
-                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let today = self.clock.today().format("%Y-%m-%d").to_string();
                 self.with_feed(|doc| {
                     let n = ops::sweep(doc, &today);
                     if n == 0 {
@@ -315,22 +420,33 @@ impl App {
                     if let Node::Item(it) = &self.doc.nodes[i] {
                         let section = ops::item_section(&self.doc, i);
                         let suggestions = ops::section_names(&self.doc);
-                        self.set_modal(Modal::Edit(EditModal::edit(key, it, section, suggestions)));
+                        let mut m = EditModal::edit(key, it, section, suggestions);
+                        let others =
+                            ops::today_count(&self.doc) - usize::from(ops::in_today(&self.doc, i));
+                        m.today_full = others >= ops::TODAY_CAP;
+                        self.set_modal(Modal::Edit(m));
                     }
                 }
             }
             Action::OpenCreate => {
                 let suggestions = ops::section_names(&self.doc);
-                self.set_modal(Modal::Edit(EditModal::create(suggestions)))
+                self.open_create(EditModal::create(suggestions));
             }
             Action::OpenCreateIn(section) => {
                 let suggestions = ops::section_names(&self.doc);
-                self.set_modal(Modal::Edit(EditModal::create_in(suggestions, &section)))
+                self.open_create(EditModal::create_in(suggestions, &section));
             }
-            Action::OpenDoneView => self.set_modal(Modal::DoneView { scroll: 0 }),
-            Action::OpenFileView => self.set_modal(Modal::FileView { scroll: 0 }),
+            Action::OpenDoneView => self.set_modal(Modal::DoneView(Viewer::default())),
+            Action::OpenFileView => self.set_modal(Modal::FileView(Viewer::default())),
             Action::OpenEditor => self.request_editor(),
         }
+    }
+
+    /// Open a create modal, arming its Today-full guard: a new item holds no
+    /// slot yet, so every Today item counts against it.
+    fn open_create(&mut self, mut m: EditModal) {
+        m.today_full = ops::today_count(&self.doc) >= ops::TODAY_CAP;
+        self.set_modal(Modal::Edit(m));
     }
 
     /// Set the active modal, zooming the sidebar's herdr pane to fill the
@@ -385,6 +501,8 @@ impl App {
             .unwrap_or(self.doc.nodes.len());
         crate::feed::write::render(&Document {
             nodes: self.doc.nodes[start..end].to_vec(),
+            // On-screen text, not a write: canonical LF regardless of the file.
+            style: Default::default(),
         })
     }
 
@@ -408,7 +526,13 @@ impl App {
     pub fn handle_modal_event(&mut self, ev: Event, size: (u16, u16)) {
         let modal = std::mem::replace(&mut self.modal, Modal::None);
         let area = ratatui::layout::Rect::new(0, 0, size.0, size.1);
-        self.modal = match crate::tui::modal::step(modal, ev, area) {
+        let clicks = match &ev {
+            Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => self
+                .clicks
+                .press(self.clock.now(), m.column, m.row, m.modifiers.is_empty()),
+            _ => 1,
+        };
+        self.modal = match crate::tui::modal::step_with_clicks(modal, ev, area, clicks) {
             ModalStep::Continue(m) => m,
             ModalStep::Save(m) => self.save_modal(m),
             ModalStep::Delete(key) => {
@@ -423,20 +547,27 @@ impl App {
                 self.request_editor();
                 Modal::None
             }
+            ModalStep::Unsaved(m) => {
+                self.status_msg = Some(crate::tui::modal::UNSAVED_HINT.into());
+                Modal::Edit(m)
+            }
+            ModalStep::TodayFull(m) => {
+                self.status_msg = Some(ops::OpError::TodayFull.to_string());
+                Modal::Edit(m)
+            }
         };
         // `edit_step` stays pure — no process spawning there — so a
         // Ctrl+C/Ctrl+X only records the yanked text in
         // `EditModal::pending_clipboard`. Drain it here (one-shot, mirroring
         // `editor_request`/`take_editor_request`) and do the actual spawn,
-        // via the injectable `clipboard_copy` so tests never touch a real
+        // via the injected `clipboard` sink so tests never touch a real
         // clipboard tool. Best-effort: a failure becomes a status message,
         // never a crash or a dropped edit.
-        if let Modal::Edit(m) = &mut self.modal {
-            if let Some(text) = m.pending_clipboard.take() {
-                if let Err(e) = (self.clipboard_copy)(&text) {
-                    self.status_msg = Some(format!("clipboard: {e}"));
-                }
-            }
+        if let Some(text) = self.modal.take_pending_clipboard() {
+            self.status_msg = Some(match self.clipboard.copy(&text) {
+                Ok(()) => copied_status(&text),
+                Err(e) => format!("clipboard: {e}"),
+            });
         }
         // Round-2 item 4: the modal fully closed this step (Save/Cancel/Esc/
         // viewer close/confirmed delete) — unzoom. A transition that stays
@@ -469,32 +600,102 @@ impl App {
                     (None, None) => false,
                     _ => true,
                 };
-                self.with_feed(move |doc| match relocate(doc, &key) {
+                // Touch `@today` only when the toggle moved, so an untouched
+                // toggle never undoes a hand edit made while the modal was up.
+                let today = (m.today != m.loaded_today).then_some(m.today);
+                let mut found = true;
+                // Some(full) when set_today refused; `full` re-arms the
+                // modal's Today-full guard.
+                let mut today_refused: Option<bool> = None;
+                let date = self.clock.today().format("%Y-%m-%d").to_string();
+                self.with_feed(|doc| match relocate_for_edit(doc, &key, &date) {
+                    // Completed and swept while the modal was up: the typed
+                    // title/body still land, on the archived record. It
+                    // stays done and in Done, so a category move is skipped
+                    // and a Today mark is refused like any done item's.
+                    Some(i) if ops::zone_of(doc, i) == Zone::Archive => {
+                        if today == Some(true) {
+                            today_refused = Some(false);
+                            return Err(ops::OpError::TodayDone.into());
+                        }
+                        ops::edit(doc, i, &title, &body);
+                        Ok(Outcome::Changed(Some(if moved {
+                            "saved in Done (archived; category kept)".into()
+                        } else {
+                            "saved in Done (item was archived)".into()
+                        })))
+                    }
                     Some(i) => {
                         ops::edit(doc, i, &title, &body);
+                        // Before the move: moving changes the item's index.
+                        match today {
+                            Some(true) => {
+                                if let Err(e) = ops::set_today(doc, i) {
+                                    today_refused = Some(matches!(e, ops::OpError::TodayFull));
+                                    return Err(e.into());
+                                }
+                            }
+                            Some(false) => ops::clear_today(doc, i),
+                            None => {}
+                        }
                         if moved {
                             ops::move_to_section(doc, i, target.as_deref())?;
                         }
                         Ok(Outcome::Changed(None))
                     }
-                    None => Ok(Outcome::Unchanged(Some(
-                        "item changed on disk — edit dropped".into(),
-                    ))),
+                    None => {
+                        found = false;
+                        Ok(Outcome::Unchanged(Some(
+                            "item deleted on disk — Esc to discard edit".into(),
+                        )))
+                    }
                 });
+                // Keep the modal (and the typed text) up rather than
+                // silently throwing the edit away with the item.
+                if !found {
+                    return Modal::Edit(m);
+                }
+                // Today refused the item (full on disk since the modal
+                // opened, or the item is completed): nothing was written;
+                // the toggle drops back so a re-save keeps the rest of the
+                // edit.
+                if let Some(full) = today_refused {
+                    let mut m = m;
+                    m.today = false;
+                    m.today_full = full;
+                    return Modal::Edit(m);
+                }
             }
             None => {
                 // Sidebar-created items are always the human's. An empty
                 // Category keeps the pre-category behavior (end of the first
                 // human section); a named one targets that section, creating
-                // it if needed (spec 2026-09-16 §2).
-                self.with_feed(move |doc| {
-                    if category.is_empty() {
-                        ops::add(doc, &title, &body, Zone::Human);
+                // it if needed (spec 2026-09-16 §2). A Today mark goes in the
+                // same locked write, re-checked against the disk.
+                let today = m.today;
+                let mut today_full = false;
+                self.with_feed(|doc| {
+                    let i = if category.is_empty() {
+                        ops::add(doc, &title, &body, Zone::Human)
                     } else {
-                        ops::add_in_section(doc, &title, &body, &category)?;
+                        ops::add_in_section(doc, &title, &body, &category)?
+                    };
+                    if today {
+                        if let Err(e) = ops::set_today(doc, i) {
+                            today_full = matches!(e, ops::OpError::TodayFull);
+                            return Err(e.into());
+                        }
                     }
                     Ok(Outcome::Changed(None))
                 });
+                // Today filled on disk since the modal opened: nothing was
+                // written; the toggle drops back so a re-save adds the item.
+                if today_full {
+                    let mut m = m;
+                    m.today = false;
+                    m.today_full = true;
+                    return Modal::Edit(m);
+                }
             }
         }
         Modal::None
@@ -573,13 +774,17 @@ impl App {
         }
     }
 
+    /// The Today panel's rows, then the list's: every item shown, once.
+    fn all_rows(&self) -> impl Iterator<Item = &Row> {
+        self.today_rows.iter().chain(&self.rows)
+    }
+
     /// Count of active items still to do — `[ ]` or `[~]` — the number shown
     /// on the collapsed rail (Plan 3c). Deliberately excludes `[?]` (its own
     /// indicator) and `[x]` (shown separately as `Done (n)` in the expanded
     /// view; not "open" work).
     pub fn open_task_count(&self) -> usize {
-        self.rows
-            .iter()
+        self.all_rows()
             .filter(|r| {
                 matches!(r, Row::Item { key, .. } if matches!(key.state, State::Open | State::InProgress))
             })
@@ -589,8 +794,7 @@ impl App {
     /// Count of active items awaiting review (`[?]`) — the collapsed rail's
     /// mauve indicator.
     pub fn review_task_count(&self) -> usize {
-        self.rows
-            .iter()
+        self.all_rows()
             .filter(|r| matches!(r, Row::Item { key, .. } if key.state == State::Review))
             .count()
     }
@@ -600,10 +804,33 @@ impl App {
     /// agents actually referenced by the feed (rows), not every agent herdr
     /// happens to know about.
     pub fn any_linked_agent_blocked(&self) -> bool {
-        self.rows.iter().any(|r| {
+        self.all_rows().any(|r| {
             matches!(r, Row::AgentLine { agent, .. }
                 if self.statuses.get(&agent.id).map(|i| i.status) == Some(AgentStatus::Blocked))
         })
+    }
+
+    /// Time-driven work, once per loop step: the auto-close re-check.
+    pub fn tick(&mut self) {
+        use crate::tui::auto_close::Verdict;
+        let Some(own) = self.herdr_pane_id.as_deref() else {
+            return;
+        };
+        if !self.cfg.auto_close {
+            return;
+        }
+        let now = self.clock.now();
+        let quit = self.cfg.quit_herdr_when_last;
+        match self.auto_close.tick(own, now, quit, self.herdr.as_mut()) {
+            Verdict::Stay => {}
+            Verdict::Exit => self.should_quit = true,
+            Verdict::StopServerThenExit => {
+                // A failed stop still exits: herdr then just opens a fresh
+                // default workspace, as it did before auto-close.
+                let _ = self.herdr.stop_server();
+                self.should_quit = true;
+            }
+        }
     }
 
     pub fn on_event(&mut self, ev: crate::tui::AppEvent) {
@@ -615,8 +842,30 @@ impl App {
                     .map(|a| (a.session_id.clone(), a))
                     .collect();
             }
+            crate::tui::AppEvent::AgentStatus { pane_id, status } => {
+                // Statuses are keyed by session; a push names only the pane.
+                if let Some(a) = self.statuses.values_mut().find(|a| a.pane_id == pane_id) {
+                    a.status = status;
+                }
+            }
+            crate::tui::AppEvent::Layout { pane_ids, .. } => {
+                if let (true, Some(own)) = (self.cfg.auto_close, self.herdr_pane_id.as_deref()) {
+                    let now = self.clock.now();
+                    self.auto_close
+                        .on_layout(own, &pane_ids, now, self.herdr.as_mut());
+                }
+            }
             crate::tui::AppEvent::SocketDown => self.statuses.clear(),
         }
+    }
+}
+
+/// The status line after a successful copy: "Copied N chars", counting
+/// characters (not bytes), so the number matches what was selected.
+fn copied_status(text: &str) -> String {
+    match text.chars().count() {
+        1 => "Copied 1 char".into(),
+        n => format!("Copied {n} chars"),
     }
 }
 
@@ -659,6 +908,7 @@ mod tests {
                 Row::Section(t) => format!("S:{t}"),
                 Row::Item { key, .. } => format!("I:{}:{}", key.state.to_char(), key.title),
                 Row::AgentLine { agent, .. } => format!("A:{}", agent.kind),
+                Row::Category(c) => format!("C:{c}"),
                 Row::Add => "+".into(),
             })
             .collect();
@@ -680,9 +930,8 @@ mod tests {
 
     #[test]
     fn empty_sections_render_no_header() {
-        let doc = parse(
-            "# Feed\n\n## Empty\n\n## Interactives\n\n- [ ] Build event db\n\n## Trailing\n",
-        );
+        let doc =
+            parse("# Feed\n\n## Empty\n\n## Interactives\n\n- [ ] Build event db\n\n## Trailing\n");
         let (rows, _) = build_rows(&doc);
         assert_eq!(
             rows,
@@ -733,6 +982,20 @@ mod tests {
         assert_eq!(relocate(&doc, &key), None);
     }
 
+    #[test]
+    fn relocate_for_edit_prefers_the_exact_state_and_never_guesses_by_title() {
+        let key = ItemKey {
+            title: "Ship it".into(),
+            state: State::Open,
+        };
+        // Exact title+state wins over a same-titled item in another state.
+        let doc = parse("# Feed\n\n- [x] Ship it\n- [ ] Ship it\n");
+        assert_eq!(relocate_for_edit(&doc, &key, "2026-01-15"), Some(3));
+        // Neither matches the opened state: two title hits is ambiguous.
+        let doc = parse("# Feed\n\n- [x] Ship it\n- [~] Ship it\n");
+        assert_eq!(relocate_for_edit(&doc, &key, "2026-01-15"), None);
+    }
+
     use crate::config::{Side, SidebarConfig};
     use crate::tui::modal::EditFocus;
     use crate::tui::socket::{AgentInfo, AgentStatus, FakeHerdr};
@@ -743,6 +1006,8 @@ mod tests {
             width: 0.18,
             max_width: 46,
             auto_dock: false,
+            auto_close: true,
+            quit_herdr_when_last: true,
         }
     }
 
@@ -781,6 +1046,23 @@ mod tests {
                 feed_text(&app)
             );
         }
+    }
+
+    #[test]
+    fn a_checkbox_click_to_done_and_an_accept_both_strip_today() {
+        let (mut app, _fake, _dir) = app_on_disk(
+            "# Feed\n\n- [~] Beta @today\n- [?] Gamma @agent(claude:1) @today\n- [ ] Keep @today\n",
+        );
+        for (title, from) in [("Beta", State::InProgress), ("Gamma", State::Review)] {
+            app.apply(Action::Advance(ItemKey {
+                title: title.into(),
+                state: from,
+            }));
+        }
+        assert_eq!(
+            feed_text(&app),
+            "# Feed\n\n- [x] Beta\n- [x] Gamma @agent(claude:1)\n- [ ] Keep @today\n"
+        );
     }
 
     #[test]
@@ -1024,6 +1306,29 @@ mod tests {
     /// mid-action NotFound must proceed with an empty Document instead of
     /// dropping, letting `save_atomic` create the file via its
     /// `create_dir_all`.
+    /// The sidebar can't redraw while it waits for the lock, so it gives up
+    /// fast — well inside the CLI's 5 s — and says the feed is busy.
+    #[test]
+    fn a_sidebar_write_on_a_held_lock_gives_up_within_a_quarter_second() {
+        let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [x] Alpha\n");
+        let held = std::fs::File::create(lock::lock_path(&app.feed_path)).unwrap();
+        held.lock().unwrap();
+
+        let start = std::time::Instant::now();
+        app.apply(Action::Sweep);
+        let waited = start.elapsed();
+
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "waited {waited:?}"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(200),
+            "waited {waited:?}"
+        );
+        assert!(app.status_msg.as_deref().unwrap().contains("feed busy"));
+    }
+
     #[test]
     fn with_feed_proceeds_on_missing_file_when_in_memory_doc_has_no_items() {
         let dir = tempfile::tempdir().unwrap();
@@ -1109,21 +1414,24 @@ mod tests {
     // `edit_step` (modal.rs) stays pure — it only records the yanked text in
     // `EditModal::pending_clipboard` on Ctrl+C/Ctrl+X. These tests cover the
     // drain wiring in `handle_modal_event` (pending_clipboard -> the
-    // injectable `clipboard_copy` -> status_msg on failure), NOT the real
+    // injected `clipboard` sink -> status_msg), NOT the real
     // `clipboard::copy` spawn (that would shell out to a real `pbcopy` and
     // touch the developer's actual clipboard on every `cargo test` run —
     // `clipboard::choose_command`'s own unit tests in clipboard.rs cover the
     // platform-tool choice instead). The injected sink below deliberately
     // fails, embedding the received text in the error, so asserting on
     // `status_msg` proves both that the drain fired AND what text it passed.
-    fn fake_clipboard_sink(text: &str) -> anyhow::Result<()> {
-        anyhow::bail!("test-sink:{text}")
+    struct FailingSink;
+    impl ClipboardSink for FailingSink {
+        fn copy(&mut self, text: &str) -> anyhow::Result<()> {
+            anyhow::bail!("test-sink:{text}")
+        }
     }
 
     #[test]
     fn copy_step_drains_pending_clipboard_through_the_injected_sink() {
         let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n");
-        app.clipboard_copy = fake_clipboard_sink;
+        app.clipboard = Box::new(FailingSink);
         app.apply(Action::OpenCreate);
         press(&mut app, KeyCode::Tab); // Category -> Title
         press(&mut app, KeyCode::Tab); // Title -> Body
@@ -1148,9 +1456,9 @@ mod tests {
     }
 
     #[test]
-    fn copy_step_leaves_status_untouched_when_the_sink_succeeds() {
+    fn copy_step_reports_the_char_count_when_the_sink_succeeds() {
         let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n");
-        app.clipboard_copy = |_| Ok(());
+        app.clipboard = Box::new(crate::tui::clipboard::FakeClipboard::default());
         app.apply(Action::OpenCreate);
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
@@ -1158,13 +1466,13 @@ mod tests {
         press_shift(&mut app, KeyCode::Left);
         press_shift(&mut app, KeyCode::Left);
         press_ctrl(&mut app, 'c');
-        assert_eq!(app.status_msg, None);
+        assert_eq!(app.status_msg.as_deref(), Some("Copied 2 chars"));
     }
 
     #[test]
     fn no_selection_ctrl_c_never_touches_the_sink() {
         let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n");
-        app.clipboard_copy = fake_clipboard_sink;
+        app.clipboard = Box::new(FailingSink);
         app.apply(Action::OpenCreate);
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
@@ -1433,7 +1741,7 @@ mod tests {
             "# Feed\n\n- [ ] Active\n\n# Done\n\n## Feed\n\n- [x] Old @done(2026-09-01)\n\n# Notes\n\nprose\n",
         );
         app.apply(Action::OpenDoneView);
-        assert!(matches!(app.modal, Modal::DoneView { .. }));
+        assert!(matches!(app.modal, Modal::DoneView(_)));
         let text = app.archive_text();
         assert!(text.contains("- [x] Old @done(2026-09-01)"));
         assert!(!text.contains("Active"));
@@ -1451,7 +1759,7 @@ mod tests {
         let (mut app, _fake, _dir) = app_on_disk("- [ ] A\n");
         app.editor_cmd = Some("true".into()); // injected — no env mutation in tests
         app.apply(Action::OpenFileView);
-        assert!(matches!(app.modal, Modal::FileView { .. }));
+        assert!(matches!(app.modal, Modal::FileView(_)));
         assert_eq!(app.file_text(), "- [ ] A\n");
         press(&mut app, KeyCode::Char('e'));
         assert!(!app.modal_active());
@@ -1461,11 +1769,11 @@ mod tests {
     }
 
     #[test]
-    fn viewer_esc_closes_and_scrolls() {
+    fn viewer_esc_closes_after_scrolling() {
         let (mut app, _fake, _dir) = app_on_disk("- [ ] A\n");
         app.apply(Action::OpenDoneView);
         press(&mut app, KeyCode::Down);
-        assert!(matches!(app.modal, Modal::DoneView { scroll: 1 }));
+        assert!(matches!(app.modal, Modal::DoneView(_)));
         press(&mut app, KeyCode::Esc);
         assert!(!app.modal_active());
     }
@@ -1634,6 +1942,31 @@ mod tests {
             },
         );
         assert!(!app.any_linked_agent_blocked());
+    }
+
+    #[test]
+    fn a_pushed_status_updates_the_linked_agent_without_a_resync() {
+        let (mut app, _fake, _dir) = app_on_disk(SAMPLE);
+        app.on_event(crate::tui::AppEvent::Agents(vec![AgentInfo {
+            pane_id: "w1:p7".into(),
+            kind: "claude".into(),
+            session_id: "0198f3ab".into(),
+            status: AgentStatus::Working,
+        }]));
+        assert!(!app.any_linked_agent_blocked());
+
+        app.on_event(crate::tui::AppEvent::AgentStatus {
+            pane_id: "w1:p7".into(),
+            status: AgentStatus::Blocked,
+        });
+        assert!(app.any_linked_agent_blocked());
+
+        // A push for a pane we don't know is ignored, not invented.
+        app.on_event(crate::tui::AppEvent::AgentStatus {
+            pane_id: "w9:p1".into(),
+            status: AgentStatus::Done,
+        });
+        assert_eq!(app.statuses.len(), 1);
     }
 
     #[test]

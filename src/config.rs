@@ -20,6 +20,13 @@ pub struct SidebarConfig {
     pub max_width: u16,
     /// Read for Plan 3's tab.created auto-dock hook; the TUI itself ignores it.
     pub auto_dock: bool,
+    /// Exit once the sidebar is the only pane left in its tab, so herdr
+    /// closes the tab (spec #22). `false` disables auto-close entirely.
+    pub auto_close: bool,
+    /// When auto-close leaves no other pane anywhere in herdr, stop the
+    /// server so herdr quits instead of opening a fresh default workspace.
+    /// Ignored when `auto_close` is off.
+    pub quit_herdr_when_last: bool,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -28,6 +35,8 @@ struct SidebarToml {
     width: Option<f64>,
     max_width: Option<u16>,
     auto_dock: Option<bool>,
+    auto_close: Option<bool>,
+    quit_herdr_when_last: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -63,11 +72,31 @@ pub fn load_sidebar_config(config_dir: &std::path::Path) -> SidebarConfig {
             Side::Left
         }
     };
+    // `width` is a share of the tab and `max_width` a column cap: values
+    // that can't be docked to warn and fall back, like a bad `side`.
+    let width = match s.width {
+        None => 0.18,
+        Some(w) if w > 0.0 && w <= 1.0 => w,
+        Some(w) => {
+            eprintln!("feedr: warning: sidebar.width {w} is not in (0, 1]; using 0.18");
+            0.18
+        }
+    };
+    let max_width = match s.max_width {
+        None => 46,
+        Some(0) => {
+            eprintln!("feedr: warning: sidebar.max_width 0 is not a width; using 46");
+            46
+        }
+        Some(m) => m,
+    };
     SidebarConfig {
         side,
-        width: s.width.unwrap_or(0.18),
-        max_width: s.max_width.unwrap_or(46),
+        width,
+        max_width,
         auto_dock: s.auto_dock.unwrap_or(false),
+        auto_close: s.auto_close.unwrap_or(true),
+        quit_herdr_when_last: s.quit_herdr_when_last.unwrap_or(true),
     }
 }
 
@@ -142,7 +171,9 @@ mod tests {
                 side: Side::Left,
                 width: 0.18,
                 max_width: 46,
-                auto_dock: false
+                auto_dock: false,
+                auto_close: true,
+                quit_herdr_when_last: true,
             }
         );
         // Parsed values:
@@ -157,7 +188,9 @@ mod tests {
                 side: Side::Right,
                 width: 0.25,
                 max_width: 60,
-                auto_dock: true
+                auto_dock: true,
+                auto_close: true,
+                quit_herdr_when_last: true,
             }
         );
         // Invalid side falls back to left:
@@ -167,6 +200,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_sidebar_config(dir.path()).side, Side::Left);
+        // Auto-close keys parse independently:
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[sidebar]\nauto_close = false\nquit_herdr_when_last = false\n",
+        )
+        .unwrap();
+        let c = load_sidebar_config(dir.path());
+        assert!(!c.auto_close && !c.quit_herdr_when_last);
+        // A wrong-typed key is rejected like the existing ones (the file is
+        // ignored with a warning), so the safe defaults stand:
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[sidebar]\nauto_close = \"no\"\n",
+        )
+        .unwrap();
+        assert!(load_sidebar_config(dir.path()).auto_close);
         // feed_path resolution still works with [sidebar] present:
         std::fs::write(
             dir.path().join("config.toml"),
@@ -177,5 +226,42 @@ mod tests {
             resolve_feed_path(None, None, dir.path()),
             PathBuf::from("/tmp/f.md")
         );
+    }
+
+    fn sidebar_from(toml: &str) -> SidebarConfig {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), toml).unwrap();
+        load_sidebar_config(dir.path())
+    }
+
+    #[test]
+    fn a_malformed_config_file_falls_back_to_every_default() {
+        let c = sidebar_from("[sidebar\nside = \"right\"\n");
+        assert_eq!(c, sidebar_from(""));
+        assert_eq!(c.side, Side::Left);
+    }
+
+    #[test]
+    fn a_width_outside_zero_to_one_falls_back_to_the_default() {
+        // `width` is a share of the tab: 0, negative, above 1 or NaN cannot
+        // be docked to.
+        for bad in ["0", "0.0", "-0.2", "1.5", "nan"] {
+            let c = sidebar_from(&format!("[sidebar]\nwidth = {bad}\n"));
+            assert_eq!(c.width, 0.18, "width = {bad}");
+        }
+        assert_eq!(sidebar_from("[sidebar]\nwidth = 1.0\n").width, 1.0);
+        assert_eq!(sidebar_from("[sidebar]\nwidth = 0.3\n").width, 0.3);
+    }
+
+    #[test]
+    fn a_zero_max_width_falls_back_to_the_default() {
+        assert_eq!(sidebar_from("[sidebar]\nmax_width = 0\n").max_width, 46);
+        assert_eq!(sidebar_from("[sidebar]\nmax_width = 1\n").max_width, 1);
+    }
+
+    #[test]
+    fn a_negative_max_width_is_a_type_error_so_the_file_is_ignored() {
+        let c = sidebar_from("[sidebar]\nside = \"right\"\nmax_width = -5\n");
+        assert_eq!((c.side, c.max_width), (Side::Left, 46));
     }
 }

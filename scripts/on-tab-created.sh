@@ -19,7 +19,7 @@
 # env vars for common ids "when available") for an event hook tied to a tab, alongside
 # the fuller HERDR_PLUGIN_EVENT_JSON payload. We prefer the direct var; if a future herdr
 # version stops setting it for this event, fall back to pulling "tab_id" out of the event
-# JSON (same string-scrape style as open-feedr.sh/toggle-feedr.sh use for `pane list`, to
+# JSON (same string-scrape style as toggle-feedr.sh uses for `pane list`, to
 # avoid a jq/python dependency).
 set -euo pipefail
 

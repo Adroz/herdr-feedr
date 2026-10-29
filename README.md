@@ -8,7 +8,7 @@ Planned shape: one Rust binary — a ratatui sidebar pane (via the herdr plugin 
 
 ## Install as a herdr plugin
 
-herdr-feedr ships a `herdr-plugin.toml` manifest (see [docs/SPEC.md §8](docs/SPEC.md)) that packages the sidebar as a herdr plugin pane, plus two actions to open it: `open-feedr` (open-or-focus, docked to the left edge) and `toggle-feedr` (close if open, else open). v1 supports Linux and macOS; there's no Windows packaging yet.
+herdr-feedr ships a `herdr-plugin.toml` manifest (see [docs/SPEC.md §8](docs/SPEC.md)) that packages the sidebar as a herdr plugin pane, plus two actions to open it: `open-feedr` (open-or-focus, docked to the `[sidebar]` side, left by default) and `toggle-feedr` (close if open, else open). v1 supports Linux and macOS; there's no Windows packaging yet.
 
 ### Published install
 
@@ -33,6 +33,16 @@ Rebuild loop while iterating:
 3. Restart the sidebars so they pick up the new binary — herdr doesn't hot-reload a running pane's process. `bash scripts/reload-feedr.sh` does steps 2–3 for every open sidebar in every tab (`--dry-run` to preview, `--tab <id>` for one tab); or close and reopen a single one by hand (`toggle-feedr` twice).
 
 `herdr plugin list` shows whether herdr-feedr loaded, with its pane and both actions.
+
+### Render snapshots
+
+Sidebar layouts (Today panel, list, edit modal, Done archive, file view) are pinned as [`insta`](https://insta.rs) text snapshots in `src/tui/snapshots/`, so a layout change shows up as a reviewable diff. When `cargo test` fails on a snapshot:
+
+1. `cargo install cargo-insta` (once).
+2. `cargo insta review` — read each diff. Accept it only if the change is one you meant to make; otherwise fix the code.
+3. Commit the updated `.snap` files with the change that caused them. Never commit `.snap.new` files.
+
+A new snapshot test fails until its first `.snap` is accepted the same way. CI never writes snapshots, so an unreviewed one fails the build there. Snapshots are text only — colour and style are asserted in ordinary tests.
 
 ### Bind keys
 
@@ -98,3 +108,7 @@ A claim isn't permanent. `feedr unclaim <item>` clears the tag and puts the item
 agents may release only their own claims, while you (and the sidebar's `[ Release ]` button, shown
 on a claimed item's edit modal) may release anyone's. In the sidebar, an `@agent` sub-line carries
 a live marker when herdr can see that session — no marker means "not visible", never "dead".
+
+## Copying text
+
+In the edit modal and the read-only Done archive and file views, dragging over text copies it on release; a double-click copies the word under the pointer and a triple-click the whole line. Ctrl+C copies the current selection again. For anything else on screen, including the sidebar list, use herdr copy mode: `prefix+[`, then `v` to select and `y` to copy.

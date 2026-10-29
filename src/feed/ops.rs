@@ -68,6 +68,16 @@ pub fn find(doc: &Document, query: &str) -> Result<usize, OpError> {
             _ => None,
         })
         .collect();
+    // An exact title wins so a title that is a substring of another stays
+    // addressable; duplicate exact titles fall through to the ambiguity error.
+    let exact: Vec<usize> = matches
+        .iter()
+        .copied()
+        .filter(|&i| matches!(&doc.nodes[i], Node::Item(it) if it.title.to_lowercase() == q))
+        .collect();
+    if let [only] = exact[..] {
+        return Ok(only);
+    }
     match matches.len() {
         0 => Err(OpError::NotFound(query.to_string())),
         1 => Ok(matches[0]),
@@ -783,6 +793,15 @@ mod tests {
         assert!(matches!(&doc.nodes[i], Node::Item(it) if it.title.contains("auth")));
         assert!(matches!(find(&doc, "old fixed"), Err(OpError::NotFound(_))));
         assert!(matches!(find(&doc, "o"), Err(OpError::Ambiguous(..))));
+    }
+
+    #[test]
+    fn find_prefers_an_exact_title_over_substring_matches() {
+        let doc =
+            parse("# Feed\n\n- [ ] Fix auth redirect\n- [ ] Fix auth\n- [ ] Fix auth flake\n");
+        let i = find(&doc, "fix AUTH").unwrap();
+        assert!(matches!(&doc.nodes[i], Node::Item(it) if it.title == "Fix auth"));
+        assert!(matches!(find(&doc, "fix au"), Err(OpError::Ambiguous(..))));
     }
 
     #[test]

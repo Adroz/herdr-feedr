@@ -208,7 +208,7 @@ impl Driver {
     }
 
     /// Set what herdr's `pane.list` answers from now on: `(pane, tab,
-    /// title)` triples, all in workspace `w1`.
+    /// title)` triples.
     pub fn set_panes(&mut self, panes: &[(&str, &str, &str)]) {
         *self.panes.borrow_mut() = Some(
             panes
@@ -216,7 +216,6 @@ impl Driver {
                 .map(|(p, t, title)| PaneEntry {
                     pane_id: p.to_string(),
                     tab_id: t.to_string(),
-                    workspace_id: "w1".into(),
                     title: Some(title.to_string()),
                 })
                 .collect(),

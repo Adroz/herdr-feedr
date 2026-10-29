@@ -713,7 +713,7 @@ pub fn step_with_clicks(modal: Modal, ev: Event, area: Rect, clicks: u8) -> Moda
                 ModalStep::Continue(Modal::None)
             }
             ev => {
-                v.handle(&ev);
+                v.handle(&ev, clicks);
                 ModalStep::Continue(Modal::DoneView(v))
             }
         },
@@ -723,7 +723,7 @@ pub fn step_with_clicks(modal: Modal, ev: Event, area: Rect, clicks: u8) -> Moda
             }
             Event::Key(k) if k.code == KeyCode::Char('e') => ModalStep::OpenEditor,
             ev => {
-                v.handle(&ev);
+                v.handle(&ev, clicks);
                 ModalStep::Continue(Modal::FileView(v))
             }
         },
@@ -839,24 +839,6 @@ fn paste_text_focused(m: &mut EditModal, text: &str) {
     }
     if m.focus == EditFocus::Category {
         m.dropdown = None; // paste refilters the suggestions
-    }
-}
-
-/// A left press in a text field: place the cursor under the pointer, then,
-/// for a double click, select the word there, and for a triple click the
-/// logical line (`multi_line` fields) or the whole field. The selection is
-/// copied on release like a drag's, so the press itself copies nothing.
-fn field_press(ta: &mut TextArea<'static>, x: u16, y: u16, clicks: u8, multi_line: bool) {
-    let Some(pos) = selection::press(ta, x, y) else {
-        return;
-    };
-    match clicks {
-        2 => {
-            selection::select_word(ta, pos);
-        }
-        3 if multi_line => selection::select_line(ta, pos.0),
-        3 => selection::select_all(ta),
-        _ => {}
     }
 }
 
@@ -1026,21 +1008,39 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect, clicks: u8) -> ModalStep {
                     // A plain click replaces any selection. A click on the
                     // field's border focuses it but has no character to land
                     // on, so the cursor stays put.
-                    field_press(&mut m.category, mev.column, mev.row, clicks, false);
+                    selection::press_n(
+                        &mut m.category,
+                        mev.column,
+                        mev.row,
+                        clicks,
+                        selection::Triple::Field,
+                    );
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Title) => {
                     m.focus = EditFocus::Title;
                     m.dropdown = None;
                     m.sync_blocks();
-                    field_press(&mut m.title, mev.column, mev.row, clicks, false);
+                    selection::press_n(
+                        &mut m.title,
+                        mev.column,
+                        mev.row,
+                        clicks,
+                        selection::Triple::Field,
+                    );
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Body) => {
                     m.focus = EditFocus::Body;
                     m.dropdown = None;
                     m.sync_blocks();
-                    field_press(&mut m.body, mev.column, mev.row, clicks, true);
+                    selection::press_n(
+                        &mut m.body,
+                        mev.column,
+                        mev.row,
+                        clicks,
+                        selection::Triple::Line,
+                    );
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Save) => ModalStep::Save(m),

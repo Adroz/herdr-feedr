@@ -95,10 +95,37 @@ pub fn copy(ta: &mut TextArea<'_>) -> Option<String> {
     Some(text)
 }
 
+/// What a triple-click selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Triple {
+    /// The logical line under the pointer (a body line, a viewer line).
+    Line,
+    /// The whole text (the one-line Title and Category fields).
+    Field,
+}
+
+/// A left press that is click number `clicks` of a run (from
+/// [`ClickTracker`]): [`press`], then, for a double, select the word there,
+/// and for a triple, what `triple` says. Like a drag, the selection is
+/// copied on release, so the press itself copies nothing.
+pub fn press_n(ta: &mut TextArea<'_>, x: u16, y: u16, clicks: u8, triple: Triple) {
+    let Some(pos) = press(ta, x, y) else {
+        return;
+    };
+    match (clicks, triple) {
+        (2, _) => {
+            select_word(ta, pos);
+        }
+        (3, Triple::Line) => select_line(ta, pos.0),
+        (3, Triple::Field) => select_all(ta),
+        _ => {}
+    }
+}
+
 /// Double-click: select the word ([`word_at`]) around `pos`. Returns false,
 /// leaving the field as it was, when there's no word there (a separator, or
 /// past the end of the line).
-pub fn select_word(ta: &mut TextArea<'_>, (line, ch): TextPos) -> bool {
+fn select_word(ta: &mut TextArea<'_>, (line, ch): TextPos) -> bool {
     let Some(range) = ta.lines().get(line).and_then(|l| word_at(l, ch)) else {
         return false;
     };
@@ -108,7 +135,7 @@ pub fn select_word(ta: &mut TextArea<'_>, (line, ch): TextPos) -> bool {
 
 /// Triple-click in a multi-line field: select the whole logical line `line`
 /// (every soft-wrapped row of it, without the line break).
-pub fn select_line(ta: &mut TextArea<'_>, line: usize) {
+fn select_line(ta: &mut TextArea<'_>, line: usize) {
     let Some(len) = ta.lines().get(line).map(|l| l.chars().count()) else {
         return;
     };
@@ -116,7 +143,7 @@ pub fn select_line(ta: &mut TextArea<'_>, line: usize) {
 }
 
 /// Triple-click in a one-line field: select the whole field.
-pub fn select_all(ta: &mut TextArea<'_>) {
+fn select_all(ta: &mut TextArea<'_>) {
     let last = ta.lines().len().saturating_sub(1);
     let len = ta.lines().last().map_or(0, |l| l.chars().count());
     select_span(ta, (0, 0), (last, len));
@@ -188,48 +215,29 @@ impl ClickTracker {
 //
 // A port of herdr v0.9.3's double-click word bounds (`word_bounds_at_column`
 // and helpers in herdr's `src/app/actions.rs`), kept structurally close so it
-// can be diffed against upstream. The row is mapped to display cells first,
-// so wide characters span two columns and zero-width marks share their base's
-// column. Then: a whole http(s) URL, else a quoted path, else a
-// separator-delimited token with wrapping punctuation trimmed.
-
-/// The inclusive display-column bounds of the word a double-click at `col`
-/// selects in `row`, or `None` when the click is on a separator, a lone
-/// quote, or past the end of the row. For surfaces that know the clicked
-/// display column of a rendered row (read-only viewers).
-// No non-test caller until the read-only viewers (#35) use it.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn word_bounds_at_column(row: &str, col: u16) -> Option<(u16, u16)> {
-    let cells = text_cells(row);
-    let clicked = cells
-        .iter()
-        .position(|c| c.start_col <= col && col <= c.end_col)?;
-    let span = word_span(&cells, clicked)?;
-    Some((cells[span.start].start_col, cells[span.end].end_col))
-}
+// can be diffed against upstream: a whole http(s) URL, else a quoted path,
+// else a separator-delimited token with wrapping punctuation trimmed.
+//
+// herdr maps a terminal row to display cells first so the clicked column
+// lands on the right char. Here [`pos_at_cell`] has already done that
+// against the text as drawn (wide chars, wrap and scroll included), so the
+// bounds work in char indices.
 
 /// The char-index range (end exclusive) of the word a double-click on the
-/// char at `idx` selects in `line`. Same rules as [`word_bounds_at_column`],
-/// in the `(line, char)` space `TextArea` positions use.
+/// char at `idx` selects in `line`, or `None` on a separator, a lone quote,
+/// or past the end of the line.
 pub fn word_at(line: &str, idx: usize) -> Option<std::ops::Range<usize>> {
-    let cells = text_cells(line);
+    let cells: Vec<char> = line.chars().collect();
     if idx >= cells.len() {
         return None;
     }
-    let span = word_span(&cells, idx)?;
+    let span = url_span(&cells, idx)
+        .or_else(|| quoted_path_span(&cells, idx))
+        .or_else(|| token_span(&cells, idx))?;
     Some(span.start..span.end + 1)
 }
 
-/// One char of a row and the display columns it covers (inclusive).
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(test), allow(dead_code))] // columns: read by `word_bounds_at_column`
-struct TextCell {
-    ch: char,
-    start_col: u16,
-    end_col: u16,
-}
-
-/// Inclusive cell-index span.
+/// Inclusive char-index span.
 #[derive(Debug, Clone, Copy)]
 struct CellSpan {
     start: usize,
@@ -242,64 +250,36 @@ impl CellSpan {
     }
 }
 
-fn word_span(cells: &[TextCell], clicked: usize) -> Option<CellSpan> {
-    url_span(cells, clicked)
-        .or_else(|| quoted_path_span(cells, clicked))
-        .or_else(|| token_span(cells, clicked))
-}
-
-fn text_cells(row: &str) -> Vec<TextCell> {
-    let mut next_col = 0u16;
-    row.chars()
-        .map(|ch| {
-            // Control chars have no defined width; give them one cell so
-            // they never overlap a neighbour.
-            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1) as u16;
-            let start_col = if width == 0 {
-                next_col.saturating_sub(1)
-            } else {
-                next_col
-            };
-            next_col = next_col.saturating_add(width);
-            TextCell {
-                ch,
-                start_col,
-                end_col: next_col.saturating_sub(1),
-            }
-        })
-        .collect()
-}
-
-fn token_span(cells: &[TextCell], clicked: usize) -> Option<CellSpan> {
-    if is_word_separator(cells[clicked].ch) {
+fn token_span(cells: &[char], clicked: usize) -> Option<CellSpan> {
+    if is_word_separator(cells[clicked]) {
         return None;
     }
     let mut start = clicked;
-    while start > 0 && !is_word_separator(cells[start - 1].ch) {
+    while start > 0 && !is_word_separator(cells[start - 1]) {
         start -= 1;
     }
     let mut end = clicked;
-    while end + 1 < cells.len() && !is_word_separator(cells[end + 1].ch) {
+    while end + 1 < cells.len() && !is_word_separator(cells[end + 1]) {
         end += 1;
     }
     trim_token_edges(cells, CellSpan { start, end }).filter(|s| s.contains(clicked))
 }
 
-fn starts_with_chars(cells: &[TextCell], prefix: &str) -> bool {
+fn starts_with_chars(cells: &[char], prefix: &str) -> bool {
     prefix
         .chars()
         .enumerate()
-        .all(|(i, expected)| cells.get(i).is_some_and(|c| c.ch == expected))
+        .all(|(i, expected)| cells.get(i) == Some(&expected))
 }
 
-fn url_span(cells: &[TextCell], clicked: usize) -> Option<CellSpan> {
+fn url_span(cells: &[char], clicked: usize) -> Option<CellSpan> {
     let mut start = 0;
     while start < cells.len() {
         if starts_with_chars(&cells[start..], "http://")
             || starts_with_chars(&cells[start..], "https://")
         {
             let mut end = start;
-            while end + 1 < cells.len() && !cells[end + 1].ch.is_whitespace() {
+            while end + 1 < cells.len() && !cells[end + 1].is_whitespace() {
                 end += 1;
             }
             if clicked >= start && clicked <= end {
@@ -314,7 +294,7 @@ fn url_span(cells: &[TextCell], clicked: usize) -> Option<CellSpan> {
     None
 }
 
-fn trim_url_edges(cells: &[TextCell], span: CellSpan) -> Option<CellSpan> {
+fn trim_url_edges(cells: &[char], span: CellSpan) -> Option<CellSpan> {
     let start = span.start;
     let mut end = span.end;
     while start <= end && should_trim_trailing_url_cell(cells, start, end) {
@@ -326,8 +306,8 @@ fn trim_url_edges(cells: &[TextCell], span: CellSpan) -> Option<CellSpan> {
     (start <= end).then_some(CellSpan { start, end })
 }
 
-fn should_trim_trailing_url_cell(cells: &[TextCell], start: usize, end: usize) -> bool {
-    match cells[end].ch {
+fn should_trim_trailing_url_cell(cells: &[char], start: usize, end: usize) -> bool {
+    match cells[end] {
         '"' | '\'' | '`' | '.' | ',' | ';' | ':' | '!' | '?' => true,
         ')' => !closer_is_balanced(cells, start, end, '(', ')'),
         ']' => !closer_is_balanced(cells, start, end, '[', ']'),
@@ -337,18 +317,12 @@ fn should_trim_trailing_url_cell(cells: &[TextCell], start: usize, end: usize) -
 }
 
 /// Whether the closer at `end` closes an opener inside `start..end`.
-fn closer_is_balanced(
-    cells: &[TextCell],
-    start: usize,
-    end: usize,
-    open: char,
-    close: char,
-) -> bool {
+fn closer_is_balanced(cells: &[char], start: usize, end: usize, open: char, close: char) -> bool {
     let mut balance = 0i32;
-    for c in &cells[start..end] {
-        if c.ch == open {
+    for &c in &cells[start..end] {
+        if c == open {
             balance += 1;
-        } else if c.ch == close {
+        } else if c == close {
             balance -= 1;
         }
     }
@@ -358,21 +332,20 @@ fn closer_is_balanced(
 /// The inside of the quoted string around the click, if it contains a `/`
 /// (so it's a path, possibly with spaces). A click on a quote itself never
 /// matches.
-fn quoted_path_span(cells: &[TextCell], clicked: usize) -> Option<CellSpan> {
-    let ch = cells.get(clicked)?.ch;
+fn quoted_path_span(cells: &[char], clicked: usize) -> Option<CellSpan> {
+    let ch = *cells.get(clicked)?;
     if matches!(ch, '"' | '\'' | '`') {
         return None;
     }
     for quote in ['"', '\'', '`'] {
         let mut open = None;
-        for (idx, cell) in cells.iter().enumerate() {
-            if cell.ch != quote || is_escaped(cells, idx) {
+        for (idx, &cell) in cells.iter().enumerate() {
+            if cell != quote || is_escaped(cells, idx) {
                 continue;
             }
             match open {
                 Some(o) => {
-                    if clicked > o && clicked < idx && cells[o + 1..idx].iter().any(|c| c.ch == '/')
-                    {
+                    if clicked > o && clicked < idx && cells[o + 1..idx].contains(&'/') {
                         return Some(CellSpan {
                             start: o + 1,
                             end: idx - 1,
@@ -387,10 +360,10 @@ fn quoted_path_span(cells: &[TextCell], clicked: usize) -> Option<CellSpan> {
     None
 }
 
-fn is_escaped(cells: &[TextCell], idx: usize) -> bool {
+fn is_escaped(cells: &[char], idx: usize) -> bool {
     let mut slashes = 0;
     let mut i = idx;
-    while i > 0 && cells[i - 1].ch == '\\' {
+    while i > 0 && cells[i - 1] == '\\' {
         slashes += 1;
         i -= 1;
     }
@@ -419,17 +392,17 @@ fn is_word_separator(ch: char) -> bool {
         )
 }
 
-fn trim_token_edges(cells: &[TextCell], span: CellSpan) -> Option<CellSpan> {
+fn trim_token_edges(cells: &[char], span: CellSpan) -> Option<CellSpan> {
     let mut start = span.start;
     let mut end = span.end;
-    while start <= end && is_leading_token_wrapper(cells[start].ch) {
+    while start <= end && is_leading_token_wrapper(cells[start]) {
         start += 1;
     }
     // Keep a shell-prompt-style `$` that follows a closer: "( master)$".
-    if start < end && cells[end].ch == '$' && is_trailing_token_wrapper(cells[end - 1].ch) {
+    if start < end && cells[end] == '$' && is_trailing_token_wrapper(cells[end - 1]) {
         end -= 1;
     }
-    while start <= end && is_trailing_token_wrapper(cells[end].ch) {
+    while start <= end && is_trailing_token_wrapper(cells[end]) {
         if end == 0 {
             return None;
         }
@@ -510,33 +483,11 @@ mod tests {
 
     // --- Word bounds (cases ported from herdr v0.9.3 app/actions.rs) -------
 
-    /// The display column `needle` starts at in `row`.
-    fn col_of(row: &str, needle: &str) -> u16 {
+    /// The text a double-click on the char `needle` starts at selects.
+    fn word_by_char(row: &str, needle: &str) -> Option<String> {
         let byte = row
             .find(needle)
             .unwrap_or_else(|| panic!("{needle:?} in {row:?}"));
-        unicode_width::UnicodeWidthStr::width(&row[..byte]) as u16
-    }
-
-    /// The text a double-click at `col` selects, via the column interface.
-    fn word_by_column(row: &str, col: u16) -> Option<String> {
-        let (start, end) = word_bounds_at_column(row, col)?;
-        let mut at = 0u16;
-        let mut out = String::new();
-        for ch in row.chars() {
-            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
-            if at >= start && at + w.max(1) - 1 <= end {
-                out.push(ch);
-            }
-            at += w;
-        }
-        Some(out)
-    }
-
-    /// The text a double-click on the char `needle` starts at selects, via
-    /// the char-index interface the edit fields use.
-    fn word_by_char(row: &str, needle: &str) -> Option<String> {
-        let byte = row.find(needle).unwrap();
         let idx = row[..byte].chars().count();
         let r = word_at(row, idx)?;
         Some(row.chars().skip(r.start).take(r.len()).collect())
@@ -655,37 +606,20 @@ mod tests {
         ];
         for (row, click, expected) in cases {
             assert_eq!(
-                word_by_column(row, col_of(row, click)).as_deref(),
-                Some(expected),
-                "by column: row={row:?} click={click:?}"
-            );
-            assert_eq!(
                 word_by_char(row, click).as_deref(),
                 Some(expected),
-                "by char: row={row:?} click={click:?}"
+                "row={row:?} click={click:?}"
             );
         }
-    }
-
-    #[test]
-    fn the_right_half_of_a_wide_character_selects_its_word() {
-        let row = "echo 你好-world done";
-        assert_eq!(
-            word_by_column(row, col_of(row, "好") + 1).as_deref(),
-            Some("你好-world")
-        );
-        // Columns are display cells: 你 and 好 take two each.
-        assert_eq!(word_bounds_at_column(row, 5), Some((5, 14)));
     }
 
     #[test]
     fn separators_and_cjk_punctuation_select_nothing() {
         for delim in ['（', '）', '：', '、', '。', '，'] {
             let row = format!("left{delim}right");
-            assert_eq!(word_by_column(&row, 0).as_deref(), Some("left"));
-            assert_eq!(word_by_column(&row, 6).as_deref(), Some("right"));
-            assert_eq!(word_bounds_at_column(&row, 4), None, "{delim:?}");
-            assert_eq!(word_bounds_at_column(&row, 5), None, "{delim:?} 2nd cell");
+            assert_eq!(word_by_char(&row, "left").as_deref(), Some("left"));
+            assert_eq!(word_by_char(&row, "right").as_deref(), Some("right"));
+            assert_eq!(word_at(&row, 4), None, "{delim:?}");
         }
         for (row, click) in [("a|b", "|"), ("one two", " "), ("f(x)", "(")] {
             assert_eq!(word_by_char(row, click), None, "{row:?} at {click:?}");
@@ -693,8 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn a_click_past_the_end_of_the_row_selects_nothing() {
-        assert_eq!(word_bounds_at_column("abc", 3), None);
+    fn a_click_past_the_end_of_the_line_selects_nothing() {
         assert_eq!(word_at("abc", 3), None);
         assert_eq!(word_at("", 0), None);
     }

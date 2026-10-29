@@ -10,10 +10,10 @@ expression: "d.screen().join(\"\\n\")"
   │                                  │
   │ ## 2026-01-14                    │
   │                                  │
-  │ - [x] Ship the sidebar @done(202 │
-  │ - [x] Write the glossary @done(2 │
-  │                                  │
-  │                                  │
+  │ - [x] Ship the sidebar @done(    │
+  │ 2026-01-14)                      │
+  │ - [x] Write the glossary @done(  │
+  │ 2026-01-14)                      │
   │                                  │
 Do└──────────────────────────────────┘
 clear completed

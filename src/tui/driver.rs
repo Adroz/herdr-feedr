@@ -182,6 +182,11 @@ impl Driver {
         self.event(Event::Paste(text.into()));
     }
 
+    /// One mouse-wheel notch down, with the pointer at `(x, y)`.
+    pub fn wheel_down(&mut self, x: u16, y: u16) {
+        self.mouse(MouseEventKind::ScrollDown, x, y);
+    }
+
     /// Resize the terminal, as the tty would, then deliver the event.
     pub fn resize(&mut self, w: u16, h: u16) {
         self.terminal.backend_mut().resize(w, h);

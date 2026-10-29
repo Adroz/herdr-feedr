@@ -1,4 +1,5 @@
 use crate::config::SidebarConfig;
+use crate::feed::lock::{self, LockError};
 use crate::feed::ops::{self, Authority, Zone};
 use crate::feed::write::save_atomic;
 use crate::feed::{AgentRef, Document, Item, Node, State};
@@ -176,6 +177,8 @@ pub struct App {
     /// `herdr` CLI runner for the collapse/expand pane resize. Injected so
     /// tests record the calls instead of spawning the real binary.
     pub herdr_cli: Box<dyn Runner>,
+    /// How long a write waits for the feed lock held by another writer.
+    pub lock_timeout: std::time::Duration,
 }
 
 impl App {
@@ -202,6 +205,7 @@ impl App {
             clipboard: Box::new(SystemClipboard),
             clock: Box::new(SystemClock),
             herdr_cli: Box::new(HerdrCli::from_env()),
+            lock_timeout: lock::timeout_from_env(),
         }
     }
 
@@ -250,6 +254,20 @@ impl App {
     where
         F: FnOnce(&mut Document) -> Result<Outcome>,
     {
+        // Held across read -> apply -> save, shared with the CLI (spec §6).
+        let _lock = match lock::acquire(&self.feed_path, self.lock_timeout) {
+            Ok(l) => l,
+            // The status row is narrow: name the lock file, not its path.
+            Err(LockError::Timeout { path, .. }) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                self.status_msg = Some(format!("feed busy ({name} held); action dropped"));
+                return;
+            }
+            Err(e) => {
+                self.status_msg = Some(format!("action dropped: {e}"));
+                return;
+            }
+        };
         let mut doc = match std::fs::read_to_string(&self.feed_path) {
             Ok(t) => crate::feed::parse::parse(&t),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

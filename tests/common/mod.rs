@@ -139,8 +139,9 @@ impl FakeHerdrBin {
 }
 
 /// A minimal herdr socket: answers every NDJSON request with an empty
-/// result and records `method params` per request. Enough for the dock
-/// paths that reach herdr over the socket rather than the CLI.
+/// result (or the canned one for its method, see [`Self::with_results`])
+/// and records `method params` per request. Enough for the dock paths that
+/// reach herdr over the socket rather than the CLI.
 pub struct FakeHerdrSocket {
     pub path: PathBuf,
     requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -149,7 +150,17 @@ pub struct FakeHerdrSocket {
 
 impl FakeHerdrSocket {
     pub fn start() -> Self {
+        Self::with_results(&[])
+    }
+
+    /// As [`Self::start`], but a request whose method is listed gets that
+    /// `result` value instead of `{}`.
+    pub fn with_results(results: &[(&str, serde_json::Value)]) -> Self {
         use std::io::{BufRead, BufReader, Write};
+        let results: std::collections::HashMap<String, serde_json::Value> = results
+            .iter()
+            .map(|(m, v)| (m.to_string(), v.clone()))
+            .collect();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("herdr.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -169,7 +180,12 @@ impl FakeHerdrSocket {
                     req["method"].as_str().unwrap_or(""),
                     req["params"]
                 ));
-                let reply = serde_json::json!({"id": req["id"], "result": {}});
+                let result = req["method"]
+                    .as_str()
+                    .and_then(|m| results.get(m))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let reply = serde_json::json!({"id": req["id"], "result": result});
                 let _ = stream.write_all(format!("{reply}\n").as_bytes());
             }
         });

@@ -19,6 +19,7 @@ pub mod socket;
 pub mod test_util;
 pub mod theme;
 pub mod view;
+pub mod viewer;
 pub mod watch;
 
 use crate::config::SidebarConfig;

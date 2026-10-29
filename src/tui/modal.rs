@@ -11,6 +11,7 @@
 
 use crate::feed::{Item, State};
 use crate::tui::app::ItemKey;
+use crate::tui::viewer::Viewer;
 use crate::tui::{selection, theme};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -23,13 +24,21 @@ pub enum Modal {
     Edit(EditModal),
     ConfirmDelete(EditModal),
     /// Read-only view of the `# Done` archive (spec §3).
-    DoneView {
-        scroll: u16,
-    },
+    DoneView(Viewer),
     /// Read-only view of the whole feed file; `e` requests `$EDITOR`.
-    FileView {
-        scroll: u16,
-    },
+    FileView(Viewer),
+}
+
+impl Modal {
+    /// Text copied in this step and not yet pushed to the system clipboard
+    /// (one-shot; `App::handle_modal_event` drains it).
+    pub fn take_pending_clipboard(&mut self) -> Option<String> {
+        match self {
+            Modal::Edit(m) => m.pending_clipboard.take(),
+            Modal::DoneView(v) | Modal::FileView(v) => v.pending_clipboard.take(),
+            Modal::None | Modal::ConfirmDelete(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -692,30 +701,27 @@ pub fn step(modal: Modal, ev: Event, area: Rect) -> ModalStep {
             }
             _ => ModalStep::Continue(Modal::ConfirmDelete(m)),
         },
-        Modal::DoneView { scroll } => match ev {
+        // Esc closes a viewer even with text selected: unlike an edit
+        // field, there's nothing to keep typing into, so a selection is not
+        // a layer worth peeling first.
+        Modal::DoneView(mut v) => match ev {
             Event::Key(k) if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) => {
                 ModalStep::Continue(Modal::None)
             }
-            Event::Key(k) if k.code == KeyCode::Down => ModalStep::Continue(Modal::DoneView {
-                scroll: scroll.saturating_add(1),
-            }),
-            Event::Key(k) if k.code == KeyCode::Up => ModalStep::Continue(Modal::DoneView {
-                scroll: scroll.saturating_sub(1),
-            }),
-            _ => ModalStep::Continue(Modal::DoneView { scroll }),
+            ev => {
+                v.handle(&ev);
+                ModalStep::Continue(Modal::DoneView(v))
+            }
         },
-        Modal::FileView { scroll } => match ev {
+        Modal::FileView(mut v) => match ev {
             Event::Key(k) if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) => {
                 ModalStep::Continue(Modal::None)
             }
             Event::Key(k) if k.code == KeyCode::Char('e') => ModalStep::OpenEditor,
-            Event::Key(k) if k.code == KeyCode::Down => ModalStep::Continue(Modal::FileView {
-                scroll: scroll.saturating_add(1),
-            }),
-            Event::Key(k) if k.code == KeyCode::Up => ModalStep::Continue(Modal::FileView {
-                scroll: scroll.saturating_sub(1),
-            }),
-            _ => ModalStep::Continue(Modal::FileView { scroll }),
+            ev => {
+                v.handle(&ev);
+                ModalStep::Continue(Modal::FileView(v))
+            }
         },
     }
 }
@@ -739,7 +745,7 @@ fn panel_rect(modal: &Modal, area: Rect) -> Rect {
             edit_layout(area, m.original.is_some(), m.claimed, m.dropdown_rows()).outer
         }
         Modal::ConfirmDelete(_) => confirm_rect(area),
-        Modal::DoneView { .. } | Modal::FileView { .. } => viewer_rect(area),
+        Modal::DoneView(_) | Modal::FileView(_) => viewer_rect(area),
     }
 }
 
@@ -748,7 +754,7 @@ fn panel_rect(modal: &Modal, area: Rect) -> Rect {
 /// the click off the list underneath.
 fn outside_click(modal: Modal) -> ModalStep {
     match modal {
-        Modal::DoneView { .. } | Modal::FileView { .. } => ModalStep::Continue(Modal::None),
+        Modal::DoneView(_) | Modal::FileView(_) => ModalStep::Continue(Modal::None),
         Modal::ConfirmDelete(m) => ModalStep::Continue(Modal::Edit(m)), // = "n"
         // Same layer test as Esc's dropdown arm in `edit_step`.
         Modal::Edit(mut m) if m.focus == EditFocus::Category && m.dropdown.is_some() => {
@@ -1154,34 +1160,30 @@ mod tests {
 
     /// Rider from Task 10's review: the viewer scroll `Down` arms used plain
     /// `scroll + 1` (u16), which debug-panics on overflow at 65,535 presses.
-    /// Hammer both DoneView and FileView well past u16::MAX to prove
-    /// `saturating_add` holds instead of panicking.
+    /// Hammer both DoneView and FileView well past u16::MAX to prove the
+    /// scroll saturates instead of panicking.
     #[test]
     fn done_view_scroll_down_saturates_past_u16_max() {
-        let mut modal = Modal::DoneView {
-            scroll: u16::MAX - 5,
-        };
+        let mut modal = Modal::DoneView(Viewer::default());
         for _ in 0..70_000 {
             modal = match step(modal, down(), TEST_AREA) {
                 ModalStep::Continue(m) => m,
                 _ => panic!("DoneView Down must stay in Continue"),
             };
         }
-        assert!(matches!(modal, Modal::DoneView { scroll } if scroll == u16::MAX));
+        assert!(matches!(modal, Modal::DoneView(_)));
     }
 
     #[test]
     fn file_view_scroll_down_saturates_past_u16_max() {
-        let mut modal = Modal::FileView {
-            scroll: u16::MAX - 5,
-        };
+        let mut modal = Modal::FileView(Viewer::default());
         for _ in 0..70_000 {
             modal = match step(modal, down(), TEST_AREA) {
                 ModalStep::Continue(m) => m,
                 _ => panic!("FileView Down must stay in Continue"),
             };
         }
-        assert!(matches!(modal, Modal::FileView { scroll } if scroll == u16::MAX));
+        assert!(matches!(modal, Modal::FileView(_)));
     }
 
     #[test]

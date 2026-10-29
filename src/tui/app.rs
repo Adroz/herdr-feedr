@@ -8,6 +8,7 @@ use crate::tui::clock::{Clock, SystemClock};
 use crate::tui::dock::{HerdrCli, Runner};
 use crate::tui::modal::{EditModal, Modal, ModalStep};
 use crate::tui::socket::{AgentInfo, AgentStatus, Herdr};
+use crate::tui::viewer::Viewer;
 use anyhow::Result;
 use crossterm::event::Event;
 use std::collections::HashMap;
@@ -420,8 +421,8 @@ impl App {
                 let suggestions = ops::section_names(&self.doc);
                 self.set_modal(Modal::Edit(EditModal::create_in(suggestions, &section)))
             }
-            Action::OpenDoneView => self.set_modal(Modal::DoneView { scroll: 0 }),
-            Action::OpenFileView => self.set_modal(Modal::FileView { scroll: 0 }),
+            Action::OpenDoneView => self.set_modal(Modal::DoneView(Viewer::default())),
+            Action::OpenFileView => self.set_modal(Modal::FileView(Viewer::default())),
             Action::OpenEditor => self.request_editor(),
         }
     }
@@ -534,13 +535,11 @@ impl App {
         // via the injected `clipboard` sink so tests never touch a real
         // clipboard tool. Best-effort: a failure becomes a status message,
         // never a crash or a dropped edit.
-        if let Modal::Edit(m) = &mut self.modal {
-            if let Some(text) = m.pending_clipboard.take() {
-                self.status_msg = Some(match self.clipboard.copy(&text) {
-                    Ok(()) => copied_status(&text),
-                    Err(e) => format!("clipboard: {e}"),
-                });
-            }
+        if let Some(text) = self.modal.take_pending_clipboard() {
+            self.status_msg = Some(match self.clipboard.copy(&text) {
+                Ok(()) => copied_status(&text),
+                Err(e) => format!("clipboard: {e}"),
+            });
         }
         // Round-2 item 4: the modal fully closed this step (Save/Cancel/Esc/
         // viewer close/confirmed delete) — unzoom. A transition that stays
@@ -1654,7 +1653,7 @@ mod tests {
             "# Feed\n\n- [ ] Active\n\n# Done\n\n## Feed\n\n- [x] Old @done(2026-09-01)\n\n# Notes\n\nprose\n",
         );
         app.apply(Action::OpenDoneView);
-        assert!(matches!(app.modal, Modal::DoneView { .. }));
+        assert!(matches!(app.modal, Modal::DoneView(_)));
         let text = app.archive_text();
         assert!(text.contains("- [x] Old @done(2026-09-01)"));
         assert!(!text.contains("Active"));
@@ -1672,7 +1671,7 @@ mod tests {
         let (mut app, _fake, _dir) = app_on_disk("- [ ] A\n");
         app.editor_cmd = Some("true".into()); // injected — no env mutation in tests
         app.apply(Action::OpenFileView);
-        assert!(matches!(app.modal, Modal::FileView { .. }));
+        assert!(matches!(app.modal, Modal::FileView(_)));
         assert_eq!(app.file_text(), "- [ ] A\n");
         press(&mut app, KeyCode::Char('e'));
         assert!(!app.modal_active());
@@ -1682,11 +1681,11 @@ mod tests {
     }
 
     #[test]
-    fn viewer_esc_closes_and_scrolls() {
+    fn viewer_esc_closes_after_scrolling() {
         let (mut app, _fake, _dir) = app_on_disk("- [ ] A\n");
         app.apply(Action::OpenDoneView);
         press(&mut app, KeyCode::Down);
-        assert!(matches!(app.modal, Modal::DoneView { scroll: 1 }));
+        assert!(matches!(app.modal, Modal::DoneView(_)));
         press(&mut app, KeyCode::Esc);
         assert!(!app.modal_active());
     }

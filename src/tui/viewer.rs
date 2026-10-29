@@ -61,8 +61,10 @@ impl Viewer {
     }
 
     /// Selection, copy and scroll input. Closing (Esc, `q`, outside click)
-    /// and the file view's `e` are the caller's.
-    pub fn handle(&mut self, ev: &Event) {
+    /// and the file view's `e` are the caller's. `clicks` is a left press's
+    /// place in a multi-click run (see `modal::step_with_clicks`): a double
+    /// selects a word, a triple the logical line.
+    pub fn handle(&mut self, ev: &Event, clicks: u8) {
         match ev {
             Event::Key(k)
                 if k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL =>
@@ -73,7 +75,8 @@ impl Viewer {
             Event::Key(k) if k.code == KeyCode::Up => self.scroll(-1),
             Event::Mouse(m) => match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    selection::press(&mut self.text, m.column, m.row);
+                    let triple = selection::Triple::Line;
+                    selection::press_n(&mut self.text, m.column, m.row, clicks, triple);
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
                     selection::drag_to(&mut self.text, m.column, m.row);
@@ -263,6 +266,32 @@ mod tests {
 
         assert!(d.clipboard_writes().is_empty());
         assert!(shows(&d, "Done archive"));
+    }
+
+    #[test]
+    fn a_double_click_in_the_done_archive_copies_the_word() {
+        let mut d = open_done(DONE_FEED);
+        let (x, y) = find(&d, "thing");
+
+        d.click(x + 1, y);
+        d.click(x + 2, y);
+
+        assert_eq!(d.clipboard_writes(), ["thing"]);
+        assert_eq!(d.highlighted(), "thing");
+        assert!(status(&d).contains("Copied 5 chars"), "{:#?}", d.screen());
+    }
+
+    #[test]
+    fn a_triple_click_in_the_file_view_copies_the_logical_line() {
+        let mut d = open_file(DONE_FEED);
+        let (x, y) = find(&d, "- [ ] Alpha"); // the viewer's, not the list's
+
+        for _ in 0..3 {
+            d.click(x + 7, y);
+        }
+
+        assert_eq!(d.clipboard_writes(), ["Alpha", "- [ ] Alpha"]);
+        assert!(status(&d).contains("Copied 11 chars"), "{:#?}", d.screen());
     }
 
     #[test]

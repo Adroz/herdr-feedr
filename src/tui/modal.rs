@@ -671,7 +671,11 @@ pub const UNSAVED_HINT: &str = "unsaved — Esc to discard, Ctrl+S to save";
 /// Never touches the filesystem — mirrors `input::translate`. `area` is the
 /// full terminal area (as drawn by `view::draw`); only `Modal::Edit`'s mouse
 /// handling needs it, to re-derive `edit_layout` for hit-testing.
-pub fn step(modal: Modal, ev: Event, area: Rect) -> ModalStep {
+///
+/// `clicks` is where a left press falls in a multi-click run (1, 2 or 3,
+/// from `selection::ClickTracker`, which needs a clock and so lives in
+/// `App`); it's ignored for every other event.
+pub fn step_with_clicks(modal: Modal, ev: Event, area: Rect, clicks: u8) -> ModalStep {
     // Ignore key releases (Windows terminals emit them).
     if let Event::Key(k) = &ev {
         if k.kind == KeyEventKind::Release {
@@ -687,7 +691,7 @@ pub fn step(modal: Modal, ev: Event, area: Rect) -> ModalStep {
     }
     match modal {
         Modal::None => ModalStep::Continue(Modal::None),
-        Modal::Edit(m) => edit_step(m, ev, area),
+        Modal::Edit(m) => edit_step(m, ev, area, clicks),
         Modal::ConfirmDelete(m) => match ev {
             Event::Key(k) if k.code == KeyCode::Char('y') => {
                 let key = m
@@ -709,7 +713,7 @@ pub fn step(modal: Modal, ev: Event, area: Rect) -> ModalStep {
                 ModalStep::Continue(Modal::None)
             }
             ev => {
-                v.handle(&ev);
+                v.handle(&ev, clicks);
                 ModalStep::Continue(Modal::DoneView(v))
             }
         },
@@ -719,11 +723,17 @@ pub fn step(modal: Modal, ev: Event, area: Rect) -> ModalStep {
             }
             Event::Key(k) if k.code == KeyCode::Char('e') => ModalStep::OpenEditor,
             ev => {
-                v.handle(&ev);
+                v.handle(&ev, clicks);
                 ModalStep::Continue(Modal::FileView(v))
             }
         },
     }
+}
+
+/// [`step_with_clicks`] for an event that isn't part of a multi-click run.
+#[cfg(test)]
+pub fn step(modal: Modal, ev: Event, area: Rect) -> ModalStep {
+    step_with_clicks(modal, ev, area, 1)
 }
 
 /// The read-only viewers' panel (Done archive, file view).
@@ -832,7 +842,7 @@ fn paste_text_focused(m: &mut EditModal, text: &str) {
     }
 }
 
-fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
+fn edit_step(mut m: EditModal, ev: Event, area: Rect, clicks: u8) -> ModalStep {
     if let Event::Paste(text) = &ev {
         paste_text_focused(&mut m, text);
         return ModalStep::Continue(Modal::Edit(m));
@@ -998,21 +1008,39 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
                     // A plain click replaces any selection. A click on the
                     // field's border focuses it but has no character to land
                     // on, so the cursor stays put.
-                    selection::press(&mut m.category, mev.column, mev.row);
+                    selection::press_n(
+                        &mut m.category,
+                        mev.column,
+                        mev.row,
+                        clicks,
+                        selection::Triple::Field,
+                    );
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Title) => {
                     m.focus = EditFocus::Title;
                     m.dropdown = None;
                     m.sync_blocks();
-                    selection::press(&mut m.title, mev.column, mev.row);
+                    selection::press_n(
+                        &mut m.title,
+                        mev.column,
+                        mev.row,
+                        clicks,
+                        selection::Triple::Field,
+                    );
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Body) => {
                     m.focus = EditFocus::Body;
                     m.dropdown = None;
                     m.sync_blocks();
-                    selection::press(&mut m.body, mev.column, mev.row);
+                    selection::press_n(
+                        &mut m.body,
+                        mev.column,
+                        mev.row,
+                        clicks,
+                        selection::Triple::Line,
+                    );
                     ModalStep::Continue(Modal::Edit(m))
                 }
                 Some(EditClickTarget::Save) => ModalStep::Save(m),

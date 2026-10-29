@@ -99,11 +99,19 @@ pub fn auto_dock_for_tab(
         })
         .with_context(|| format!("no pane found in tab {tab_id} to dock the sidebar beside"))?;
 
-    // `--no-focus`: this hook fires unattended on every new tab, so it must
-    // not yank focus away from wherever the user (or another agent) already
-    // is — unlike the user-initiated `dock()` path above.
-    let pane_id = open_split_dock(runner, cfg, &target_pane, true)?;
-    size_sidebar(runner, herdr, cfg, &pane_id);
+    // This hook fires unattended on every new tab, so it must not yank
+    // focus away from wherever the user (or another agent) already is (SPEC
+    // §3). `--no-focus` isn't enough: the swap-walk focuses the pane it
+    // swaps from and activates that pane's tab (herdr 0.9.3), so put focus
+    // back on the pane that held it before we started — success or not.
+    let previously_focused = focused_pane_id(&list);
+    let docked = open_split_dock(runner, cfg, &target_pane, true)
+        .inspect(|pane_id| size_sidebar(runner, herdr, cfg, pane_id));
+    if let Some(prev) = &previously_focused {
+        // Best-effort: a failed restore must not mask the dock's own result.
+        let _ = herdr.focus_pane(prev);
+    }
+    let pane_id = docked?;
     Ok(format!(
         "auto-docked sidebar pane {pane_id} in tab {tab_id}"
     ))
@@ -1015,6 +1023,60 @@ mod tests {
             "clamp resize missing: {:?}",
             runner.calls
         );
+    }
+
+    /// The hook fires unattended, and the swap-walk focuses (and activates
+    /// the tab of) whichever pane it swaps from. SPEC §3: the sidebar never
+    /// steals focus, so the user lands back on the pane they were in.
+    #[test]
+    fn auto_dock_ends_with_focus_back_on_the_originally_focused_pane() {
+        let list = r#"{"id":"x","result":{"panes":[
+            {"pane_id":"w2:p5","tab_id":"w2:t1","terminal_title_stripped":"vim","focused":true},
+            {"pane_id":"w1:p9","tab_id":"w1:t9","terminal_title_stripped":"zsh","focused":false}]}}"#;
+        let opened = r#"{"id":"y","result":{"pane_id":"w1:p10"}}"#;
+        let neighbor = r#"{"result":{"neighbor":{"neighbor_pane_id":"w1:p9","pane_id":"w1:p10"}}}"#;
+        let layout = r#"{"result":{"layout":{"tab_id":"w1:t9","area":{"width":332},"panes":[
+            {"pane_id":"w1:p10","rect":{"width":106}},
+            {"pane_id":"w1:p9","rect":{"width":226}}]}}}"#;
+        let mut runner = FakeRunner::new(vec![
+            Ok(list.into()),
+            Ok(opened.into()),
+            Ok(neighbor.into()),
+            Ok(String::new()),                   // swap: herdr focuses w1:p9
+            Err(anyhow::anyhow!("no neighbor")), // now at the edge
+            Ok(String::new()),                   // resize
+            Ok(layout.into()),
+        ]);
+        let mut herdr = FakeHerdr {
+            layout: Some(split("right", 0.32, pane("w1:p10"), pane("w1:p9"))),
+            ..FakeHerdr::default()
+        };
+        auto_dock_for_tab(&mut runner, &mut herdr, &cfg(Side::Left), "w1:t9").unwrap();
+        assert_eq!(
+            herdr.log.borrow().last().map(String::as_str),
+            Some("focus_pane w2:p5"),
+            "herdr calls: {:?}",
+            herdr.log.borrow()
+        );
+    }
+
+    /// Even when docking fails part-way, whatever herdr call moved focus
+    /// before the failure is undone.
+    #[test]
+    fn auto_dock_restores_focus_even_when_the_dock_fails() {
+        let list = r#"{"id":"x","result":{"panes":[
+            {"pane_id":"w2:p5","tab_id":"w2:t1","terminal_title_stripped":"vim","focused":true},
+            {"pane_id":"w1:p9","tab_id":"w1:t9","terminal_title_stripped":"zsh"}]}}"#;
+        let mut runner = FakeRunner::new(vec![
+            Ok(list.into()),
+            Err(anyhow::anyhow!("plugin herdr-feedr not found")),
+            Err(anyhow::anyhow!("split failed")),
+        ]);
+        let mut herdr = FakeHerdr::default();
+        let err =
+            auto_dock_for_tab(&mut runner, &mut herdr, &cfg(Side::Left), "w1:t9").unwrap_err();
+        assert!(err.to_string().contains("split failed"), "got: {err}");
+        assert_eq!(herdr.log.borrow().as_slice(), ["focus_pane w2:p5"]);
     }
 
     #[test]

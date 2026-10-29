@@ -435,6 +435,10 @@ impl App {
                 self.request_editor();
                 Modal::None
             }
+            ModalStep::Unsaved(m) => {
+                self.status_msg = Some(crate::tui::modal::UNSAVED_HINT.into());
+                Modal::Edit(m)
+            }
         };
         // `edit_step` stays pure — no process spawning there — so a
         // Ctrl+C/Ctrl+X only records the yanked text in

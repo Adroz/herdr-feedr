@@ -206,6 +206,11 @@ impl Driver {
             .collect()
     }
 
+    /// The foreground colour drawn at one cell of the last frame.
+    pub fn cell_fg(&self, x: u16, y: u16) -> ratatui::style::Color {
+        self.terminal.backend().buffer()[(x, y)].fg
+    }
+
     pub fn feed_path(&self) -> &Path {
         &self.app.feed_path
     }
@@ -473,6 +478,287 @@ mod tests {
             screen.iter().any(|l| l.contains("Alpha fixed")),
             "the typed edit stays in the open modal"
         );
+    }
+
+    // --- Today panel and modal toggle (#30) --------------------------------
+
+    const TODAY_FEED: &str = "\
+# Feed
+
+## Work
+
+- [ ] Fix auth @today
+- [ ] Bump Node
+
+## Later
+
+- [ ] Evaluate pnpm
+";
+
+    #[test]
+    fn today_items_sit_in_a_bordered_panel_above_the_list_not_in_their_section() {
+        let d = Driver::new(TODAY_FEED, 24, 14);
+        let screen = d.screen();
+        assert_eq!(
+            screen[..9],
+            [
+                "┌ Today ───────────────┐",
+                "│[ ] Fix auth          │",
+                "│    Work              │",
+                "└──────────────────────┘",
+                "",
+                "Work",
+                "[ ] Bump Node",
+                "Later",
+                "[ ] Evaluate pnpm",
+            ],
+            "{screen:#?}"
+        );
+        assert_eq!(
+            screen.iter().filter(|l| l.contains("Fix auth")).count(),
+            1,
+            "a Today item is listed once, in the panel"
+        );
+    }
+
+    #[test]
+    fn the_today_panel_is_hidden_once_nothing_is_in_today() {
+        let mut d = Driver::new(TODAY_FEED, 24, 14);
+        std::fs::write(d.feed_path(), TODAY_FEED.replace(" @today", "")).unwrap();
+        d.push(AppEvent::FeedChanged);
+
+        let screen = d.screen();
+        assert_eq!(screen[..3], ["Work", "[ ] Fix auth", "[ ] Bump Node"]);
+        assert!(!screen.iter().any(|l| l.contains("Today")));
+    }
+
+    #[test]
+    fn the_today_panel_outline_turns_red_when_a_hand_edit_overfills_it() {
+        let red = crate::tui::theme::RED;
+        let border_fg = |d: &Driver| d.cell_fg(0, 0);
+
+        let full = "# Feed\n\n- [ ] A @today\n- [ ] B @today\n- [ ] C @today\n- [ ] D\n";
+        let d = Driver::new(full, 24, 14);
+        assert_ne!(border_fg(&d), red, "three is full, not over");
+
+        let over = full.replace("- [ ] D", "- [ ] D @today");
+        let d = Driver::new(&over, 24, 14);
+        assert_eq!(border_fg(&d), red, "outline");
+        assert_eq!(d.cell_fg(3, 0), red, "the ` Today ` title too");
+        assert_eq!(d.screen()[0], "┌ Today ───────────────┐");
+    }
+
+    #[test]
+    fn an_uncategorized_today_item_names_its_zone_heading_as_home() {
+        let d = Driver::new("# Feed\n\n- [ ] Loose @today\n", 24, 14);
+        assert_eq!(d.screen()[2], "│    Feed              │");
+    }
+
+    #[test]
+    fn a_checkbox_click_in_the_today_panel_advances_the_item() {
+        let mut d = Driver::new(TODAY_FEED, 24, 14);
+        d.click(2, 1); // the state char of "│[ ] Fix auth"
+        assert!(
+            d.feed().contains("- [~] Fix auth @today\n"),
+            "got: {}",
+            d.feed()
+        );
+        assert_eq!(d.screen()[1], "│[~] Fix auth          │");
+    }
+
+    #[test]
+    fn completing_a_today_item_strips_it_and_drops_it_from_the_panel() {
+        let mut d = Driver::new(&TODAY_FEED.replace("[ ] Fix", "[~] Fix"), 24, 14);
+        d.click(2, 1);
+        assert!(d.feed().contains("- [x] Fix auth\n"), "got: {}", d.feed());
+        let screen = d.screen();
+        assert_eq!(screen[..2], ["Work", "[x] Fix auth"], "{screen:#?}");
+    }
+
+    #[test]
+    fn a_title_click_in_the_today_panel_opens_its_edit_modal() {
+        let mut d = Driver::new(TODAY_FEED, 40, 24);
+        d.click(8, 1);
+        let screen = d.screen();
+        assert!(
+            screen.iter().any(|l| l.contains("Edit item")),
+            "{screen:#?}"
+        );
+        assert!(
+            screen.iter().any(|l| l.contains("│Fix auth")),
+            "{screen:#?}"
+        );
+    }
+
+    #[test]
+    fn an_agent_click_in_the_today_panel_resumes_its_session() {
+        let feed = "# Feed\n\n## Work\n\n- [~] Fix auth @agent(claude:abc) @today\n";
+        let mut d = Driver::new(feed, 24, 14);
+        assert_eq!(d.screen()[3], "│  @claude             │");
+        d.click(4, 3);
+        assert!(
+            d.herdr_calls().iter().any(|c| c.contains("abc")),
+            "{:?}",
+            d.herdr_calls()
+        );
+    }
+
+    fn ctrl(d: &mut Driver, c: char) {
+        d.key(KeyCode::Char(c), KeyModifiers::CONTROL);
+    }
+
+    /// The edit modal's top border row.
+    fn modal_top(d: &Driver) -> String {
+        d.screen()
+            .into_iter()
+            .find(|l| l.contains("Edit item"))
+            .expect("the edit modal is open")
+    }
+
+    #[test]
+    fn ctrl_t_marks_an_item_today_and_save_writes_the_token() {
+        let mut d = Driver::new(TODAY_FEED, 40, 24);
+        d.click(6, 6); // "[ ] Bump Node", under the panel and its gap row
+        assert!(
+            modal_top(&d).contains("Edit item ── ☆ Today"),
+            "{}",
+            modal_top(&d)
+        );
+        assert!(d.screen().iter().any(|l| l.contains("^T today")));
+
+        ctrl(&mut d, 't');
+        assert!(modal_top(&d).contains("★ Today"), "{}", modal_top(&d));
+        save(&mut d);
+
+        assert!(
+            d.feed().contains("- [ ] Bump Node @today\n"),
+            "got: {}",
+            d.feed()
+        );
+        assert!(d.screen()[3].contains("[ ] Bump Node"), "{:#?}", d.screen());
+    }
+
+    #[test]
+    fn ctrl_t_on_a_today_item_unmarks_it_and_save_strips_the_token() {
+        let mut d = Driver::new(TODAY_FEED, 40, 24);
+        d.click(8, 1); // "Fix auth" in the panel
+        assert!(modal_top(&d).contains("★ Today"), "{}", modal_top(&d));
+
+        ctrl(&mut d, 't');
+        assert!(modal_top(&d).contains("☆ Today"), "{}", modal_top(&d));
+        save(&mut d);
+
+        assert!(d.feed().contains("- [ ] Fix auth\n"), "got: {}", d.feed());
+        assert!(!d.screen().iter().any(|l| l.contains("Today")));
+    }
+
+    const FULL_TODAY: &str = "# Feed\n\n- [ ] A @today\n- [ ] B @today\n- [?] C @today\n- [ ] D\n";
+
+    #[test]
+    fn a_fourth_today_mark_is_refused_with_a_status_message() {
+        let mut d = Driver::new(FULL_TODAY, 40, 24);
+        d.click(6, 9); // "[ ] D", under the 8-row panel and its gap row
+        let screen = d.screen();
+        assert!(screen.iter().any(|l| l.contains("│D")), "{screen:#?}");
+
+        ctrl(&mut d, 't');
+        assert!(modal_top(&d).contains("☆ Today"), "the toggle stays unset");
+        assert!(
+            d.screen()
+                .last()
+                .unwrap()
+                .contains("Today full — unmark one first"),
+            "{:#?}",
+            d.screen()
+        );
+        save(&mut d);
+        assert_eq!(d.feed(), FULL_TODAY, "nothing to write");
+    }
+
+    #[test]
+    fn a_today_mark_refused_at_save_keeps_the_modal_and_writes_nothing() {
+        let feed = "# Feed\n\n- [ ] A @today\n- [ ] B @today\n- [ ] D\n- [ ] E\n";
+        let mut d = Driver::new(feed, 40, 24);
+        d.click(6, 7); // "[ ] D"
+        ctrl(&mut d, 't');
+
+        // Meanwhile a hand edit fills Today.
+        let filled = feed.replace("- [ ] E", "- [ ] E @today");
+        std::fs::write(d.feed_path(), &filled).unwrap();
+        d.push(AppEvent::FeedChanged);
+        save(&mut d);
+
+        assert_eq!(d.feed(), filled, "nothing written");
+        assert!(modal_top(&d).contains("☆ Today"), "{}", modal_top(&d));
+        assert!(d
+            .screen()
+            .last()
+            .unwrap()
+            .contains("Today full — unmark one first"));
+    }
+
+    #[test]
+    fn a_today_toggle_alone_makes_the_modal_dirty() {
+        let mut d = Driver::new(TODAY_FEED, 40, 24);
+        d.click(6, 6); // "[ ] Bump Node"
+        ctrl(&mut d, 't');
+
+        d.click(0, 0); // outside the modal panel
+        assert!(
+            modal_top(&d).contains("★ Today"),
+            "a dirty modal stays open"
+        );
+        assert!(
+            d.screen().last().unwrap().starts_with("unsaved"),
+            "{:#?}",
+            d.screen()
+        );
+
+        ctrl(&mut d, 't'); // toggled back: clean again
+        d.click(0, 0);
+        assert!(!d.screen().iter().any(|l| l.contains("Edit item")));
+    }
+
+    #[test]
+    fn a_save_after_an_agent_claims_the_item_still_applies_the_today_toggle() {
+        let mut d = Driver::new(TODAY_FEED, 40, 24);
+        d.click(6, 6); // "[ ] Bump Node"
+        ctrl(&mut d, 't');
+
+        let claimed = TODAY_FEED.replace("- [ ] Bump Node", "- [~] Bump Node @agent(claude:abc)");
+        std::fs::write(d.feed_path(), claimed).unwrap();
+        d.push(AppEvent::FeedChanged);
+        save(&mut d);
+
+        assert!(
+            d.feed()
+                .contains("- [~] Bump Node @agent(claude:abc) @today\n"),
+            "got: {}",
+            d.feed()
+        );
+    }
+
+    /// The panel at the narrowest and widest sidebar widths, with a claimed
+    /// item and a long title.
+    #[test]
+    fn the_today_panel_at_the_sidebar_width_extremes() {
+        let feed = "\
+# Feed
+
+## Work
+
+- [ ] Fix the auth redirect loop on expired sessions @today
+- [~] Migrate CI to GitHub Actions @agent(claude:abc) @today
+- [ ] Bump Node
+
+## Agent
+
+- [?] Add retry to flaky deploy test @agent(claude:def) @today
+";
+        for w in [20, 46] {
+            let d = Driver::new(feed, w, 18);
+            insta::assert_snapshot!(format!("today_panel_{w}"), d.screen().join("\n"));
+        }
     }
 
     #[test]

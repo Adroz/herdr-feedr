@@ -443,10 +443,6 @@ pub fn today_count(doc: &Document) -> usize {
 /// Put an item in Today. It stays in its home section; only the `@today`
 /// token is added. Refused when Today already holds [`TODAY_CAP`] items;
 /// an item already in Today is left as is.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the edit modal (#30) is the only caller")
-)]
 pub fn set_today(doc: &mut Document, index: usize) -> Result<(), OpError> {
     debug_assert!(matches!(doc.nodes[index], Node::Item(_)));
     if matches!(&doc.nodes[index], Node::Item(it) if it.today) {
@@ -462,10 +458,6 @@ pub fn set_today(doc: &mut Document, index: usize) -> Result<(), OpError> {
 }
 
 /// Take an item out of Today.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the edit modal (#30) is the only caller")
-)]
 pub fn clear_today(doc: &mut Document, index: usize) {
     debug_assert!(matches!(doc.nodes[index], Node::Item(_)));
     if let Node::Item(it) = &mut doc.nodes[index] {
@@ -489,8 +481,9 @@ pub fn item_section(doc: &Document, index: usize) -> Option<String> {
     current
 }
 
-/// Section name an item sits under, for mirroring in the Done archive.
-fn section_name(doc: &Document, index: usize) -> String {
+/// Section name an item sits under: its `##` heading, else its `#` zone
+/// heading. Mirrored in the Done archive and shown as a Today item's home.
+pub fn section_name(doc: &Document, index: usize) -> String {
     let mut name = "Feed".to_string();
     for node in &doc.nodes[..index] {
         match node {

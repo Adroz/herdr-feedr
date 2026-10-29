@@ -1,0 +1,22 @@
+---
+source: src/tui/driver.rs
+expression: "d.screen().join(\"\\n\")"
+---
+┌ Today ───────────┐
+│[ ] Fix the auth …│
+│    Work          │
+│[~] Migrate CI to…│
+│    Work          │
+│  @claude         │
+│[?] Add retry to …│
+│    Agent         │
+│  @claude         │
+└──────────────────┘
+
+Work
+[ ] Bump Node
++ add
+
+Done (0)
+clear completed
+                   «

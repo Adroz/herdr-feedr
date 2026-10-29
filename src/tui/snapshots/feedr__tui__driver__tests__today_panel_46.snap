@@ -1,0 +1,22 @@
+---
+source: src/tui/driver.rs
+expression: "d.screen().join(\"\\n\")"
+---
+┌ Today ─────────────────────────────────────┐
+│[ ] Fix the auth redirect loop on expired s…│
+│    Work                                    │
+│[~] Migrate CI to GitHub Actions            │
+│    Work                                    │
+│  @claude                                   │
+│[?] Add retry to flaky deploy test          │
+│    Agent                                   │
+│  @claude                                   │
+└────────────────────────────────────────────┘
+
+Work
+[ ] Bump Node
++ add
+
+Done (0)
+clear completed
+                                             «

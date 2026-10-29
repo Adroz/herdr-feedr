@@ -1,6 +1,8 @@
 pub mod app;
 pub mod auto_close;
 pub mod clipboard;
+#[cfg(test)]
+mod clipboard_e2e;
 pub mod clock;
 pub mod dock;
 #[cfg(test)]
@@ -9,6 +11,8 @@ pub mod driver;
 pub mod fake_socket;
 pub mod input;
 pub mod modal;
+#[cfg(test)]
+mod reload_tests;
 pub mod selection;
 pub mod socket;
 #[cfg(test)]

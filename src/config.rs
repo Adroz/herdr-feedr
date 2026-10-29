@@ -72,10 +72,28 @@ pub fn load_sidebar_config(config_dir: &std::path::Path) -> SidebarConfig {
             Side::Left
         }
     };
+    // `width` is a share of the tab and `max_width` a column cap: values
+    // that can't be docked to warn and fall back, like a bad `side`.
+    let width = match s.width {
+        None => 0.18,
+        Some(w) if w > 0.0 && w <= 1.0 => w,
+        Some(w) => {
+            eprintln!("feedr: warning: sidebar.width {w} is not in (0, 1]; using 0.18");
+            0.18
+        }
+    };
+    let max_width = match s.max_width {
+        None => 46,
+        Some(0) => {
+            eprintln!("feedr: warning: sidebar.max_width 0 is not a width; using 46");
+            46
+        }
+        Some(m) => m,
+    };
     SidebarConfig {
         side,
-        width: s.width.unwrap_or(0.18),
-        max_width: s.max_width.unwrap_or(46),
+        width,
+        max_width,
         auto_dock: s.auto_dock.unwrap_or(false),
         auto_close: s.auto_close.unwrap_or(true),
         quit_herdr_when_last: s.quit_herdr_when_last.unwrap_or(true),
@@ -208,5 +226,42 @@ mod tests {
             resolve_feed_path(None, None, dir.path()),
             PathBuf::from("/tmp/f.md")
         );
+    }
+
+    fn sidebar_from(toml: &str) -> SidebarConfig {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), toml).unwrap();
+        load_sidebar_config(dir.path())
+    }
+
+    #[test]
+    fn a_malformed_config_file_falls_back_to_every_default() {
+        let c = sidebar_from("[sidebar\nside = \"right\"\n");
+        assert_eq!(c, sidebar_from(""));
+        assert_eq!(c.side, Side::Left);
+    }
+
+    #[test]
+    fn a_width_outside_zero_to_one_falls_back_to_the_default() {
+        // `width` is a share of the tab: 0, negative, above 1 or NaN cannot
+        // be docked to.
+        for bad in ["0", "0.0", "-0.2", "1.5", "nan"] {
+            let c = sidebar_from(&format!("[sidebar]\nwidth = {bad}\n"));
+            assert_eq!(c.width, 0.18, "width = {bad}");
+        }
+        assert_eq!(sidebar_from("[sidebar]\nwidth = 1.0\n").width, 1.0);
+        assert_eq!(sidebar_from("[sidebar]\nwidth = 0.3\n").width, 0.3);
+    }
+
+    #[test]
+    fn a_zero_max_width_falls_back_to_the_default() {
+        assert_eq!(sidebar_from("[sidebar]\nmax_width = 0\n").max_width, 46);
+        assert_eq!(sidebar_from("[sidebar]\nmax_width = 1\n").max_width, 1);
+    }
+
+    #[test]
+    fn a_negative_max_width_is_a_type_error_so_the_file_is_ignored() {
+        let c = sidebar_from("[sidebar]\nside = \"right\"\nmax_width = -5\n");
+        assert_eq!((c.side, c.max_width), (Side::Left, 46));
     }
 }

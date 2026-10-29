@@ -1,0 +1,24 @@
+---
+source: src/tui/driver.rs
+expression: "d.screen().join(\"\\n\")"
+---
+[ ] Uncategorised chore
+Work
+[ ] Fix the auth redirect loop on expir…
+[~] Migrate CI to GitHub Actions
+  @claude
+[?] Pick a retry budget
+  @codex
+Home
+[x] Book the plumber
++ add
+
+
+
+
+
+
+
+Done (1)
+clear completed
+                                       «

@@ -58,6 +58,8 @@ pub struct Item {
     pub state: State,
     pub title: String,
     pub agent: Option<AgentRef>,
+    /// Carries the trailing `@today` token: part of the human's Today.
+    pub today: bool,
     /// Set on swept items: YYYY-MM-DD.
     pub done_date: Option<String>,
     /// Body lines without their two-space indent.
@@ -84,11 +86,16 @@ pub struct ItemStyle {
 
 impl Item {
     /// Change state. A real change drops the hand-typed checkbox so the
-    /// canonical one is written; setting the same state keeps it.
+    /// canonical one is written; setting the same state keeps it. Completing
+    /// leaves Today: every path to `[x]` comes through here, so the file
+    /// keeps no trace of past focus.
     pub fn set_state(&mut self, state: State) {
         if state != self.state {
             self.state = state;
             self.style.mark = None;
+            if state == State::Done {
+                self.today = false;
+            }
         }
     }
 

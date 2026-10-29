@@ -865,6 +865,23 @@ mod tests {
     }
 
     #[test]
+    fn a_checkbox_click_to_done_and_an_accept_both_strip_today() {
+        let (mut app, _fake, _dir) = app_on_disk(
+            "# Feed\n\n- [~] Beta @today\n- [?] Gamma @agent(claude:1) @today\n- [ ] Keep @today\n",
+        );
+        for (title, from) in [("Beta", State::InProgress), ("Gamma", State::Review)] {
+            app.apply(Action::Advance(ItemKey {
+                title: title.into(),
+                state: from,
+            }));
+        }
+        assert_eq!(
+            feed_text(&app),
+            "# Feed\n\n- [x] Beta\n- [x] Gamma @agent(claude:1)\n- [ ] Keep @today\n"
+        );
+    }
+
+    #[test]
     fn advance_never_produces_review_state() {
         // No transition targets [?] — that's the agent's signal (spec §3).
         let (mut app, _fake, _dir) = app_on_disk("- [ ] A\n");

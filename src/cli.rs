@@ -204,6 +204,14 @@ fn agent_suffix(agent: Option<&AgentRef>, live: &HashSet<String>) -> String {
     }
 }
 
+/// One item as `list` and `show` print it: state, title, agent suffix, and
+/// the Today flag — the human's focus, which agents are told to prefer.
+fn item_line(it: &crate::feed::Item, live: &HashSet<String>) -> String {
+    let agent = agent_suffix(it.agent.as_ref(), live);
+    let today = if it.today { "  ★ Today" } else { "" };
+    format!("[{}] {}{agent}{today}", it.state.to_char(), it.title)
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let path = config::resolve_feed_path(
@@ -285,8 +293,7 @@ pub fn run() -> Result<()> {
                         println!("{text}:");
                     }
                     Node::Item(it) if ops::zone_of(&doc, i) != Zone::Archive => {
-                        let agent = agent_suffix(it.agent.as_ref(), &live);
-                        println!("[{}] {}{agent}", it.state.to_char(), it.title);
+                        println!("{}", item_line(it, &live));
                     }
                     _ => {}
                 }
@@ -297,8 +304,7 @@ pub fn run() -> Result<()> {
             let live = live_sessions(&identity::SystemEnv, &mut herdr);
             let i = ops::find(&doc, &item)?;
             if let Node::Item(it) = &doc.nodes[i] {
-                let agent = agent_suffix(it.agent.as_ref(), &live);
-                println!("[{}] {}{agent}", it.state.to_char(), it.title);
+                println!("{}", item_line(it, &live));
                 for b in &it.body {
                     println!("  {b}");
                 }

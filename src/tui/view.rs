@@ -558,6 +558,7 @@ mod tests {
             state: State::Open,
             title: "T".into(),
             agent: None,
+            today: false,
             style: Default::default(),
             done_date: None,
             body: vec![
@@ -1049,6 +1050,7 @@ mod tests {
             state: State::Open,
             title: "T".into(),
             agent: None,
+            today: false,
             style: Default::default(),
             done_date: None,
             body,
@@ -1089,6 +1091,7 @@ mod tests {
             state: State::Open,
             title: "A title long enough to overflow a narrow docked pane".into(),
             agent: None,
+            today: false,
             style: Default::default(),
             done_date: None,
             body: Vec::new(),

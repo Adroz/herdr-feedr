@@ -57,9 +57,9 @@ Sweeping clears completed items from the active list while keeping history:
 
 ## 3. The sidebar ([#2](https://github.com/Adroz/herdr-feedr/issues/2), [#6](https://github.com/Adroz/herdr-feedr/issues/6))
 
-A ratatui TUI in a herdr plugin pane, docked with the herdr-beads pattern: open as `split`, swap-walk to the left edge, resize narrow (capped at a configurable max_width, default 46 columns). Herdr plugin v1 has no native dock, so:
+A ratatui TUI in a herdr plugin pane, docked with the herdr-beads pattern: open as `split` beside the focused pane, move it to the `[sidebar] side` edge (`left` by default, or `right`), and resize it to `width` (a share of the tab, default 0.18) capped at `max_width` (default 46 columns). Herdr plugin v1 has no native dock, so:
 
-- The pane is **per-tab** (leftmost within the tab's pane grid; herdr's own sidebar is app chrome and can sit further left).
+- The pane is **per-tab** (at the configured edge of the tab's pane grid; herdr's own sidebar is app chrome and can sit further out).
 - `auto_dock = false` by default; `true` docks the sidebar on every `tab.created`.
 - The launcher is idempotent (reopen ≡ focus), which also recovers the pane after a herdr server restart (plugin panes revive as plain shells).
 
@@ -87,11 +87,11 @@ Interactions:
 
 Additions ([#22](https://github.com/Adroz/herdr-feedr/issues/22)):
 
-- **Today panel**: a bordered ` Today ` block pinned above the list, no count; each item is a checkbox + title row with its category on an indented muted sub-line. Today items appear only there, in file order. Hidden when empty; outline turns red when over cap (hand edit). The edit modal shows `☆/★ Today` in its top border, toggled by Ctrl+T; a fourth mark is refused with "Today full — unmark one first".
+- **Today panel**: a bordered ` Today ` block fixed above the list, no count; each item is a checkbox + title row with its category on an indented muted sub-line. Today items appear only there, in file order. Hidden when empty; outline turns red when over cap (hand edit). The edit modal shows `☆/★ Today` in its top border, toggled by Ctrl+T; a fourth mark is refused with "Today full — unmark one first".
 - **Outside click**: closes read-only modals; closes a clean edit modal like Esc; a dirty edit modal stays open with "unsaved — Esc to discard, Ctrl+S to save"; an open dropdown closes first; ConfirmDelete cancels. The click never falls through to the list.
 - **Copy**: feedr owns copy-on-select in edit fields and the read-only viewers (not the list). Mouse-up after a drag copies; double-click selects a word (herdr's rules) and triple-click a logical line, both copying immediately; Ctrl+C still works. Writes OSC 52, then pbcopy/wl-copy/xclip; status "Copied N chars". Cmd+C is not available (macOS terminals swallow it); herdr copy mode (`prefix+[`) is the fallback.
 - **Paste**: bracketed paste; newlines become spaces in Title/Category, kept in Body.
-- **Auto-close**: when the sidebar is the only pane left in its tab (other feedr sidebars/popups don't count as company), it exits, closing the tab and, if last, the workspace. If it was the last pane anywhere in herdr it calls `server.stop` so herdr quits. Armed only after company is seen; ~400 ms debounce plus a `pane.list` re-check; never closes on a failed query. `[sidebar] auto_close` and `quit_herdr_when_last` (both default true) opt out.
+- **Auto-close**: when the sidebar is the only pane left in its tab (other feedr sidebars/popups don't count as company), it exits, closing the tab and, if last, the workspace. If it was the last pane anywhere in herdr it calls `server.stop` so herdr quits. Armed only after company is seen; ~400 ms debounce plus a `pane.list` re-check; never closes on a failed query, and a pane it can't identify because the query failed never arms it. Feedr panes are recognised by their terminal title `feedr-sidebar` (which the sidebar sets on itself), because herdr 0.9.3's `pane.list` carries no plugin identity and no zoom flag; zoomed panes and overlays are listed like any other pane, so they count as company. `[sidebar] auto_close` and `quit_herdr_when_last` (both default true) opt out.
 - Auto-dock restores the user's focus after placing a sidebar.
 
 ## 4. The `feedr` CLI ([#8](https://github.com/Adroz/herdr-feedr/issues/8))
@@ -133,7 +133,7 @@ You and agents edit the same file at the same time; that's the point. How nothin
 
 - Every sidebar action and every CLI command **reads the file fresh, applies its one change, and writes the whole file back atomically** (temp file + rename — the file on disk is never half-written). Interleaved small edits — you ticking a box while an agent claims an item — all land.
 - The sidebar re-reads on every file change, so it always shows current state.
-- Every read-modify-write holds an advisory `flock` on a sibling `feed.md.lock`, so concurrent CLI and sidebar writers never lose an update. Reads (`list`, `show`, the sidebar's redraw) don't lock. A writer that can't get the lock within 5 s (`FEEDR_LOCK_TIMEOUT_MS` overrides) fails with an error naming the lock file — the CLI exits non-zero, the sidebar drops the action and says so — rather than hanging.
+- Every read-modify-write holds an advisory `flock` on a sibling `feed.md.lock`, so concurrent CLI and sidebar writers never lose an update. Reads (`list`, `show`, the sidebar's redraw) don't lock. A writer that can't get the lock in time fails with an error naming the lock file rather than hanging: the CLI waits up to 5 s (`FEEDR_LOCK_TIMEOUT_MS` overrides, for the CLI only) and exits non-zero; the sidebar, which can't redraw while it waits, waits only 250 ms, drops the action and says the feed is busy.
 - The one loseable case: a whole-file `$EDITOR` session held open while something else writes — the editor's save wins over anything written since the buffer opened. Accepted for v1; keep editor sessions short. Everyday edits go through the safe path.
 
 ## 7. Agent status plumbing ([#3](https://github.com/Adroz/herdr-feedr/issues/3))

@@ -184,10 +184,11 @@ pub struct App {
     /// guess), so a pane driven to herdr's minimum over several iterations
     /// still returns to its original width.
     collapse_resize_steps: usize,
-    /// System-clipboard sink for the edit modal's Ctrl+C/Ctrl+X
-    /// (`handle_modal_event` drains `EditModal::pending_clipboard` through
-    /// this after every `modal::step`). Injected so tests record writes
-    /// instead of spawning a real `pbcopy`/`xclip`/`wl-copy`. Defaults to
+    /// System-clipboard sink for the edit modal's copies (drag release,
+    /// Ctrl+C, Ctrl+X; `handle_modal_event` drains
+    /// `EditModal::pending_clipboard` through this after every `modal::step`).
+    /// Injected so tests record writes instead of emitting OSC 52 and
+    /// spawning a real `pbcopy`/`xclip`/`wl-copy`. Defaults to
     /// `clipboard::SystemClipboard`.
     pub clipboard: Box<dyn ClipboardSink>,
     /// Wall and monotonic time; injected so tests can drive time by hand.
@@ -220,7 +221,7 @@ impl App {
                 .ok()
                 .filter(|p| !p.is_empty()),
             collapse_resize_steps: 0,
-            clipboard: Box::new(SystemClipboard),
+            clipboard: Box::new(SystemClipboard::new()),
             clock: Box::new(SystemClock),
             herdr_cli: Box::new(HerdrCli::from_env()),
             lock_timeout: lock::timeout_from_env(),

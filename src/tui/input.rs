@@ -1,5 +1,7 @@
 use crate::tui::app::{Action, App, Row};
+use crate::tui::view::{list_layout, ListLayout};
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
+use ratatui::layout::Rect;
 
 /// Pure event → action mapping. `size` is the terminal (width, height);
 /// geometry must mirror view::draw: list at y=0..=h-4, Done(n) at h-3,
@@ -57,26 +59,45 @@ fn click(app: &App, x: u16, y: u16, w: u16, h: u16) -> Option<Action> {
         return Some(Action::OpenDoneView);
     }
     if h >= 4 && y <= h - 4 {
-        let idx = app.scroll + y as usize;
-        return match app.rows.get(idx)? {
-            Row::Section(t) => Some(Action::OpenCreateIn(t.clone())),
-            // Row is "[<char>] title" (round-2 item 2): checkbox zone is
-            // x 0..=2 (the bracket pair + state char), title starts at x 4;
-            // x==3 (the space after "]") is a dead zone between them.
-            Row::Item { key, .. } => {
-                if x <= 2 {
-                    Some(Action::Advance(key.clone()))
-                } else if x >= 4 {
-                    Some(Action::OpenEdit(key.clone()))
-                } else {
-                    None
-                }
+        let region = Rect::new(0, 0, w, h - 3);
+        let ListLayout { today, list } = list_layout(region, app.today_rows.len());
+        if y < today.y + today.height {
+            // Inside the panel's border: rows are inset one cell each way.
+            if y == today.y || y + 1 == today.y + today.height || x == 0 || x + 1 >= w {
+                return None;
             }
-            Row::AgentLine { key, .. } => Some(Action::AgentClick(key.clone())),
-            Row::Add => Some(Action::OpenCreate),
-        };
+            let row = app.today_rows.get((y - today.y - 1) as usize)?;
+            return row_click(row, x - 1);
+        }
+        if y < list.y {
+            return None; // the blank row under the panel
+        }
+        let idx = app.scroll + (y - list.y) as usize;
+        return row_click(app.rows.get(idx)?, x);
     }
     None
+}
+
+/// A click at column `x` of a row (relative to the row's own left edge).
+fn row_click(row: &Row, x: u16) -> Option<Action> {
+    match row {
+        Row::Section(t) => Some(Action::OpenCreateIn(t.clone())),
+        // Row is "[<char>] title" (round-2 item 2): checkbox zone is
+        // x 0..=2 (the bracket pair + state char), title starts at x 4;
+        // x==3 (the space after "]") is a dead zone between them.
+        Row::Item { key, .. } => {
+            if x <= 2 {
+                Some(Action::Advance(key.clone()))
+            } else if x >= 4 {
+                Some(Action::OpenEdit(key.clone()))
+            } else {
+                None
+            }
+        }
+        Row::AgentLine { key, .. } => Some(Action::AgentClick(key.clone())),
+        Row::Category(_) => None,
+        Row::Add => Some(Action::OpenCreate),
+    }
 }
 
 #[cfg(test)]

@@ -485,9 +485,10 @@ impl App {
         // never a crash or a dropped edit.
         if let Modal::Edit(m) = &mut self.modal {
             if let Some(text) = m.pending_clipboard.take() {
-                if let Err(e) = self.clipboard.copy(&text) {
-                    self.status_msg = Some(format!("clipboard: {e}"));
-                }
+                self.status_msg = Some(match self.clipboard.copy(&text) {
+                    Ok(()) => copied_status(&text),
+                    Err(e) => format!("clipboard: {e}"),
+                });
             }
         }
         // Round-2 item 4: the modal fully closed this step (Save/Cancel/Esc/
@@ -685,6 +686,15 @@ impl App {
             crate::tui::AppEvent::Layout { .. } => {}
             crate::tui::AppEvent::SocketDown => self.statuses.clear(),
         }
+    }
+}
+
+/// The status line after a successful copy: "Copied N chars", counting
+/// characters (not bytes), so the number matches what was selected.
+fn copied_status(text: &str) -> String {
+    match text.chars().count() {
+        1 => "Copied 1 char".into(),
+        n => format!("Copied {n} chars"),
     }
 }
 
@@ -1207,7 +1217,7 @@ mod tests {
     // `edit_step` (modal.rs) stays pure — it only records the yanked text in
     // `EditModal::pending_clipboard` on Ctrl+C/Ctrl+X. These tests cover the
     // drain wiring in `handle_modal_event` (pending_clipboard -> the
-    // injected `clipboard` sink -> status_msg on failure), NOT the real
+    // injected `clipboard` sink -> status_msg), NOT the real
     // `clipboard::copy` spawn (that would shell out to a real `pbcopy` and
     // touch the developer's actual clipboard on every `cargo test` run —
     // `clipboard::choose_command`'s own unit tests in clipboard.rs cover the
@@ -1249,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_step_leaves_status_untouched_when_the_sink_succeeds() {
+    fn copy_step_reports_the_char_count_when_the_sink_succeeds() {
         let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n");
         app.clipboard = Box::new(crate::tui::clipboard::FakeClipboard::default());
         app.apply(Action::OpenCreate);
@@ -1259,7 +1269,7 @@ mod tests {
         press_shift(&mut app, KeyCode::Left);
         press_shift(&mut app, KeyCode::Left);
         press_ctrl(&mut app, 'c');
-        assert_eq!(app.status_msg, None);
+        assert_eq!(app.status_msg.as_deref(), Some("Copied 2 chars"));
     }
 
     #[test]

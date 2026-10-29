@@ -756,19 +756,13 @@ fn focused_textarea_mut(m: &mut EditModal) -> Option<&mut TextArea<'static>> {
     }
 }
 
-/// Ctrl+C: copy the focused field's selection into tui-textarea's own yank
-/// buffer (`TextArea::copy`, native — a no-op without a selection) and
-/// report the yanked text so the caller can also push it to the SYSTEM
-/// clipboard via `EditModal::pending_clipboard`. Returns `None` — leaving
-/// `pending_clipboard` untouched — when there's nothing to copy: no field
-/// focused, or no active (non-empty) selection. Gated on `selection_range()`
-/// rather than `is_selecting()` so a degenerate zero-length selection
-/// (cursor back at its anchor) doesn't falsely report a copy.
+/// Ctrl+C and drag release: copy the focused field's selection into its yank
+/// buffer, keeping the highlight (`selection::copy`), and report the text so
+/// the caller can also push it to the SYSTEM clipboard via
+/// `EditModal::pending_clipboard`. `None` when there's nothing to copy: no
+/// field focused, or no non-empty selection (a zero-length one included).
 fn copy_focused(m: &mut EditModal) -> Option<String> {
-    let ta = focused_textarea_mut(m)?;
-    let had_selection = ta.selection_range().is_some();
-    ta.copy();
-    had_selection.then(|| ta.yank_text())
+    selection::copy(focused_textarea_mut(m)?)
 }
 
 /// Ctrl+X: same gating as `copy_focused`, via `TextArea::cut` (native —
@@ -861,7 +855,7 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
             {
                 return ModalStep::Continue(Modal::ConfirmDelete(m));
             }
-            // Ctrl+C/Ctrl+X: native `TextArea::copy`/`cut` do the in-memory
+            // Ctrl+C/Ctrl+X: `selection::copy` / native `TextArea::cut` do the in-memory
             // work (selection → yank buffer); we additionally stash the
             // yanked text in `pending_clipboard` so `App::handle_modal_event`
             // can push it to the SYSTEM clipboard (`edit_step` stays pure —
@@ -950,6 +944,11 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
     }
     if let Event::Mouse(mev) = &ev {
         if mev.kind == MouseEventKind::Down(MouseButton::Left) {
+            // Any click drops every field's highlight, including one left
+            // standing by a copy in a field the click moves focus away from.
+            for ta in [&mut m.category, &mut m.title, &mut m.body] {
+                ta.cancel_selection();
+            }
             let is_edit = m.original.is_some();
             let layout = edit_layout(area, is_edit, m.claimed, m.dropdown_rows());
             return match edit_click(&layout, is_edit, mev.column, mev.row) {
@@ -999,6 +998,15 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
         if mev.kind == MouseEventKind::Drag(MouseButton::Left) {
             if let Some(ta) = focused_textarea_mut(&mut m) {
                 selection::drag_to(ta, mev.column, mev.row);
+            }
+            return ModalStep::Continue(Modal::Edit(m));
+        }
+        // Copy-on-select: releasing a drag copies what it selected. A plain
+        // click's release has nothing selected (the press cleared it), so it
+        // copies nothing. The highlight stays until the next click or key.
+        if mev.kind == MouseEventKind::Up(MouseButton::Left) {
+            if let Some(text) = copy_focused(&mut m) {
+                m.pending_clipboard = Some(text);
             }
             return ModalStep::Continue(Modal::Edit(m));
         }

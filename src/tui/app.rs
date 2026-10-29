@@ -63,18 +63,32 @@ pub fn relocate(doc: &Document, key: &ItemKey) -> Option<usize> {
 /// may have moved on since (an agent claimed it, a human ticked it), and
 /// the typed edit must still land — so after an exact title+state miss,
 /// fall back to a unique active item with the same title, whatever its
-/// state. Still never guesses between two same-titled items.
-pub fn relocate_for_edit(doc: &Document, key: &ItemKey) -> Option<usize> {
-    relocate(doc, key).or_else(|| {
-        let mut hits = doc.nodes.iter().enumerate().filter(|(i, n)| {
-            matches!(n, Node::Item(it) if it.title == key.title)
-                && ops::zone_of(doc, *i) != Zone::Archive
-        });
-        match (hits.next(), hits.next()) {
-            (Some((i, _)), None) => Some(i),
-            _ => None,
-        }
-    })
+/// state. With no active match at all, the item may have been completed and
+/// swept meanwhile: fall back to a unique archived item of that title
+/// stamped `@done(today)` — an older same-titled entry is a past item, not
+/// this one. Still never guesses between two same-titled items.
+pub fn relocate_for_edit(doc: &Document, key: &ItemKey, today: &str) -> Option<usize> {
+    if let Some(i) = relocate(doc, key) {
+        return Some(i);
+    }
+    let (active, archived): (Vec<usize>, Vec<usize>) = doc
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| matches!(n, Node::Item(it) if it.title == key.title))
+        .map(|(i, _)| i)
+        .partition(|&i| ops::zone_of(doc, i) != Zone::Archive);
+    let swept_today: Vec<usize> = archived
+        .into_iter()
+        .filter(
+            |&i| matches!(&doc.nodes[i], Node::Item(it) if it.done_date.as_deref() == Some(today)),
+        )
+        .collect();
+    // Two active hits are ambiguous, not a reason to reach into the archive.
+    match (active.as_slice(), swept_today.as_slice()) {
+        ([i], _) | ([], [i]) => Some(*i),
+        _ => None,
+    }
 }
 
 /// One display row of the sidebar list.
@@ -92,12 +106,6 @@ pub enum Row {
     /// A Today item's home section, on the muted sub-line under its title.
     Category(String),
     Add,
-}
-
-/// Whether an item holds a Today slot (and so shows in the Today panel).
-/// A hand-typed `[x] … @today` doesn't: Today is uncompleted items only.
-fn in_today(it: &Item) -> bool {
-    it.today && it.state != State::Done
 }
 
 /// An item's title row, plus its `@agent` sub-line when claimed.
@@ -122,7 +130,7 @@ pub fn build_today_rows(doc: &Document) -> Vec<Row> {
     let mut rows = Vec::new();
     for (i, n) in doc.nodes.iter().enumerate() {
         if let Node::Item(it) = n {
-            if in_today(it) && ops::zone_of(doc, i) != Zone::Archive {
+            if ops::in_today(doc, i) {
                 let start = rows.len();
                 push_item_rows(&mut rows, it);
                 rows.insert(start + 1, Row::Category(ops::section_name(doc, i)));
@@ -149,7 +157,7 @@ pub fn build_rows(doc: &Document) -> (Vec<Row>, usize) {
             // Any other heading (a level-1 zone) ends the pending section.
             Node::Heading { .. } => pending_section = None,
             // Today items show only in the Today panel.
-            Node::Item(it) if in_today(it) => {}
+            Node::Item(_) if ops::in_today(doc, i) => {}
             Node::Item(it) => {
                 if let Some(t) = pending_section.take() {
                     rows.push(Row::Section(t));
@@ -196,7 +204,7 @@ pub struct App {
     pub cfg: SidebarConfig,
     pub doc: Document,
     pub rows: Vec<Row>,
-    /// The Today panel's rows, pinned above `rows` (empty = no panel).
+    /// The Today panel's rows, drawn above `rows` (empty = no panel).
     pub today_rows: Vec<Row>,
     /// More than `ops::TODAY_CAP` items in Today (only a hand edit gets
     /// there): the panel's outline turns red.
@@ -239,7 +247,8 @@ pub struct App {
     /// modal presses feed it, so the list click that opens a modal never
     /// pairs with a first click inside it.
     clicks: crate::tui::selection::ClickTracker,
-    /// How long a write waits for the feed lock held by another writer.
+    /// How long a write waits for the feed lock held by another writer
+    /// ([`lock::SIDEBAR_TIMEOUT`]; short, as the UI is frozen meanwhile).
     pub lock_timeout: std::time::Duration,
 }
 
@@ -271,7 +280,7 @@ impl App {
             herdr_cli: Box::new(HerdrCli::from_env()),
             auto_close: Default::default(),
             clicks: Default::default(),
-            lock_timeout: lock::timeout_from_env(),
+            lock_timeout: lock::SIDEBAR_TIMEOUT,
         }
     }
 
@@ -412,7 +421,8 @@ impl App {
                         let section = ops::item_section(&self.doc, i);
                         let suggestions = ops::section_names(&self.doc);
                         let mut m = EditModal::edit(key, it, section, suggestions);
-                        let others = ops::today_count(&self.doc) - usize::from(in_today(it));
+                        let others =
+                            ops::today_count(&self.doc) - usize::from(ops::in_today(&self.doc, i));
                         m.today_full = others >= ops::TODAY_CAP;
                         self.set_modal(Modal::Edit(m));
                     }
@@ -587,15 +597,34 @@ impl App {
                 // toggle never undoes a hand edit made while the modal was up.
                 let today = (m.today != m.loaded_today).then_some(m.today);
                 let mut found = true;
-                let mut today_refused = false;
-                self.with_feed(|doc| match relocate_for_edit(doc, &key) {
+                // Some(full) when set_today refused; `full` re-arms the
+                // modal's Today-full guard.
+                let mut today_refused: Option<bool> = None;
+                let date = self.clock.today().format("%Y-%m-%d").to_string();
+                self.with_feed(|doc| match relocate_for_edit(doc, &key, &date) {
+                    // Completed and swept while the modal was up: the typed
+                    // title/body still land, on the archived record. It
+                    // stays done and in Done, so a category move is skipped
+                    // and a Today mark is refused like any done item's.
+                    Some(i) if ops::zone_of(doc, i) == Zone::Archive => {
+                        if today == Some(true) {
+                            today_refused = Some(false);
+                            return Err(ops::OpError::TodayDone.into());
+                        }
+                        ops::edit(doc, i, &title, &body);
+                        Ok(Outcome::Changed(Some(if moved {
+                            "saved in Done (archived; category kept)".into()
+                        } else {
+                            "saved in Done (item was archived)".into()
+                        })))
+                    }
                     Some(i) => {
                         ops::edit(doc, i, &title, &body);
                         // Before the move: moving changes the item's index.
                         match today {
                             Some(true) => {
                                 if let Err(e) = ops::set_today(doc, i) {
-                                    today_refused = true;
+                                    today_refused = Some(matches!(e, ops::OpError::TodayFull));
                                     return Err(e.into());
                                 }
                             }
@@ -619,13 +648,14 @@ impl App {
                 if !found {
                     return Modal::Edit(m);
                 }
-                // Today filled up on disk since the modal opened: nothing
-                // was written; the toggle drops back so a re-save keeps the
-                // rest of the edit.
-                if today_refused {
+                // Today refused the item (full on disk since the modal
+                // opened, or the item is completed): nothing was written;
+                // the toggle drops back so a re-save keeps the rest of the
+                // edit.
+                if let Some(full) = today_refused {
                     let mut m = m;
                     m.today = false;
-                    m.today_full = true;
+                    m.today_full = full;
                     return Modal::Edit(m);
                 }
             }
@@ -936,10 +966,10 @@ mod tests {
         };
         // Exact title+state wins over a same-titled item in another state.
         let doc = parse("# Feed\n\n- [x] Ship it\n- [ ] Ship it\n");
-        assert_eq!(relocate_for_edit(&doc, &key), Some(3));
+        assert_eq!(relocate_for_edit(&doc, &key, "2026-01-15"), Some(3));
         // Neither matches the opened state: two title hits is ambiguous.
         let doc = parse("# Feed\n\n- [x] Ship it\n- [~] Ship it\n");
-        assert_eq!(relocate_for_edit(&doc, &key), None);
+        assert_eq!(relocate_for_edit(&doc, &key, "2026-01-15"), None);
     }
 
     use crate::config::{Side, SidebarConfig};
@@ -1252,6 +1282,29 @@ mod tests {
     /// mid-action NotFound must proceed with an empty Document instead of
     /// dropping, letting `save_atomic` create the file via its
     /// `create_dir_all`.
+    /// The sidebar can't redraw while it waits for the lock, so it gives up
+    /// fast — well inside the CLI's 5 s — and says the feed is busy.
+    #[test]
+    fn a_sidebar_write_on_a_held_lock_gives_up_within_a_quarter_second() {
+        let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [x] Alpha\n");
+        let held = std::fs::File::create(lock::lock_path(&app.feed_path)).unwrap();
+        held.lock().unwrap();
+
+        let start = std::time::Instant::now();
+        app.apply(Action::Sweep);
+        let waited = start.elapsed();
+
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "waited {waited:?}"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(200),
+            "waited {waited:?}"
+        );
+        assert!(app.status_msg.as_deref().unwrap().contains("feed busy"));
+    }
+
     #[test]
     fn with_feed_proceeds_on_missing_file_when_in_memory_doc_has_no_items() {
         let dir = tempfile::tempdir().unwrap();

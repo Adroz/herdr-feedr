@@ -111,4 +111,4 @@ a live marker when herdr can see that session — no marker means "not visible",
 
 ## Copying text
 
-Dragging over text in the edit modal copies it on release (Ctrl+C works too). For anything else on screen, including the sidebar list, use herdr copy mode: `prefix+[`, then `v` to select and `y` to copy.
+In the edit modal and the read-only Done archive and file views, dragging over text copies it on release; a double-click copies the word under the pointer and a triple-click the whole line. Ctrl+C copies the current selection again. For anything else on screen, including the sidebar list, use herdr copy mode: `prefix+[`, then `v` to select and `y` to copy.

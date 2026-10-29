@@ -10,6 +10,8 @@
 //!    alone, a non-feedr pane elsewhere --> exit
 //!    alone, nothing else anywhere      --> server.stop (if enabled), exit
 //! layout showing company during the debounce --> cancel it
+//! layout with a pane pane.list can't identify (query failed)
+//!    --> no decision: never arms; an armed debounce is cancelled
 //! ```
 //!
 //! Company is any pane that isn't a feedr sidebar: other plugins' panes,
@@ -61,8 +63,13 @@ impl AutoClose {
                 self.remember(&panes);
             }
         }
-        // An id still unknown (the query failed) counts as company: the
-        // safe direction is always to stay.
+        // An id still unknown means the query failed: no decision. It
+        // mustn't arm (arming needs company actually seen), and an armed
+        // sidebar drops any debounce — the safe direction is to stay.
+        if others.iter().any(|p| !self.feedr.contains_key(*p)) {
+            self.alone_since = None;
+            return;
+        }
         let company = others
             .iter()
             .any(|p| !self.feedr.get(*p).copied().unwrap_or(false));
@@ -231,6 +238,36 @@ mod tests {
         d.layout(TAB_ID, &[PANE_ID]);
         d.advance(Duration::from_secs(1));
         assert!(d.exit_requested());
+    }
+
+    #[test]
+    fn a_failed_lookup_of_an_unknown_pane_does_not_arm() {
+        let mut d = sidebar();
+        // A pane we can't identify joins while pane.list is failing...
+        d.fail_pane_list();
+        d.layout(TAB_ID, &[PANE_ID, "w1:p5"]);
+        // ...and turns out to be another feedr sidebar, which then goes.
+        d.set_panes(&[
+            (PANE_ID, TAB_ID, SIDEBAR),
+            ("w1:p5", TAB_ID, SIDEBAR),
+            ELSEWHERE,
+        ]);
+        d.layout(TAB_ID, &[PANE_ID, "w1:p5"]);
+        d.set_panes(&[(PANE_ID, TAB_ID, SIDEBAR), ELSEWHERE]);
+        d.layout(TAB_ID, &[PANE_ID]);
+        d.advance(Duration::from_secs(2));
+        assert!(!d.exit_requested(), "it never saw company, so never armed");
+    }
+
+    #[test]
+    fn a_failed_lookup_keeps_an_armed_sidebar_open() {
+        let mut d = sidebar();
+        armed_then_left_alone(&mut d);
+        // An unknown pane joins while pane.list fails: no decision, stay.
+        d.fail_pane_list();
+        d.layout(TAB_ID, &[PANE_ID, "w1:p5"]);
+        d.advance(Duration::from_secs(2));
+        assert!(!d.exit_requested());
     }
 
     #[test]

@@ -208,7 +208,7 @@ impl Driver {
     }
 
     /// Set what herdr's `pane.list` answers from now on: `(pane, tab,
-    /// title)` triples, all in workspace `w1`.
+    /// title)` triples.
     pub fn set_panes(&mut self, panes: &[(&str, &str, &str)]) {
         *self.panes.borrow_mut() = Some(
             panes
@@ -216,7 +216,6 @@ impl Driver {
                 .map(|(p, t, title)| PaneEntry {
                     pane_id: p.to_string(),
                     tab_id: t.to_string(),
-                    workspace_id: "w1".into(),
                     title: Some(title.to_string()),
                 })
                 .collect(),
@@ -724,6 +723,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_save_after_the_item_was_completed_and_archived_edits_it_in_the_archive() {
+        let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n- [ ] Beta\n", 40, 24);
+        d.click(6, 0);
+        d.key(KeyCode::Tab, KeyModifiers::NONE);
+        d.type_str(" fixed");
+
+        // An agent finishes Alpha and sweeps it today (the driver's clock).
+        let archived =
+            "# Feed\n\n- [ ] Beta\n\n# Done\n\n## Feed\n\n- [x] Alpha @agent(claude:abc) @done(2026-01-15)\n";
+        std::fs::write(d.feed_path(), archived).unwrap();
+        d.push(AppEvent::FeedChanged);
+        save(&mut d);
+
+        assert_eq!(
+            d.feed(),
+            archived.replace("- [x] Alpha", "- [x] Alpha fixed"),
+            "the edit lands on the archived item, still done"
+        );
+        let screen = d.screen();
+        assert!(
+            !screen.iter().any(|l| l.contains("Edit item")),
+            "{screen:#?}"
+        );
+        assert!(
+            screen.last().unwrap().contains("archived"),
+            "status says where it went: {screen:#?}"
+        );
+    }
+
+    #[test]
+    fn an_older_same_titled_archive_entry_is_not_mistaken_for_the_item() {
+        let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n- [ ] Beta\n", 40, 24);
+        d.click(6, 0);
+        d.key(KeyCode::Tab, KeyModifiers::NONE);
+        d.type_str(" fixed");
+
+        // Alpha is deleted; a same-titled entry from last week sits in Done.
+        let disk = "# Feed\n\n- [ ] Beta\n\n# Done\n\n## Feed\n\n- [x] Alpha @done(2026-01-08)\n";
+        std::fs::write(d.feed_path(), disk).unwrap();
+        d.push(AppEvent::FeedChanged);
+        save(&mut d);
+
+        assert_eq!(d.feed(), disk, "nothing written");
+        assert!(d.screen().last().unwrap().contains("deleted on disk"));
+    }
+
     // --- Today panel and modal toggle (#30) --------------------------------
 
     const TODAY_FEED: &str = "\
@@ -939,6 +985,22 @@ mod tests {
             .last()
             .unwrap()
             .contains("Today full — unmark one first"));
+    }
+
+    #[test]
+    fn a_today_mark_on_a_done_item_is_refused_at_save_and_writes_nothing() {
+        let feed = "# Feed\n\n- [x] Alpha\n";
+        let mut d = open_first_item(feed);
+        ctrl(&mut d, 't');
+        save(&mut d);
+
+        assert_eq!(d.feed(), feed, "nothing written");
+        assert!(modal_top(&d).contains("☆ Today"), "{}", modal_top(&d));
+        assert!(
+            d.screen().last().unwrap().contains("only uncompleted"),
+            "{:#?}",
+            d.screen()
+        );
     }
 
     #[test]

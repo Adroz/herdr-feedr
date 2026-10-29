@@ -97,7 +97,6 @@ pub fn parse_agent_list(result: &Value) -> Vec<AgentInfo> {
 pub struct PaneEntry {
     pub pane_id: String,
     pub tab_id: String,
-    pub workspace_id: String,
     pub title: Option<String>,
 }
 
@@ -126,7 +125,6 @@ pub fn parse_pane_list(result: &Value) -> Vec<PaneEntry> {
             Some(PaneEntry {
                 pane_id: s("pane_id")?,
                 tab_id: s("tab_id")?,
-                workspace_id: s("workspace_id").unwrap_or_default(),
                 title: s("terminal_title_stripped").or_else(|| s("terminal_title")),
             })
         })
@@ -1249,13 +1247,11 @@ mod tests {
                 PaneEntry {
                     pane_id: "w1:p1".into(),
                     tab_id: "w1:t3".into(),
-                    workspace_id: "w1".into(),
                     title: Some("feedr-sidebar".into()),
                 },
                 PaneEntry {
                     pane_id: "w1:p2".into(),
                     tab_id: "w1:t3".into(),
-                    workspace_id: "w1".into(),
                     title: Some("zsh".into()),
                 },
             ]

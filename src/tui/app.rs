@@ -654,6 +654,13 @@ impl App {
                     .map(|a| (a.session_id.clone(), a))
                     .collect();
             }
+            crate::tui::AppEvent::AgentStatus { pane_id, status } => {
+                // Statuses are keyed by session; a push names only the pane.
+                if let Some(a) = self.statuses.values_mut().find(|a| a.pane_id == pane_id) {
+                    a.status = status;
+                }
+            }
+            crate::tui::AppEvent::Layout { .. } => {}
             crate::tui::AppEvent::SocketDown => self.statuses.clear(),
         }
     }
@@ -1689,6 +1696,31 @@ mod tests {
             },
         );
         assert!(!app.any_linked_agent_blocked());
+    }
+
+    #[test]
+    fn a_pushed_status_updates_the_linked_agent_without_a_resync() {
+        let (mut app, _fake, _dir) = app_on_disk(SAMPLE);
+        app.on_event(crate::tui::AppEvent::Agents(vec![AgentInfo {
+            pane_id: "w1:p7".into(),
+            kind: "claude".into(),
+            session_id: "0198f3ab".into(),
+            status: AgentStatus::Working,
+        }]));
+        assert!(!app.any_linked_agent_blocked());
+
+        app.on_event(crate::tui::AppEvent::AgentStatus {
+            pane_id: "w1:p7".into(),
+            status: AgentStatus::Blocked,
+        });
+        assert!(app.any_linked_agent_blocked());
+
+        // A push for a pane we don't know is ignored, not invented.
+        app.on_event(crate::tui::AppEvent::AgentStatus {
+            pane_id: "w9:p1".into(),
+            status: AgentStatus::Done,
+        });
+        assert_eq!(app.statuses.len(), 1);
     }
 
     #[test]

@@ -4,6 +4,8 @@ pub mod clock;
 pub mod dock;
 #[cfg(test)]
 pub mod driver;
+#[cfg(test)]
+pub mod fake_socket;
 pub mod input;
 pub mod modal;
 pub mod socket;
@@ -26,9 +28,22 @@ use std::time::Duration;
 
 /// Events pushed by background threads (file watcher: Task 11; socket
 /// subscriber: Task 12).
+#[derive(Debug, PartialEq)]
 pub enum AppEvent {
     FeedChanged,
+    /// Full agent resync (`agent.list`).
     Agents(Vec<socket::AgentInfo>),
+    /// One pane's agent status, pushed by herdr.
+    AgentStatus {
+        pane_id: String,
+        status: socket::AgentStatus,
+    },
+    /// A tab's layout changed (`layout.updated`): the panes now in it.
+    /// Feeds sidebar auto-close; unused by the app until then.
+    Layout {
+        tab_id: String,
+        pane_ids: Vec<String>,
+    },
     SocketDown,
 }
 

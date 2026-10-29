@@ -63,18 +63,32 @@ pub fn relocate(doc: &Document, key: &ItemKey) -> Option<usize> {
 /// may have moved on since (an agent claimed it, a human ticked it), and
 /// the typed edit must still land — so after an exact title+state miss,
 /// fall back to a unique active item with the same title, whatever its
-/// state. Still never guesses between two same-titled items.
-pub fn relocate_for_edit(doc: &Document, key: &ItemKey) -> Option<usize> {
-    relocate(doc, key).or_else(|| {
-        let mut hits = doc.nodes.iter().enumerate().filter(|(i, n)| {
-            matches!(n, Node::Item(it) if it.title == key.title)
-                && ops::zone_of(doc, *i) != Zone::Archive
-        });
-        match (hits.next(), hits.next()) {
-            (Some((i, _)), None) => Some(i),
-            _ => None,
-        }
-    })
+/// state. With no active match at all, the item may have been completed and
+/// swept meanwhile: fall back to a unique archived item of that title
+/// stamped `@done(today)` — an older same-titled entry is a past item, not
+/// this one. Still never guesses between two same-titled items.
+pub fn relocate_for_edit(doc: &Document, key: &ItemKey, today: &str) -> Option<usize> {
+    if let Some(i) = relocate(doc, key) {
+        return Some(i);
+    }
+    let (active, archived): (Vec<usize>, Vec<usize>) = doc
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| matches!(n, Node::Item(it) if it.title == key.title))
+        .map(|(i, _)| i)
+        .partition(|&i| ops::zone_of(doc, i) != Zone::Archive);
+    let swept_today: Vec<usize> = archived
+        .into_iter()
+        .filter(
+            |&i| matches!(&doc.nodes[i], Node::Item(it) if it.done_date.as_deref() == Some(today)),
+        )
+        .collect();
+    // Two active hits are ambiguous, not a reason to reach into the archive.
+    match (active.as_slice(), swept_today.as_slice()) {
+        ([i], _) | ([], [i]) => Some(*i),
+        _ => None,
+    }
 }
 
 /// One display row of the sidebar list.
@@ -585,7 +599,24 @@ impl App {
                 // Some(full) when set_today refused; `full` re-arms the
                 // modal's Today-full guard.
                 let mut today_refused: Option<bool> = None;
-                self.with_feed(|doc| match relocate_for_edit(doc, &key) {
+                let date = self.clock.today().format("%Y-%m-%d").to_string();
+                self.with_feed(|doc| match relocate_for_edit(doc, &key, &date) {
+                    // Completed and swept while the modal was up: the typed
+                    // title/body still land, on the archived record. It
+                    // stays done and in Done, so a category move is skipped
+                    // and a Today mark is refused like any done item's.
+                    Some(i) if ops::zone_of(doc, i) == Zone::Archive => {
+                        if today == Some(true) {
+                            today_refused = Some(false);
+                            return Err(ops::OpError::TodayDone.into());
+                        }
+                        ops::edit(doc, i, &title, &body);
+                        Ok(Outcome::Changed(Some(if moved {
+                            "saved in Done (archived; category kept)".into()
+                        } else {
+                            "saved in Done (item was archived)".into()
+                        })))
+                    }
                     Some(i) => {
                         ops::edit(doc, i, &title, &body);
                         // Before the move: moving changes the item's index.
@@ -934,10 +965,10 @@ mod tests {
         };
         // Exact title+state wins over a same-titled item in another state.
         let doc = parse("# Feed\n\n- [x] Ship it\n- [ ] Ship it\n");
-        assert_eq!(relocate_for_edit(&doc, &key), Some(3));
+        assert_eq!(relocate_for_edit(&doc, &key, "2026-01-15"), Some(3));
         // Neither matches the opened state: two title hits is ambiguous.
         let doc = parse("# Feed\n\n- [x] Ship it\n- [~] Ship it\n");
-        assert_eq!(relocate_for_edit(&doc, &key), None);
+        assert_eq!(relocate_for_edit(&doc, &key, "2026-01-15"), None);
     }
 
     use crate::config::{Side, SidebarConfig};

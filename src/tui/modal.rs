@@ -79,6 +79,9 @@ pub struct EditModal {
     /// drains it after every `step` call and does the actual spawn (mirrors
     /// `App`'s `editor_request`/`take_editor_request` one-shot pattern).
     pub pending_clipboard: Option<String>,
+    /// Category, title and body lines as the modal opened — the baseline
+    /// `is_dirty` compares against.
+    loaded: [Vec<String>; 3],
 }
 
 impl EditModal {
@@ -97,13 +100,34 @@ impl EditModal {
             focus: EditFocus::Category,
             claimed: false,
             pending_clipboard: None,
+            loaded: Default::default(),
         };
         // Bodies are prose: wrap them. Title and category stay unwrapped —
         // they're single-line fields in a 3-row box, where a wrapped second
         // visual row would push the text out of view.
         m.body.set_wrap_mode(WrapMode::Word);
         m.sync_blocks();
+        m.mark_loaded();
         m
+    }
+
+    fn fields(&self) -> [Vec<String>; 3] {
+        [
+            self.category.lines().to_vec(),
+            self.title.lines().to_vec(),
+            self.body.lines().to_vec(),
+        ]
+    }
+
+    /// Take the current field contents as the "as opened" baseline.
+    fn mark_loaded(&mut self) {
+        self.loaded = self.fields();
+    }
+
+    /// Whether the title, body or category differ from what was loaded.
+    /// Typing a change and then undoing it by hand is clean again.
+    pub fn is_dirty(&self) -> bool {
+        self.fields() != self.loaded
     }
 
     /// Create with the category pre-filled (clicking a section header):
@@ -113,6 +137,7 @@ impl EditModal {
         m.set_category(category);
         m.focus = EditFocus::Title;
         m.sync_blocks();
+        m.mark_loaded();
         m
     }
 
@@ -143,7 +168,9 @@ impl EditModal {
             focus,
             claimed: item.state == State::InProgress && item.agent.is_some(),
             pending_clipboard: None,
+            loaded: Default::default(),
         };
+        m.mark_loaded();
         // Unfocused fields keep `TextArea::new`'s (0,0) cursor so they
         // render unscrolled (their viewport follows their cursor); only the
         // INITIALLY FOCUSED field parks at the end, exactly like a Tab-entry
@@ -598,7 +625,13 @@ pub enum ModalStep {
     /// request (it needs `editor_cmd`/`status_msg`), so hand it back like
     /// `Save`/`Delete`.
     OpenEditor,
+    /// An outside click on a dirty edit modal: it stays open, and only `App`
+    /// can put the "how to leave" hint on the status line.
+    Unsaved(EditModal),
 }
+
+/// Status hint for an outside click that a dirty edit modal refused.
+pub const UNSAVED_HINT: &str = "unsaved — Esc to discard, Ctrl+S to save";
 
 /// Pure modal transition: `(modal, event, terminal area) -> ModalStep`.
 /// Never touches the filesystem — mirrors `input::translate`. `area` is the
@@ -609,6 +642,13 @@ pub fn step(modal: Modal, ev: Event, area: Rect) -> ModalStep {
     if let Event::Key(k) = &ev {
         if k.kind == KeyEventKind::Release {
             return ModalStep::Continue(modal);
+        }
+    }
+    if let Event::Mouse(mev) = &ev {
+        if mev.kind == MouseEventKind::Down(MouseButton::Left)
+            && !rect_contains(panel_rect(&modal, area), mev.column, mev.row)
+        {
+            return outside_click(modal);
         }
     }
     match modal {
@@ -652,6 +692,47 @@ pub fn step(modal: Modal, ev: Event, area: Rect) -> ModalStep {
             }),
             _ => ModalStep::Continue(Modal::FileView { scroll }),
         },
+    }
+}
+
+/// The read-only viewers' panel (Done archive, file view).
+pub(crate) fn viewer_rect(area: Rect) -> Rect {
+    centered(area, 90, 80)
+}
+
+/// The delete-confirmation panel.
+pub(crate) fn confirm_rect(area: Rect) -> Rect {
+    centered(area, 80, 20)
+}
+
+/// The panel `view::draw_modal` paints for this modal — anything outside
+/// it is an "outside" click.
+fn panel_rect(modal: &Modal, area: Rect) -> Rect {
+    match modal {
+        Modal::None => area,
+        Modal::Edit(m) => {
+            edit_layout(area, m.original.is_some(), m.claimed, m.dropdown_rows()).outer
+        }
+        Modal::ConfirmDelete(_) => confirm_rect(area),
+        Modal::DoneView { .. } | Modal::FileView { .. } => viewer_rect(area),
+    }
+}
+
+/// A left click outside the panel. Peels back one layer, like Esc, and is
+/// always consumed — returning a step (never falling through) is what keeps
+/// the click off the list underneath.
+fn outside_click(modal: Modal) -> ModalStep {
+    match modal {
+        Modal::DoneView { .. } | Modal::FileView { .. } => ModalStep::Continue(Modal::None),
+        Modal::ConfirmDelete(m) => ModalStep::Continue(Modal::Edit(m)), // = "n"
+        // Same layer test as Esc's dropdown arm in `edit_step`.
+        Modal::Edit(mut m) if m.focus == EditFocus::Category && m.dropdown.is_some() => {
+            m.dropdown = None;
+            ModalStep::Continue(Modal::Edit(m))
+        }
+        Modal::Edit(m) if m.is_dirty() => ModalStep::Unsaved(m),
+        Modal::Edit(_) => ModalStep::Continue(Modal::None),
+        Modal::None => ModalStep::Continue(Modal::None),
     }
 }
 
@@ -2210,6 +2291,153 @@ mod tests {
         assert_eq!(m.category.selection_style(), theme::selection());
         assert_eq!(m.title.selection_style(), theme::selection());
         assert_eq!(m.body.selection_style(), theme::selection());
+    }
+}
+
+/// Outside-click dismissal (spec #22, issue #31), driven end to end through
+/// the headless sidebar driver. On the 60x24 sidebar used here, every modal
+/// box sits clear of the top-left cells, which hold the first item's
+/// checkbox — so a click there is "outside" and, if it fell through, would
+/// toggle that item in the feed.
+#[cfg(test)]
+mod outside_click_tests {
+    use crate::tui::driver::Driver;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    const FEED: &str = "# Work\n\n- [ ] Alpha\n\n# Done\n\n- [x] Old @done(2026-01-01)\n";
+    const W: u16 = 60;
+    const H: u16 = 24;
+    /// Over the first item's checkbox, outside every modal box.
+    const OUTSIDE: (u16, u16) = (1, 0);
+
+    fn shows(d: &Driver, text: &str) -> bool {
+        d.screen().iter().any(|l| l.contains(text))
+    }
+
+    fn click_outside(d: &mut Driver) {
+        d.click(OUTSIDE.0, OUTSIDE.1);
+    }
+
+    #[test]
+    fn clicking_outside_the_done_archive_closes_it() {
+        let mut d = Driver::new(FEED, W, H);
+        d.click(0, H - 3); // the Done(n) row
+        assert!(shows(&d, "Done archive"));
+
+        click_outside(&mut d);
+
+        assert!(!shows(&d, "Done archive"), "{}", d.screen().join("\n"));
+        assert_eq!(d.feed(), FEED);
+    }
+
+    #[test]
+    fn clicking_outside_the_file_view_closes_it() {
+        let mut d = Driver::new(FEED, W, H);
+        d.key(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert!(shows(&d, "feed file"));
+
+        click_outside(&mut d);
+
+        assert!(!shows(&d, "feed file"), "{}", d.screen().join("\n"));
+        assert_eq!(d.feed(), FEED);
+    }
+
+    #[test]
+    fn clicking_outside_the_delete_confirmation_cancels_back_to_the_edit_modal() {
+        let mut d = Driver::new(FEED, W, H);
+        d.click(6, 0); // Alpha's title
+        d.key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(shows(&d, "Confirm delete"), "{}", d.screen().join("\n"));
+
+        click_outside(&mut d);
+
+        assert!(!shows(&d, "Confirm delete"), "{}", d.screen().join("\n"));
+        assert!(shows(&d, "Edit item"), "{}", d.screen().join("\n"));
+        assert_eq!(d.feed(), FEED);
+    }
+
+    #[test]
+    fn clicking_outside_a_clean_edit_modal_closes_it_like_esc() {
+        let mut d = Driver::new(FEED, W, H);
+        d.click(6, 0); // Alpha's title
+        assert!(shows(&d, "Edit item"));
+
+        click_outside(&mut d);
+
+        assert!(!shows(&d, "Edit item"), "{}", d.screen().join("\n"));
+        assert_eq!(
+            d.herdr_calls(),
+            ["zoom_pane w1:p1 on", "zoom_pane w1:p1 off"],
+            "closing unzooms, exactly as Esc does"
+        );
+    }
+
+    #[test]
+    fn clicking_outside_a_dirty_edit_modal_keeps_it_open_and_says_how_to_leave() {
+        let mut d = Driver::new(FEED, W, H);
+        d.click(6, 0); // Alpha's edit modal, Category focused
+        d.key(KeyCode::Tab, KeyModifiers::NONE); // -> Title
+        d.type_str("!");
+
+        click_outside(&mut d);
+
+        assert!(shows(&d, "Edit item"), "{}", d.screen().join("\n"));
+        assert!(
+            shows(&d, "unsaved — Esc to discard, Ctrl+S to save"),
+            "{}",
+            d.screen().join("\n")
+        );
+        assert_eq!(d.feed(), FEED);
+        // The typing survived: saving now writes it.
+        d.key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(d.feed().contains("- [ ] Alpha!"), "{}", d.feed());
+    }
+
+    #[test]
+    fn an_edit_typed_back_to_its_loaded_text_is_clean_again() {
+        let mut d = Driver::new(FEED, W, H);
+        d.click(6, 0);
+        d.type_str("!");
+        d.key(KeyCode::Backspace, KeyModifiers::NONE);
+
+        click_outside(&mut d);
+
+        assert!(!shows(&d, "Edit item"), "{}", d.screen().join("\n"));
+    }
+
+    #[test]
+    fn clicking_outside_with_the_category_dropdown_open_closes_only_the_dropdown() {
+        let feed = "# Work\n\n- [ ] Alpha\n\n## Errands\n\n- [ ] Milk\n";
+        let mut d = Driver::new(feed, W, H);
+        d.key(KeyCode::Char('a'), KeyModifiers::NONE); // New item, Category focused
+        d.key(KeyCode::Down, KeyModifiers::NONE); // highlight "Errands"
+        assert!(shows(&d, "Errands"));
+
+        click_outside(&mut d);
+        assert!(shows(&d, "New item"), "{}", d.screen().join("\n"));
+        // The highlight is gone: Enter now advances to Title instead of
+        // accepting "Errands" into Category.
+        d.key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(shows(&d, "Title*"), "{}", d.screen().join("\n"));
+
+        click_outside(&mut d); // next layer: the (clean) modal itself
+        assert!(!shows(&d, "New item"), "{}", d.screen().join("\n"));
+        assert_eq!(d.feed(), feed);
+    }
+
+    #[test]
+    fn an_outside_click_over_a_checkbox_never_reaches_the_list() {
+        // Control: with no modal open, this very click toggles Alpha.
+        let mut control = Driver::new(FEED, W, H);
+        click_outside(&mut control);
+        assert_ne!(control.feed(), FEED, "OUTSIDE must sit on a checkbox");
+
+        let mut d = Driver::new(FEED, W, H);
+        d.click(6, 0); // open Alpha's edit modal
+        click_outside(&mut d);
+
+        assert!(!shows(&d, "Edit item"));
+        assert_eq!(d.feed(), FEED, "the dismissing click must be consumed");
     }
 }
 

@@ -1,4 +1,5 @@
 use crate::config::SidebarConfig;
+use crate::feed::lock::{self, LockError};
 use crate::feed::ops::{self, Authority, Zone};
 use crate::feed::write::save_atomic;
 use crate::feed::{AgentRef, Document, Item, Node, State};
@@ -55,6 +56,24 @@ pub fn relocate(doc: &Document, key: &ItemKey) -> Option<usize> {
         1 => Some(matches[0]),
         _ => None,
     }
+}
+
+/// Relocate the item an open edit modal was opened on. Its checkbox state
+/// may have moved on since (an agent claimed it, a human ticked it), and
+/// the typed edit must still land — so after an exact title+state miss,
+/// fall back to a unique active item with the same title, whatever its
+/// state. Still never guesses between two same-titled items.
+pub fn relocate_for_edit(doc: &Document, key: &ItemKey) -> Option<usize> {
+    relocate(doc, key).or_else(|| {
+        let mut hits = doc.nodes.iter().enumerate().filter(|(i, n)| {
+            matches!(n, Node::Item(it) if it.title == key.title)
+                && ops::zone_of(doc, *i) != Zone::Archive
+        });
+        match (hits.next(), hits.next()) {
+            (Some((i, _)), None) => Some(i),
+            _ => None,
+        }
+    })
 }
 
 /// One display row of the sidebar list.
@@ -176,6 +195,8 @@ pub struct App {
     /// `herdr` CLI runner for the collapse/expand pane resize. Injected so
     /// tests record the calls instead of spawning the real binary.
     pub herdr_cli: Box<dyn Runner>,
+    /// How long a write waits for the feed lock held by another writer.
+    pub lock_timeout: std::time::Duration,
 }
 
 impl App {
@@ -202,6 +223,7 @@ impl App {
             clipboard: Box::new(SystemClipboard),
             clock: Box::new(SystemClock),
             herdr_cli: Box::new(HerdrCli::from_env()),
+            lock_timeout: lock::timeout_from_env(),
         }
     }
 
@@ -250,6 +272,20 @@ impl App {
     where
         F: FnOnce(&mut Document) -> Result<Outcome>,
     {
+        // Held across read -> apply -> save, shared with the CLI (spec §6).
+        let _lock = match lock::acquire(&self.feed_path, self.lock_timeout) {
+            Ok(l) => l,
+            // The status row is narrow: name the lock file, not its path.
+            Err(LockError::Timeout { path, .. }) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                self.status_msg = Some(format!("feed busy ({name} held); action dropped"));
+                return;
+            }
+            Err(e) => {
+                self.status_msg = Some(format!("action dropped: {e}"));
+                return;
+            }
+        };
         let mut doc = match std::fs::read_to_string(&self.feed_path) {
             Ok(t) => crate::feed::parse::parse(&t),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -435,6 +471,10 @@ impl App {
                 self.request_editor();
                 Modal::None
             }
+            ModalStep::Unsaved(m) => {
+                self.status_msg = Some(crate::tui::modal::UNSAVED_HINT.into());
+                Modal::Edit(m)
+            }
         };
         // `edit_step` stays pure — no process spawning there — so a
         // Ctrl+C/Ctrl+X only records the yanked text in
@@ -481,7 +521,8 @@ impl App {
                     (None, None) => false,
                     _ => true,
                 };
-                self.with_feed(move |doc| match relocate(doc, &key) {
+                let mut found = true;
+                self.with_feed(|doc| match relocate_for_edit(doc, &key) {
                     Some(i) => {
                         ops::edit(doc, i, &title, &body);
                         if moved {
@@ -489,10 +530,18 @@ impl App {
                         }
                         Ok(Outcome::Changed(None))
                     }
-                    None => Ok(Outcome::Unchanged(Some(
-                        "item changed on disk — edit dropped".into(),
-                    ))),
+                    None => {
+                        found = false;
+                        Ok(Outcome::Unchanged(Some(
+                            "item deleted on disk — Esc to discard edit".into(),
+                        )))
+                    }
                 });
+                // Keep the modal (and the typed text) up rather than
+                // silently throwing the edit away with the item.
+                if !found {
+                    return Modal::Edit(m);
+                }
             }
             None => {
                 // Sidebar-created items are always the human's. An empty
@@ -627,6 +676,13 @@ impl App {
                     .map(|a| (a.session_id.clone(), a))
                     .collect();
             }
+            crate::tui::AppEvent::AgentStatus { pane_id, status } => {
+                // Statuses are keyed by session; a push names only the pane.
+                if let Some(a) = self.statuses.values_mut().find(|a| a.pane_id == pane_id) {
+                    a.status = status;
+                }
+            }
+            crate::tui::AppEvent::Layout { .. } => {}
             crate::tui::AppEvent::SocketDown => self.statuses.clear(),
         }
     }
@@ -742,6 +798,20 @@ mod tests {
             state: State::Open,
         };
         assert_eq!(relocate(&doc, &key), None);
+    }
+
+    #[test]
+    fn relocate_for_edit_prefers_the_exact_state_and_never_guesses_by_title() {
+        let key = ItemKey {
+            title: "Ship it".into(),
+            state: State::Open,
+        };
+        // Exact title+state wins over a same-titled item in another state.
+        let doc = parse("# Feed\n\n- [x] Ship it\n- [ ] Ship it\n");
+        assert_eq!(relocate_for_edit(&doc, &key), Some(3));
+        // Neither matches the opened state: two title hits is ambiguous.
+        let doc = parse("# Feed\n\n- [x] Ship it\n- [~] Ship it\n");
+        assert_eq!(relocate_for_edit(&doc, &key), None);
     }
 
     use crate::config::{Side, SidebarConfig};
@@ -1648,6 +1718,31 @@ mod tests {
             },
         );
         assert!(!app.any_linked_agent_blocked());
+    }
+
+    #[test]
+    fn a_pushed_status_updates_the_linked_agent_without_a_resync() {
+        let (mut app, _fake, _dir) = app_on_disk(SAMPLE);
+        app.on_event(crate::tui::AppEvent::Agents(vec![AgentInfo {
+            pane_id: "w1:p7".into(),
+            kind: "claude".into(),
+            session_id: "0198f3ab".into(),
+            status: AgentStatus::Working,
+        }]));
+        assert!(!app.any_linked_agent_blocked());
+
+        app.on_event(crate::tui::AppEvent::AgentStatus {
+            pane_id: "w1:p7".into(),
+            status: AgentStatus::Blocked,
+        });
+        assert!(app.any_linked_agent_blocked());
+
+        // A push for a pane we don't know is ignored, not invented.
+        app.on_event(crate::tui::AppEvent::AgentStatus {
+            pane_id: "w9:p1".into(),
+            status: AgentStatus::Done,
+        });
+        assert_eq!(app.statuses.len(), 1);
     }
 
     #[test]

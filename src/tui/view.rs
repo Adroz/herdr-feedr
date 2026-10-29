@@ -202,7 +202,7 @@ fn draw_modal(f: &mut Frame, app: &mut App) {
     match &app.modal {
         Modal::None | Modal::Edit(_) => {}
         Modal::ConfirmDelete(m) => {
-            let area = modal::centered(f.area(), 80, 20);
+            let area = modal::confirm_rect(f.area());
             f.render_widget(Clear, area);
             let outer = Block::bordered()
                 .style(theme::modal_panel_style())
@@ -361,7 +361,7 @@ fn render_button(f: &mut Frame, area: Rect, label: &str, focused: bool) {
 }
 
 fn draw_viewer(f: &mut Frame, title: &str, text: &str, scroll: u16) {
-    let area = modal::centered(f.area(), 90, 80);
+    let area = modal::viewer_rect(f.area());
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(text.to_string())

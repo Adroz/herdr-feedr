@@ -672,3 +672,18 @@ fn unclaiming_an_unclaimed_item_fails() {
         .failure()
         .stderr(contains("isn't claimed"));
 }
+
+#[test]
+fn a_cli_write_keeps_hand_edited_formatting() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = dir.path().join("feed.md");
+    std::fs::write(&feed, "# Feed\r\n\r\n- [X] Shipped\r\n- [ ] Fix auth").unwrap();
+    feedr_bare_env(&feed)
+        .args(["claim", "auth", "--agent", "claude:abc123"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(&feed).unwrap(),
+        "# Feed\r\n\r\n- [X] Shipped\r\n- [~] Fix auth @agent(claude:abc123)"
+    );
+}

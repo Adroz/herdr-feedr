@@ -385,6 +385,8 @@ impl App {
             .unwrap_or(self.doc.nodes.len());
         crate::feed::write::render(&Document {
             nodes: self.doc.nodes[start..end].to_vec(),
+            // On-screen text, not a write: canonical LF regardless of the file.
+            style: Default::default(),
         })
     }
 

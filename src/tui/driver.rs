@@ -260,6 +260,24 @@ impl Driver {
         std::fs::read_to_string(&self.app.feed_path).unwrap()
     }
 
+    /// The text of every cell drawn with the selection highlight, in reading
+    /// order, rows joined by newlines (empty when nothing is highlighted).
+    pub fn highlighted(&self) -> String {
+        let bg = crate::tui::theme::selection().bg;
+        let buf = self.terminal.backend().buffer();
+        let area = buf.area;
+        (0..area.height)
+            .filter_map(|y| {
+                let row: String = (0..area.width)
+                    .filter(|&x| buf[(x, y)].style().bg == bg)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect();
+                (!row.is_empty()).then_some(row)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     pub fn clipboard_writes(&self) -> Vec<String> {
         self.clipboard.writes.borrow().clone()
     }
@@ -405,11 +423,6 @@ mod tests {
         assert!(d.feed().contains("  日X本🙂ab\n"), "got: {}", d.feed());
     }
 
-    fn copy(d: &mut Driver) -> Vec<String> {
-        d.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        d.clipboard_writes()
-    }
-
     #[test]
     fn a_drag_across_a_soft_wrap_selects_what_was_dragged_over() {
         let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  one two three four five six seven\n");
@@ -417,7 +430,7 @@ mod tests {
         // From the 't' of "two" on row 1 to just after "sev" on the wrapped row 2.
         d.drag(&[(BODY_X + 4, BODY_Y), (BODY_X + 3, BODY_Y + 1)]);
 
-        assert_eq!(copy(&mut d), ["two three four five six sev"]);
+        assert_eq!(d.clipboard_writes(), ["two three four five six sev"]);
     }
 
     #[test]
@@ -427,7 +440,7 @@ mod tests {
         // Top drawn row ("line4") down to the end of the third ("line6").
         d.drag(&[(BODY_X, BODY_Y), (BODY_X + 5, BODY_Y + 2)]);
 
-        assert_eq!(copy(&mut d), ["line4\nline5\nline6"]);
+        assert_eq!(d.clipboard_writes(), ["line4\nline5\nline6"]);
     }
 
     #[test]
@@ -437,7 +450,7 @@ mod tests {
         // From 本 (cell 2) to just after 'b' (cell 8).
         d.drag(&[(BODY_X + 2, BODY_Y), (BODY_X + 8, BODY_Y)]);
 
-        assert_eq!(copy(&mut d), ["本🙂ab"]);
+        assert_eq!(d.clipboard_writes(), ["本🙂ab"]);
     }
 
     #[test]
@@ -451,7 +464,97 @@ mod tests {
             (BODY_X + 2, BODY_Y - 3),
         ]);
 
-        assert_eq!(copy(&mut d), ["hello"]);
+        assert_eq!(d.clipboard_writes(), ["hello"]);
+    }
+
+    // --- Copy-on-select in edit fields (#33) --------------------------------
+
+    fn status(d: &Driver) -> String {
+        d.screen().last().unwrap().clone()
+    }
+
+    #[test]
+    fn releasing_a_drag_copies_the_selection_and_reports_the_count() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  hello world\n");
+
+        d.drag(&[(BODY_X, BODY_Y), (BODY_X + 5, BODY_Y)]);
+
+        assert_eq!(d.clipboard_writes(), ["hello"]);
+        assert!(status(&d).contains("Copied 5 chars"), "{:#?}", d.screen());
+    }
+
+    #[test]
+    fn a_multi_line_body_drag_copies_with_newlines() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  one\n  two\n  three\n");
+
+        // From the 'n' of "one" to just after "th" of "three".
+        d.drag(&[(BODY_X + 1, BODY_Y), (BODY_X + 2, BODY_Y + 2)]);
+
+        assert_eq!(d.clipboard_writes(), ["ne\ntwo\nth"]);
+        assert!(status(&d).contains("Copied 9 chars"), "{:#?}", d.screen());
+    }
+
+    #[test]
+    fn a_plain_click_or_zero_length_drag_copies_nothing() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  hello world\n");
+
+        d.click(BODY_X + 2, BODY_Y);
+        d.drag(&[(BODY_X + 3, BODY_Y), (BODY_X + 3, BODY_Y)]);
+
+        assert!(d.clipboard_writes().is_empty());
+        assert!(!status(&d).contains("Copied"), "{:#?}", d.screen());
+    }
+
+    #[test]
+    fn ctrl_c_copies_the_selection_again() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  hello world\n");
+        d.drag(&[(BODY_X + 6, BODY_Y), (BODY_X + 11, BODY_Y)]);
+
+        d.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert_eq!(d.clipboard_writes(), ["world", "world"]);
+        assert!(status(&d).contains("Copied 5 chars"), "{:#?}", d.screen());
+    }
+
+    #[test]
+    fn the_highlight_stays_after_copying_until_the_next_click() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  hello world\n");
+        d.drag(&[(BODY_X, BODY_Y), (BODY_X + 5, BODY_Y)]);
+        assert_eq!(d.highlighted(), "hello");
+        d.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(d.highlighted(), "hello", "Ctrl+C keeps it too");
+
+        d.click(BODY_X + 8, BODY_Y);
+        assert_eq!(d.highlighted(), "");
+    }
+
+    #[test]
+    fn the_highlight_is_cleared_by_the_next_key() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  hello world\n");
+        d.drag(&[(BODY_X, BODY_Y), (BODY_X + 5, BODY_Y)]);
+
+        d.key(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(d.highlighted(), "");
+    }
+
+    #[test]
+    fn typing_after_a_copy_replaces_the_selection() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  hello world\n");
+        d.drag(&[(BODY_X, BODY_Y), (BODY_X + 5, BODY_Y)]);
+
+        d.type_str("bye");
+        save(&mut d);
+
+        assert!(d.feed().contains("  bye world\n"), "got: {}", d.feed());
+    }
+
+    #[test]
+    fn dragging_in_the_sidebar_list_copies_nothing() {
+        let mut d = Driver::new("# Feed\n\n- [ ] Alpha beta\n", 40, 12);
+
+        d.drag(&[(6, 0), (12, 0)]);
+
+        assert!(d.clipboard_writes().is_empty());
     }
 
     #[test]

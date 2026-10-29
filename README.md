@@ -108,3 +108,7 @@ A claim isn't permanent. `feedr unclaim <item>` clears the tag and puts the item
 agents may release only their own claims, while you (and the sidebar's `[ Release ]` button, shown
 on a claimed item's edit modal) may release anyone's. In the sidebar, an `@agent` sub-line carries
 a live marker when herdr can see that session — no marker means "not visible", never "dead".
+
+## Copying text
+
+Dragging over text in the edit modal copies it on release (Ctrl+C works too). For anything else on screen, including the sidebar list, use herdr copy mode: `prefix+[`, then `v` to select and `y` to copy.

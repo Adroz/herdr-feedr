@@ -20,6 +20,7 @@ notify = "8"
 serde_json = "1"
 unicode-width = "0.2"
 tui-textarea = { version = "0.13", package = "tui-textarea-2" }
+base64 = "0.22"
 
 [dev-dependencies]
 assert_cmd = "2"

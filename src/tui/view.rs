@@ -74,7 +74,7 @@ pub fn ellipsize(s: &str, width: usize) -> String {
 /// clicked rows can never drift apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListLayout {
-    /// The bordered Today panel, pinned to the top; zero-height when Today
+    /// The bordered Today panel, fixed at the top; zero-height when Today
     /// is empty.
     pub today: Rect,
     /// The scrolling list, below the panel and a blank row.

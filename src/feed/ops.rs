@@ -433,13 +433,18 @@ pub fn set_state(
 /// then refuses new marks but never rewrites the excess away.
 pub const TODAY_CAP: usize = 3;
 
-/// Uncompleted (`[ ]`/`[~]`/`[?]`) items carrying `@today` — the ones that
-/// hold a Today slot.
+/// Whether the item at `index` holds a Today slot: an uncompleted
+/// (`[ ]`/`[~]`/`[?]`) item carrying `@today`, outside the Done archive.
+/// The one rule both the Today panel and [`TODAY_CAP`] go by — a hand-typed
+/// `[x] … @today`, or an `@today` left under `# Done`, holds none.
+pub fn in_today(doc: &Document, index: usize) -> bool {
+    matches!(&doc.nodes[index], Node::Item(it) if it.today && it.state != State::Done)
+        && zone_of(doc, index) != Zone::Archive
+}
+
+/// How many items hold a Today slot (see [`in_today`]).
 pub fn today_count(doc: &Document) -> usize {
-    doc.nodes
-        .iter()
-        .filter(|n| matches!(n, Node::Item(it) if it.today && it.state != State::Done))
-        .count()
+    (0..doc.nodes.len()).filter(|&i| in_today(doc, i)).count()
 }
 
 /// Put an item in Today. It stays in its home section; only the `@today`
@@ -1456,6 +1461,18 @@ Some prose.
             let d = find(&doc, "D").unwrap();
             set_today(&mut doc, d).unwrap();
             assert_eq!(today_count(&doc), 3);
+        }
+
+        #[test]
+        fn archived_items_do_not_hold_a_today_slot() {
+            // A hand edit can leave `@today` on an item under `# Done`; the
+            // panel doesn't show it, so the cap mustn't count it either.
+            let mut doc = parse(
+                "# Feed\n\n- [ ] A @today\n- [ ] B @today\n- [ ] D\n\n# Done\n\n- [ ] C @today\n",
+            );
+            assert_eq!(today_count(&doc), 2);
+            let d = find(&doc, "D").unwrap();
+            set_today(&mut doc, d).unwrap();
         }
 
         #[test]

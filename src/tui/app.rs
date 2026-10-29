@@ -94,12 +94,6 @@ pub enum Row {
     Add,
 }
 
-/// Whether an item holds a Today slot (and so shows in the Today panel).
-/// A hand-typed `[x] … @today` doesn't: Today is uncompleted items only.
-fn in_today(it: &Item) -> bool {
-    it.today && it.state != State::Done
-}
-
 /// An item's title row, plus its `@agent` sub-line when claimed.
 fn push_item_rows(rows: &mut Vec<Row>, it: &Item) {
     let key = ItemKey::of(it);
@@ -122,7 +116,7 @@ pub fn build_today_rows(doc: &Document) -> Vec<Row> {
     let mut rows = Vec::new();
     for (i, n) in doc.nodes.iter().enumerate() {
         if let Node::Item(it) = n {
-            if in_today(it) && ops::zone_of(doc, i) != Zone::Archive {
+            if ops::in_today(doc, i) {
                 let start = rows.len();
                 push_item_rows(&mut rows, it);
                 rows.insert(start + 1, Row::Category(ops::section_name(doc, i)));
@@ -149,7 +143,7 @@ pub fn build_rows(doc: &Document) -> (Vec<Row>, usize) {
             // Any other heading (a level-1 zone) ends the pending section.
             Node::Heading { .. } => pending_section = None,
             // Today items show only in the Today panel.
-            Node::Item(it) if in_today(it) => {}
+            Node::Item(_) if ops::in_today(doc, i) => {}
             Node::Item(it) => {
                 if let Some(t) = pending_section.take() {
                     rows.push(Row::Section(t));
@@ -196,7 +190,7 @@ pub struct App {
     pub cfg: SidebarConfig,
     pub doc: Document,
     pub rows: Vec<Row>,
-    /// The Today panel's rows, pinned above `rows` (empty = no panel).
+    /// The Today panel's rows, drawn above `rows` (empty = no panel).
     pub today_rows: Vec<Row>,
     /// More than `ops::TODAY_CAP` items in Today (only a hand edit gets
     /// there): the panel's outline turns red.
@@ -412,7 +406,8 @@ impl App {
                         let section = ops::item_section(&self.doc, i);
                         let suggestions = ops::section_names(&self.doc);
                         let mut m = EditModal::edit(key, it, section, suggestions);
-                        let others = ops::today_count(&self.doc) - usize::from(in_today(it));
+                        let others =
+                            ops::today_count(&self.doc) - usize::from(ops::in_today(&self.doc, i));
                         m.today_full = others >= ops::TODAY_CAP;
                         self.set_modal(Modal::Edit(m));
                     }

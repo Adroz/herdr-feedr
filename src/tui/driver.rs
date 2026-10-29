@@ -250,6 +250,50 @@ mod tests {
     }
 
     #[test]
+    fn a_save_after_an_agent_claims_the_item_keeps_the_edit_and_the_claim() {
+        let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n", 40, 24);
+        d.click(6, 0);
+        d.key(KeyCode::Tab, KeyModifiers::NONE); // Category -> Title
+        d.type_str(" fixed");
+        d.key(KeyCode::Tab, KeyModifiers::NONE); // Title -> Body
+        d.type_str("notes");
+
+        // An agent claims the item while the modal is open.
+        std::fs::write(d.feed_path(), "# Feed\n\n- [~] Alpha @agent(claude:abc)\n").unwrap();
+        d.push(AppEvent::FeedChanged);
+        d.key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            d.feed(),
+            "# Feed\n\n- [~] Alpha fixed @agent(claude:abc)\n  notes\n"
+        );
+        assert!(!d.screen().iter().any(|l| l.contains("Edit item")));
+    }
+
+    #[test]
+    fn a_save_after_the_item_was_deleted_on_disk_says_so_and_keeps_the_modal() {
+        let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n- [ ] Beta\n", 40, 24);
+        d.click(6, 0);
+        d.key(KeyCode::Tab, KeyModifiers::NONE);
+        d.type_str(" fixed");
+
+        std::fs::write(d.feed_path(), "# Feed\n\n- [ ] Beta\n").unwrap();
+        d.push(AppEvent::FeedChanged);
+        d.key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        assert_eq!(d.feed(), "# Feed\n\n- [ ] Beta\n", "nothing written");
+        let screen = d.screen();
+        assert!(
+            screen.last().unwrap().contains("deleted on disk"),
+            "status row reports the miss: {screen:#?}"
+        );
+        assert!(
+            screen.iter().any(|l| l.contains("Alpha fixed")),
+            "the typed edit stays in the open modal"
+        );
+    }
+
+    #[test]
     fn a_pushed_feed_change_redraws_from_disk() {
         let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n", 40, 12);
         std::fs::write(d.feed_path(), "# Feed\n\n- [ ] Beta\n").unwrap();

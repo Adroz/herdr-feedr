@@ -13,13 +13,15 @@ The design is in [docs/SPEC.md](docs/SPEC.md).
 
 ## Install
 
-**Requirements:** [herdr](https://herdr.dev) 0.9.0+ on macOS or Linux, and a [Rust toolchain](https://rustup.rs). v1 builds from source; prebuilt binaries are tracked in [#42](https://github.com/Adroz/herdr-feedr/issues/42). Windows isn't supported yet.
+**Requirements:** [herdr](https://herdr.dev) 0.9.0+ on macOS or Linux. Windows isn't supported yet.
 
 ```sh
 herdr plugin install Adroz/herdr-feedr
 ```
 
-herdr clones the repo, runs `scripts/build.sh` (`cargo build --release`), and registers the `feedr-sidebar` pane plus two actions: `open-feedr` (open or focus the sidebar, docked to the configured side, left by default) and `toggle-feedr` (close if open, else open). Then install the agent skill (see [Teach your agent](#teach-your-agent) below).
+herdr clones the repo, runs `scripts/fetch-or-build.sh`, and registers the `feedr-sidebar` pane plus two actions: `open-feedr` (open or focus the sidebar, docked to the configured side, left by default) and `toggle-feedr` (close if open, else open). Then install the agent skill (see [Teach your agent](#teach-your-agent) below).
+
+`fetch-or-build.sh` downloads the prebuilt binary released for this version on macOS (Apple silicon or Intel) and x86_64 Linux, and verifies its SHA-256. A [Rust toolchain](https://rustup.rs) is only needed on fallback: when there's no prebuilt for your platform (e.g. Linux arm64) or the download or checksum fails, it says why and runs `cargo build --release` instead.
 
 Outside herdr, `cargo install --path .` gives you the `feedr` CLI, and `feedr sidebar` runs the sidebar in any terminal.
 
@@ -34,7 +36,7 @@ herdr plugin link /path/to/herdr-feedr-sidebar
 Rebuild loop while iterating:
 
 1. Edit the code.
-2. `cargo build --release` (or re-run `herdr plugin link <path>`, which re-runs `scripts/build.sh`).
+2. `cargo build --release`. (Re-running `herdr plugin link <path>` re-runs `scripts/fetch-or-build.sh`, which installs the *released* binary for this version over your build; set `FEEDR_FROM_SOURCE=1` to make it build your checkout instead.)
 3. Restart the sidebars so they pick up the new binary — herdr doesn't hot-reload a running pane's process. `bash scripts/reload-feedr.sh` does steps 2–3 for every open sidebar in every tab (`--dry-run` to preview, `--tab <id>` for one tab); or close and reopen a single one by hand (`toggle-feedr` twice).
 
 `herdr plugin list` shows whether herdr-feedr loaded, with its pane and both actions.
@@ -48,6 +50,10 @@ Sidebar layouts (Today panel, list, edit modal, Done archive, file view) are pin
 3. Commit the updated `.snap` files with the change that caused them. Never commit `.snap.new` files.
 
 A new snapshot test fails until its first `.snap` is accepted the same way. CI never writes snapshots, so an unreviewed one fails the build there. Snapshots are text only — colour and style are asserted in ordinary tests.
+
+### Releasing
+
+Bump `version` in `Cargo.toml`, `herdr-plugin.toml` and the skill's version line together, merge, then push a matching tag (`git tag v0.3.0 && git push origin v0.3.0`). `.github/workflows/release.yml` refuses a tag that doesn't match both manifests, then builds and publishes the binaries and `SHA256SUMS` that `fetch-or-build.sh` downloads.
 
 ### Bind keys
 
@@ -89,7 +95,7 @@ ever writes.
 feedr skill status    # where it's installed, and whether it matches this binary
 ```
 
-`scripts/build.sh` runs `feedr skill install --refresh-only`, which refreshes copies that
+`scripts/fetch-or-build.sh` runs `feedr skill install --refresh-only`, which refreshes copies that
 already exist and never creates one — so `herdr plugin install` updates an installed skill
 without planting files in your home directory unasked.
 

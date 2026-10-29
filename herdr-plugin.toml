@@ -6,8 +6,6 @@
 # differences are v1 scope choices, noted inline below.
 #
 # v1 is linux/macos only (no Windows [[build]]/[[actions]] entries — see README).
-# v1 also has no prebuilt-binary fetch path (scripts/build.sh always builds from source
-# with cargo; see its header for a TODO referencing file-viewer's fetch-or-build.sh).
 
 id = "herdr-feedr"
 name = "herdr-feedr"
@@ -17,10 +15,11 @@ min_herdr_version = "0.9.0"
 platforms = ["linux", "macos"]
 
 # Build step herdr runs at `plugin link`/`plugin install` time (and again on
-# reinstall-to-update): compiles the `feedr` binary the pane and launcher scripts run.
+# reinstall-to-update): downloads the SHA-256-verified prebuilt `feedr` released for this
+# version and platform, falling back to `cargo build --release` on any miss.
 [[build]]
 platforms = ["linux", "macos"]
-command = ["/bin/sh", "scripts/build.sh"]
+command = ["/bin/sh", "scripts/fetch-or-build.sh"]
 
 # The sidebar pane. herdr performs the split placement on launch; the [[actions]] below
 # summon it (open/focus/close) and do the edge dock (swap-walk + resize) that herdr's

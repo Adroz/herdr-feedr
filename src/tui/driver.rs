@@ -150,6 +150,18 @@ impl Driver {
         self.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
     }
 
+    /// Left press on the first cell of `path`, drag through the rest, and
+    /// release on the last.
+    pub fn drag(&mut self, path: &[(u16, u16)]) {
+        let (&(x0, y0), rest) = path.split_first().expect("a drag needs a start cell");
+        self.mouse(MouseEventKind::Down(MouseButton::Left), x0, y0);
+        for &(x, y) in rest {
+            self.mouse(MouseEventKind::Drag(MouseButton::Left), x, y);
+        }
+        let &(x, y) = path.last().unwrap();
+        self.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
+    }
+
     // No consumer yet: paste and clock-driven behaviour land later in spec #22.
     #[allow(dead_code)]
     pub fn paste(&mut self, text: &str) {
@@ -247,6 +259,174 @@ mod tests {
 
         d.key(KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(d.exit_requested());
+    }
+
+    // --- Click/drag positions in edit fields (#32) --------------------------
+    //
+    // At 40x24 the edit modal's Body field draws its text in columns 5..=34
+    // (30 cells) from row 11 down (6 rows) (see the `edit_modal_open` snapshot). Each
+    // test clicks a cell, types a marker and saves, so the feed shows exactly
+    // which logical character the click landed on.
+
+    const BODY_X: u16 = 5;
+    const BODY_Y: u16 = 11;
+
+    /// Open the edit modal for the first item, as a user would.
+    fn open_first_item(feed: &str) -> Driver {
+        let mut d = Driver::new(feed, 40, 24);
+        d.click(6, 0);
+        assert!(d.screen().iter().any(|l| l.contains("Edit item")));
+        d
+    }
+
+    fn save(d: &mut Driver) {
+        d.key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    }
+
+    #[test]
+    fn a_click_on_a_wrapped_continuation_row_lands_under_the_pointer() {
+        // 33 chars: word-wraps after "six " so "seven" starts row 2.
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  one two three four five six seven\n");
+        assert!(
+            d.screen()[BODY_Y as usize + 1].contains("│seven"),
+            "{:#?}",
+            d.screen()
+        );
+
+        d.click(BODY_X + 2, BODY_Y + 1); // the 'v' of "seven"
+        d.type_str("X");
+        save(&mut d);
+
+        assert!(
+            d.feed().contains("  one two three four five six seXven\n"),
+            "got: {}",
+            d.feed()
+        );
+    }
+
+    /// Ten body lines in a six-row field: Tab into Body parks the cursor at
+    /// the end, which scrolls the field so "line4".."line9" are drawn.
+    fn scrolled_body() -> Driver {
+        let body: String = (0..10).map(|i| format!("  line{i}\n")).collect();
+        let mut d = open_first_item(&format!("# Feed\n\n- [ ] Alpha\n{body}"));
+        d.key(KeyCode::Tab, KeyModifiers::NONE); // Category -> Title
+        d.key(KeyCode::Tab, KeyModifiers::NONE); // Title -> Body, cursor at end
+        assert!(
+            d.screen()[BODY_Y as usize].contains("│line4"),
+            "{:#?}",
+            d.screen()
+        );
+        d
+    }
+
+    #[test]
+    fn a_click_in_a_scrolled_body_lands_under_the_pointer() {
+        let mut d = scrolled_body();
+
+        d.click(BODY_X + 1, BODY_Y); // the 'i' of the top drawn row, "line4"
+        assert!(
+            d.screen()[BODY_Y as usize].contains("│line4"),
+            "the click must not scroll the field away from what was clicked: {:#?}",
+            d.screen()
+        );
+        d.type_str("X");
+        save(&mut d);
+
+        assert!(d.feed().contains("  lXine4\n"), "got: {}", d.feed());
+    }
+
+    #[test]
+    fn a_click_after_wide_characters_lands_under_the_pointer() {
+        // 日, 本 and 🙂 each draw two cells wide, so 'a' is in cell 6.
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  日本🙂ab\n");
+
+        d.click(BODY_X + 6, BODY_Y);
+        d.type_str("X");
+        save(&mut d);
+
+        assert!(d.feed().contains("  日本🙂Xab\n"), "got: {}", d.feed());
+    }
+
+    #[test]
+    fn a_click_on_the_right_half_of_a_wide_character_lands_on_it() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  日本🙂ab\n");
+
+        d.click(BODY_X + 3, BODY_Y); // second cell of 本
+        d.type_str("X");
+        save(&mut d);
+
+        assert!(d.feed().contains("  日X本🙂ab\n"), "got: {}", d.feed());
+    }
+
+    fn copy(d: &mut Driver) -> Vec<String> {
+        d.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        d.clipboard_writes()
+    }
+
+    #[test]
+    fn a_drag_across_a_soft_wrap_selects_what_was_dragged_over() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  one two three four five six seven\n");
+
+        // From the 't' of "two" on row 1 to just after "sev" on the wrapped row 2.
+        d.drag(&[(BODY_X + 4, BODY_Y), (BODY_X + 3, BODY_Y + 1)]);
+
+        assert_eq!(copy(&mut d), ["two three four five six sev"]);
+    }
+
+    #[test]
+    fn a_drag_in_a_scrolled_body_selects_what_was_dragged_over() {
+        let mut d = scrolled_body();
+
+        // Top drawn row ("line4") down to the end of the third ("line6").
+        d.drag(&[(BODY_X, BODY_Y), (BODY_X + 5, BODY_Y + 2)]);
+
+        assert_eq!(copy(&mut d), ["line4\nline5\nline6"]);
+    }
+
+    #[test]
+    fn a_drag_after_wide_characters_selects_what_was_dragged_over() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  日本🙂abc\n");
+
+        // From 本 (cell 2) to just after 'b' (cell 8).
+        d.drag(&[(BODY_X + 2, BODY_Y), (BODY_X + 8, BODY_Y)]);
+
+        assert_eq!(copy(&mut d), ["本🙂ab"]);
+    }
+
+    #[test]
+    fn a_drag_that_leaves_the_field_keeps_the_last_in_field_endpoint() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  hello world\n");
+
+        // Over "hello", then up into the Title field: ignored, not redirected.
+        d.drag(&[
+            (BODY_X, BODY_Y),
+            (BODY_X + 5, BODY_Y),
+            (BODY_X + 2, BODY_Y - 3),
+        ]);
+
+        assert_eq!(copy(&mut d), ["hello"]);
+    }
+
+    #[test]
+    fn a_click_past_the_end_of_a_line_lands_at_its_end() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  hello\n");
+
+        d.click(BODY_X + 20, BODY_Y);
+        d.type_str("X");
+        save(&mut d);
+
+        assert!(d.feed().contains("  helloX\n"), "got: {}", d.feed());
+    }
+
+    #[test]
+    fn a_click_in_the_title_lands_under_the_pointer() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha beta\n");
+
+        d.click(BODY_X + 6, 8); // Title text row; the 'b' of "beta"
+        d.type_str("X");
+        save(&mut d);
+
+        assert_eq!(d.feed(), "# Feed\n\n- [ ] Alpha Xbeta\n");
     }
 
     #[test]

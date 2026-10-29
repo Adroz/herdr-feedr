@@ -6,6 +6,7 @@ pub mod dock;
 pub mod driver;
 pub mod input;
 pub mod modal;
+pub mod selection;
 pub mod socket;
 #[cfg(test)]
 pub mod test_util;

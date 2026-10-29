@@ -558,6 +558,7 @@ mod tests {
             state: State::Open,
             title: "T".into(),
             agent: None,
+            style: Default::default(),
             done_date: None,
             body: vec![
                 "the quick brown fox jumps over the lazy dog and keeps running well past \
@@ -1048,6 +1049,7 @@ mod tests {
             state: State::Open,
             title: "T".into(),
             agent: None,
+            style: Default::default(),
             done_date: None,
             body,
         };
@@ -1087,6 +1089,7 @@ mod tests {
             state: State::Open,
             title: "A title long enough to overflow a narrow docked pane".into(),
             agent: None,
+            style: Default::default(),
             done_date: None,
             body: Vec::new(),
         };

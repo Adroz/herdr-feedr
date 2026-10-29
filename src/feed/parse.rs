@@ -23,11 +23,14 @@ pub fn parse(text: &str) -> Document {
             });
         } else if let Some(item) = parse_item_line(line) {
             nodes.push(Node::Item(item));
-        } else if line.starts_with("  ") && !line.trim().is_empty() {
+        } else if let Some((indent, content)) = split_body_indent(line) {
             // Body line: attach to the most recent item if one directly precedes
             // (an item's body is contiguous).
             if let Some(Node::Item(item)) = nodes.last_mut() {
-                item.body.push(line[2..].to_string());
+                if item.body.is_empty() {
+                    item.style.tab_body = indent == BodyIndent::Tab;
+                }
+                item.body.push(content.to_string());
             } else {
                 nodes.push(Node::Raw(line.to_string()));
             }
@@ -42,7 +45,7 @@ pub fn parse(text: &str) -> Document {
             let next_is_body_line = lines[idx + 1..]
                 .iter()
                 .find(|l| !l.trim().is_empty())
-                .is_some_and(|l| l.starts_with("  ") && !l.trim().is_empty());
+                .is_some_and(|l| split_body_indent(l).is_some());
             if preceding_is_body_context && next_is_body_line {
                 if let Some(Node::Item(item)) = nodes.last_mut() {
                     item.body.push(String::new());
@@ -55,13 +58,45 @@ pub fn parse(text: &str) -> Document {
         }
         idx += 1;
     }
-    Document { nodes }
+    Document {
+        nodes,
+        style: file_style(text),
+    }
+}
+
+/// Line endings follow the first line break; a file with none is LF.
+/// An empty file counts as newline-terminated so the first write is canonical.
+fn file_style(text: &str) -> FileStyle {
+    FileStyle {
+        crlf: text.find('\n').is_some_and(|i| text[..i].ends_with('\r')),
+        no_trailing_newline: !text.is_empty() && !text.ends_with('\n'),
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum BodyIndent {
+    TwoSpaces,
+    Tab,
+}
+
+/// A non-blank line indented by two spaces or one tab is body; returns the
+/// indent and the content after it.
+fn split_body_indent(line: &str) -> Option<(BodyIndent, &str)> {
+    if line.trim().is_empty() {
+        return None;
+    }
+    if let Some(rest) = line.strip_prefix("  ") {
+        Some((BodyIndent::TwoSpaces, rest))
+    } else {
+        line.strip_prefix('\t').map(|rest| (BodyIndent::Tab, rest))
+    }
 }
 
 fn parse_item_line(line: &str) -> Option<Item> {
     let rest = line.strip_prefix("- [")?;
     let mut chars = rest.chars();
-    let state = State::from_char(chars.next()?)?;
+    let mark = chars.next()?;
+    let state = State::from_char(mark)?;
     let rest = chars.as_str().strip_prefix("] ")?;
 
     let mut title = rest.trim_end().to_string();
@@ -91,6 +126,10 @@ fn parse_item_line(line: &str) -> Option<Item> {
         agent,
         done_date,
         body: Vec::new(),
+        style: ItemStyle {
+            mark: (mark != state.to_char()).then_some(mark),
+            tab_body: false,
+        },
     })
 }
 

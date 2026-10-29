@@ -99,7 +99,7 @@ pub fn find(doc: &Document, query: &str) -> Result<usize, OpError> {
 pub fn claim(doc: &mut Document, index: usize, agent: AgentRef) {
     debug_assert!(matches!(doc.nodes[index], Node::Item(_)));
     if let Node::Item(it) = &mut doc.nodes[index] {
-        it.state = State::InProgress;
+        it.set_state(State::InProgress);
         it.agent = Some(agent);
     }
 }
@@ -109,6 +109,7 @@ pub fn add(doc: &mut Document, title: &str, body: &[String], zone: Zone) {
         state: State::Open,
         title: title.to_string(),
         agent: None,
+        style: Default::default(),
         done_date: None,
         body: trim_blank_edges(body),
     });
@@ -375,6 +376,7 @@ pub fn add_in_section(
             state: State::Open,
             title: title.to_string(),
             agent: None,
+            style: Default::default(),
             done_date: None,
             body: trim_blank_edges(body),
         }),
@@ -416,7 +418,7 @@ pub fn set_state(
         return Err(OpError::NotAuthorised);
     }
     if let Node::Item(it) = &mut doc.nodes[index] {
-        it.state = state;
+        it.set_state(state);
     }
     Ok(())
 }
@@ -610,7 +612,7 @@ pub fn unclaim(doc: &mut Document, index: usize, by: &Unclaimer) -> Result<(), O
         }
     }
     if let Node::Item(it) = &mut doc.nodes[index] {
-        it.state = State::Open;
+        it.set_state(State::Open);
         it.agent = None;
     }
     Ok(())
@@ -1178,6 +1180,7 @@ Some prose.
                 state: State::Open,
                 title: "New".into(),
                 agent: None,
+                style: Default::default(),
                 done_date: None,
                 body: Vec::new(),
             }),
@@ -1201,6 +1204,7 @@ Some prose.
                 state: State::Open,
                 title: "X".into(),
                 agent: None,
+                style: Default::default(),
                 done_date: None,
                 body: Vec::new(),
             }),

@@ -1052,6 +1052,7 @@ mod tests {
                 state: State::Open,
                 title: "A".into(),
                 agent: None,
+                style: Default::default(),
                 done_date: None,
                 body: vec![],
             },
@@ -1411,6 +1412,7 @@ mod tests {
             state: State::InProgress,
             title: "Migrate CI".into(),
             agent: Some(crate::feed::AgentRef::parse("claude:sess-1").unwrap()),
+            style: Default::default(),
             done_date: None,
             body: Vec::new(),
         };
@@ -1435,6 +1437,7 @@ mod tests {
             state: State::Open,
             title: "T".into(),
             agent: None,
+            style: Default::default(),
             done_date: None,
             body: vec!["a very long line of prose that would otherwise scroll".into()],
         };
@@ -1469,6 +1472,7 @@ mod tests {
             state: State::Open,
             title: "T".into(),
             agent: None,
+            style: Default::default(),
             done_date: None,
             body: Vec::new(),
         };
@@ -1532,6 +1536,7 @@ mod tests {
             state: State::Open,
             title: "T".into(),
             agent: None,
+            style: Default::default(),
             done_date: None,
             body: Vec::new(),
         };
@@ -1579,6 +1584,7 @@ mod tests {
             state: State::Open,
             title: "A very long title that would have scrolled the field horizontally".into(),
             agent: None,
+            style: Default::default(),
             done_date: None,
             body: vec![
                 "A very long first line of body text that would have scrolled".into(),
@@ -1756,6 +1762,7 @@ mod tests {
             state: State::Open,
             title: "abc".into(),
             agent: None,
+            style: Default::default(),
             done_date: None,
             body: vec!["alpha beta gamma".into(), "line two".into()],
         };

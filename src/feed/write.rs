@@ -20,7 +20,7 @@ pub fn render(doc: &Document) -> String {
                 // "- [x] @done(...)" (empty title + token) round-trips with a
                 // double space. Items can have empty titles (parser accepts
                 // "- [x] " and token-only lines).
-                out.push_str(&format!("- [{}]", item.state.to_char()));
+                out.push_str(&format!("- [{}]", item.checkbox_char()));
                 if !item.title.is_empty() {
                     out.push(' ');
                     out.push_str(&item.title);
@@ -38,15 +38,23 @@ pub fn render(doc: &Document) -> String {
                     out.push(' ');
                 }
                 out.push('\n');
+                let indent = if item.style.tab_body { "\t" } else { "  " };
                 for b in &item.body {
                     if !b.is_empty() {
-                        out.push_str("  ");
+                        out.push_str(indent);
                         out.push_str(b);
                     }
                     out.push('\n');
                 }
             }
         }
+    }
+    if doc.style.no_trailing_newline {
+        out.pop();
+    }
+    // Nodes never hold a line break, so every '\n' above is a line ending.
+    if doc.style.crlf {
+        out = out.replace('\n', "\r\n");
     }
     out
 }

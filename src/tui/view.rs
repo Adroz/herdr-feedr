@@ -2,6 +2,7 @@ use crate::tui::app::{App, Row};
 use crate::tui::modal::{self, EditFocus, Modal};
 use crate::tui::socket::AgentStatus;
 use crate::tui::theme;
+use crate::tui::viewer::Viewer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
@@ -272,15 +273,18 @@ fn draw_modal(f: &mut Frame, app: &mut App) {
                 inner,
             );
         }
-        Modal::DoneView { scroll } => {
-            draw_viewer(f, "Done archive — Esc closes", &app.archive_text(), *scroll)
+        Modal::DoneView(_) => {
+            let text = app.archive_text();
+            if let Modal::DoneView(v) = &mut app.modal {
+                draw_viewer(f, "Done archive — Esc closes", &text, v);
+            }
         }
-        Modal::FileView { scroll } => draw_viewer(
-            f,
-            "feed file — e edits in $EDITOR, Esc closes",
-            &app.file_text(),
-            *scroll,
-        ),
+        Modal::FileView(_) => {
+            let text = app.file_text();
+            if let Modal::FileView(v) = &mut app.modal {
+                draw_viewer(f, "feed file — e edits in $EDITOR, Esc closes", &text, v);
+            }
+        }
     }
 }
 
@@ -422,23 +426,21 @@ fn render_button(f: &mut Frame, area: Rect, label: &str, focused: bool) {
     f.render_widget(Paragraph::new(label).style(theme::button(focused)), area);
 }
 
-fn draw_viewer(f: &mut Frame, title: &str, text: &str, scroll: u16) {
+/// The viewer's text goes through its read-only `TextArea` so selection
+/// maps against exactly what is drawn here (wrap and scroll included).
+fn draw_viewer(f: &mut Frame, title: &str, text: &str, v: &mut Viewer) {
     let area = modal::viewer_rect(f.area());
     f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(text.to_string())
-            .style(theme::normal_text())
-            .block(
-                Block::bordered()
-                    .style(theme::modal_panel_style())
-                    .border_style(theme::modal_border())
-                    .title_style(theme::modal_title())
-                    .title(title.to_string())
-                    .padding(Padding::uniform(1)),
-            )
-            .scroll((scroll, 0)),
-        area,
+    v.sync(text);
+    v.text.set_block(
+        Block::bordered()
+            .style(theme::modal_panel_style())
+            .border_style(theme::modal_border())
+            .title_style(theme::modal_title())
+            .title(title.to_string())
+            .padding(Padding::uniform(1)),
     );
+    f.render_widget(&v.text, area);
 }
 
 fn row_line(app: &App, row: &Row, w: usize) -> Line<'static> {

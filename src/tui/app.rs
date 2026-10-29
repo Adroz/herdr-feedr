@@ -587,7 +587,9 @@ impl App {
                 // toggle never undoes a hand edit made while the modal was up.
                 let today = (m.today != m.loaded_today).then_some(m.today);
                 let mut found = true;
-                let mut today_refused = false;
+                // Some(full) when set_today refused; `full` re-arms the
+                // modal's Today-full guard.
+                let mut today_refused: Option<bool> = None;
                 self.with_feed(|doc| match relocate_for_edit(doc, &key) {
                     Some(i) => {
                         ops::edit(doc, i, &title, &body);
@@ -595,7 +597,7 @@ impl App {
                         match today {
                             Some(true) => {
                                 if let Err(e) = ops::set_today(doc, i) {
-                                    today_refused = true;
+                                    today_refused = Some(matches!(e, ops::OpError::TodayFull));
                                     return Err(e.into());
                                 }
                             }
@@ -619,13 +621,14 @@ impl App {
                 if !found {
                     return Modal::Edit(m);
                 }
-                // Today filled up on disk since the modal opened: nothing
-                // was written; the toggle drops back so a re-save keeps the
-                // rest of the edit.
-                if today_refused {
+                // Today refused the item (full on disk since the modal
+                // opened, or the item is completed): nothing was written;
+                // the toggle drops back so a re-save keeps the rest of the
+                // edit.
+                if let Some(full) = today_refused {
                     let mut m = m;
                     m.today = false;
-                    m.today_full = true;
+                    m.today_full = full;
                     return Modal::Edit(m);
                 }
             }

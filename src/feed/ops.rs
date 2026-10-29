@@ -32,6 +32,8 @@ pub enum OpError {
     NotYours(String, AgentRef),
     #[error("Today full — unmark one first")]
     TodayFull,
+    #[error("Today holds only uncompleted items")]
+    TodayDone,
 }
 
 pub fn zone_of(doc: &Document, index: usize) -> Zone {
@@ -441,10 +443,14 @@ pub fn today_count(doc: &Document) -> usize {
 }
 
 /// Put an item in Today. It stays in its home section; only the `@today`
-/// token is added. Refused when Today already holds [`TODAY_CAP`] items;
-/// an item already in Today is left as is.
+/// token is added. Refused for a completed item (Today holds uncompleted
+/// items only) and when Today already holds [`TODAY_CAP`] items; an item
+/// already in Today is left as is.
 pub fn set_today(doc: &mut Document, index: usize) -> Result<(), OpError> {
     debug_assert!(matches!(doc.nodes[index], Node::Item(_)));
+    if matches!(&doc.nodes[index], Node::Item(it) if it.state == State::Done) {
+        return Err(OpError::TodayDone);
+    }
     if matches!(&doc.nodes[index], Node::Item(it) if it.today) {
         return Ok(());
     }
@@ -1450,6 +1456,15 @@ Some prose.
             let d = find(&doc, "D").unwrap();
             set_today(&mut doc, d).unwrap();
             assert_eq!(today_count(&doc), 3);
+        }
+
+        #[test]
+        fn a_done_item_cannot_be_put_in_today() {
+            let mut doc = parse("# Feed\n\n- [x] A\n");
+            let before = render(&doc);
+            let a = find(&doc, "A").unwrap();
+            assert!(matches!(set_today(&mut doc, a), Err(OpError::TodayDone)));
+            assert_eq!(render(&doc), before);
         }
 
         #[test]

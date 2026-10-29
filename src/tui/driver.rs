@@ -942,6 +942,22 @@ mod tests {
     }
 
     #[test]
+    fn a_today_mark_on_a_done_item_is_refused_at_save_and_writes_nothing() {
+        let feed = "# Feed\n\n- [x] Alpha\n";
+        let mut d = open_first_item(feed);
+        ctrl(&mut d, 't');
+        save(&mut d);
+
+        assert_eq!(d.feed(), feed, "nothing written");
+        assert!(modal_top(&d).contains("☆ Today"), "{}", modal_top(&d));
+        assert!(
+            d.screen().last().unwrap().contains("only uncompleted"),
+            "{:#?}",
+            d.screen()
+        );
+    }
+
+    #[test]
     fn a_today_toggle_alone_makes_the_modal_dirty() {
         let mut d = Driver::new(TODAY_FEED, 40, 24);
         d.click(6, 6); // "[ ] Bump Node"

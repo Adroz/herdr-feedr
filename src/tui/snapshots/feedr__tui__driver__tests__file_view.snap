@@ -1,0 +1,20 @@
+---
+source: src/tui/driver.rs
+expression: "d.screen().join(\"\\n\")"
+---
+┌ Today ───────────────────────────────┐
+│[ ] Alpha                             │
+│ ┌feed file — e edits in $EDITOR, Es┐ │
+└─│                                  │─┘
+  │ # Feed                           │
+Wo│                                  │
+[ │ ## Work                          │
++ │                                  │
+  │ - [ ] Alpha @today               │
+  │ - [ ] Beta                       │
+  │                                  │
+  │                                  │
+  │                                  │
+Do└──────────────────────────────────┘
+clear completed
+                                       «

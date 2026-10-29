@@ -1,0 +1,16 @@
+---
+source: src/tui/driver.rs
+expression: "d.screen().join(\"\\n\")"
+---
+Work
+[ ] Fix the auth redirect loop on expired ses…
+[ ] Bump Node
++ add
+
+
+
+
+
+Done (0)
+clear completed
+                                             «

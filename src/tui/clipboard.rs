@@ -66,6 +66,41 @@ pub fn copy(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Where the sidebar's copies go. Injected into `App` so tests record
+/// writes instead of touching the developer's real clipboard.
+pub trait ClipboardSink {
+    fn copy(&mut self, text: &str) -> Result<()>;
+}
+
+/// Production sink: the platform clipboard tool (`copy`).
+pub struct SystemClipboard;
+
+impl ClipboardSink for SystemClipboard {
+    fn copy(&mut self, text: &str) -> Result<()> {
+        copy(text)
+    }
+}
+
+/// Records every write; clones share the record. `fail` makes each write
+/// error (after recording it), for exercising the status-message path.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct FakeClipboard {
+    pub writes: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    pub fail: bool,
+}
+
+#[cfg(test)]
+impl ClipboardSink for FakeClipboard {
+    fn copy(&mut self, text: &str) -> Result<()> {
+        self.writes.borrow_mut().push(text.to_string());
+        if self.fail {
+            bail!("fake clipboard failure");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,9 @@
 pub mod app;
 pub mod clipboard;
+pub mod clock;
 pub mod dock;
+#[cfg(test)]
+pub mod driver;
 #[cfg(test)]
 pub mod fake_socket;
 pub mod input;
@@ -15,8 +18,10 @@ pub mod watch;
 use crate::config::SidebarConfig;
 use anyhow::{bail, Result};
 use app::App;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
 use crossterm::tty::IsTty;
+use ratatui::backend::Backend;
+use ratatui::Terminal;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -85,7 +90,7 @@ pub fn run(feed_path: PathBuf, cfg: SidebarConfig) -> Result<()> {
 
     let mut terminal = ratatui::init();
     let _ = reinit_terminal_commands(&mut std::io::stdout());
-    let res = event_loop(&mut terminal, &mut app, &rx);
+    let res = event_loop(&mut terminal, &mut app, &rx, &mut CrosstermHost);
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res
@@ -136,40 +141,106 @@ fn drain_events(app: &mut App, rx: &mpsc::Receiver<AppEvent>) -> bool {
     feed_changed
 }
 
-fn event_loop(
-    terminal: &mut ratatui::DefaultTerminal,
+/// What the loop needs from the outside world besides herdr and the feed:
+/// terminal input, and suspending the terminal to run $EDITOR. Production
+/// uses crossterm and the real tty; the headless test driver scripts both.
+pub trait Host<B: Backend> {
+    /// Wait up to `timeout` for the next terminal event.
+    fn next_event(&mut self, timeout: Duration) -> Result<Option<Event>>;
+    /// Hand the tty to `editor` on `path`, then take it back.
+    fn run_editor(&mut self, terminal: &mut Terminal<B>, editor: &str, path: &Path) -> Result<()>;
+}
+
+struct CrosstermHost;
+
+impl Host<ratatui::backend::CrosstermBackend<std::io::Stdout>> for CrosstermHost {
+    fn next_event(&mut self, timeout: Duration) -> Result<Option<Event>> {
+        Ok(if event::poll(timeout)? {
+            Some(event::read()?)
+        } else {
+            None
+        })
+    }
+
+    fn run_editor(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        editor: &str,
+        path: &Path,
+    ) -> Result<()> {
+        ratatui::restore();
+        let result = spawn_editor(editor, path);
+        *terminal = ratatui::init();
+        let _ = reinit_terminal_commands(&mut std::io::stdout());
+        result
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    Continue,
+    Exit,
+}
+
+/// How long one step waits for terminal input before looping again (so
+/// pushed herdr events and clock-driven work still get serviced).
+const POLL_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// One turn of the sidebar's event loop: apply pushed events (reloading at
+/// most once), run a requested editor, handle at most one terminal event,
+/// then redraw. The real run loop and the headless test driver both call
+/// this, so tests exercise exactly the production path.
+pub fn step<B, H>(
+    terminal: &mut Terminal<B>,
     app: &mut App,
     rx: &mpsc::Receiver<AppEvent>,
-) -> Result<()> {
-    loop {
-        terminal.draw(|f| view::draw(f, app))?;
-        if app.should_quit {
-            return Ok(());
+    host: &mut H,
+) -> Result<Flow>
+where
+    B: Backend,
+    B::Error: Send + Sync + 'static,
+    H: Host<B>,
+{
+    if drain_events(app, rx) {
+        app.reload();
+    }
+    if let Some(path) = app.take_editor_request() {
+        let editor = app.editor_cmd.clone().unwrap_or_default();
+        if let Err(e) = host.run_editor(terminal, &editor, &path) {
+            app.status_msg = Some(format!("editor: {e}"));
         }
-        if drain_events(app, rx) {
-            app.reload();
-        }
-        if let Some(path) = app.take_editor_request() {
-            let editor = app.editor_cmd.clone().unwrap_or_default();
-            ratatui::restore();
-            let result = spawn_editor(&editor, &path);
-            *terminal = ratatui::init();
-            let _ = reinit_terminal_commands(&mut std::io::stdout());
-            if let Err(e) = result {
-                app.status_msg = Some(format!("editor: {e}"));
-            }
-            app.reload(); // editor's save wins (spec §6, accepted for v1)
-        }
-        if event::poll(Duration::from_millis(100))? {
-            let ev = event::read()?;
-            let size = terminal.size()?;
-            if app.modal_active() {
-                app.handle_modal_event(ev, (size.width, size.height));
-            } else if let Some(action) = input::translate(&ev, app, (size.width, size.height)) {
-                app.apply(action);
-            }
+        app.reload(); // editor's save wins (spec §6, accepted for v1)
+    }
+    if let Some(ev) = host.next_event(POLL_TIMEOUT)? {
+        let size = terminal.size()?;
+        if app.modal_active() {
+            app.handle_modal_event(ev, (size.width, size.height));
+        } else if let Some(action) = input::translate(&ev, app, (size.width, size.height)) {
+            app.apply(action);
         }
     }
+    terminal.draw(|f| view::draw(f, app))?;
+    Ok(if app.should_quit {
+        Flow::Exit
+    } else {
+        Flow::Continue
+    })
+}
+
+fn event_loop<B, H>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    rx: &mpsc::Receiver<AppEvent>,
+    host: &mut H,
+) -> Result<()>
+where
+    B: Backend,
+    B::Error: Send + Sync + 'static,
+    H: Host<B>,
+{
+    terminal.draw(|f| view::draw(f, app))?;
+    while step(terminal, app, rx, host)? == Flow::Continue {}
+    Ok(())
 }
 
 #[cfg(test)]

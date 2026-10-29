@@ -68,6 +68,16 @@ pub fn find(doc: &Document, query: &str) -> Result<usize, OpError> {
             _ => None,
         })
         .collect();
+    // An exact title wins so a title that is a substring of another stays
+    // addressable; duplicate exact titles fall through to the ambiguity error.
+    let exact: Vec<usize> = matches
+        .iter()
+        .copied()
+        .filter(|&i| matches!(&doc.nodes[i], Node::Item(it) if it.title.to_lowercase() == q))
+        .collect();
+    if let [only] = exact[..] {
+        return Ok(only);
+    }
     match matches.len() {
         0 => Err(OpError::NotFound(query.to_string())),
         1 => Ok(matches[0]),
@@ -89,7 +99,7 @@ pub fn find(doc: &Document, query: &str) -> Result<usize, OpError> {
 pub fn claim(doc: &mut Document, index: usize, agent: AgentRef) {
     debug_assert!(matches!(doc.nodes[index], Node::Item(_)));
     if let Node::Item(it) = &mut doc.nodes[index] {
-        it.state = State::InProgress;
+        it.set_state(State::InProgress);
         it.agent = Some(agent);
     }
 }
@@ -99,6 +109,7 @@ pub fn add(doc: &mut Document, title: &str, body: &[String], zone: Zone) {
         state: State::Open,
         title: title.to_string(),
         agent: None,
+        style: Default::default(),
         done_date: None,
         body: trim_blank_edges(body),
     });
@@ -365,6 +376,7 @@ pub fn add_in_section(
             state: State::Open,
             title: title.to_string(),
             agent: None,
+            style: Default::default(),
             done_date: None,
             body: trim_blank_edges(body),
         }),
@@ -406,7 +418,7 @@ pub fn set_state(
         return Err(OpError::NotAuthorised);
     }
     if let Node::Item(it) = &mut doc.nodes[index] {
-        it.state = state;
+        it.set_state(state);
     }
     Ok(())
 }
@@ -600,7 +612,7 @@ pub fn unclaim(doc: &mut Document, index: usize, by: &Unclaimer) -> Result<(), O
         }
     }
     if let Node::Item(it) = &mut doc.nodes[index] {
-        it.state = State::Open;
+        it.set_state(State::Open);
         it.agent = None;
     }
     Ok(())
@@ -783,6 +795,15 @@ mod tests {
         assert!(matches!(&doc.nodes[i], Node::Item(it) if it.title.contains("auth")));
         assert!(matches!(find(&doc, "old fixed"), Err(OpError::NotFound(_))));
         assert!(matches!(find(&doc, "o"), Err(OpError::Ambiguous(..))));
+    }
+
+    #[test]
+    fn find_prefers_an_exact_title_over_substring_matches() {
+        let doc =
+            parse("# Feed\n\n- [ ] Fix auth redirect\n- [ ] Fix auth\n- [ ] Fix auth flake\n");
+        let i = find(&doc, "fix AUTH").unwrap();
+        assert!(matches!(&doc.nodes[i], Node::Item(it) if it.title == "Fix auth"));
+        assert!(matches!(find(&doc, "fix au"), Err(OpError::Ambiguous(..))));
     }
 
     #[test]
@@ -1159,6 +1180,7 @@ Some prose.
                 state: State::Open,
                 title: "New".into(),
                 agent: None,
+                style: Default::default(),
                 done_date: None,
                 body: Vec::new(),
             }),
@@ -1182,6 +1204,7 @@ Some prose.
                 state: State::Open,
                 title: "X".into(),
                 agent: None,
+                style: Default::default(),
                 done_date: None,
                 body: Vec::new(),
             }),

@@ -23,4 +23,5 @@ tui-textarea = { version = "0.13", package = "tui-textarea-2" }
 
 [dev-dependencies]
 assert_cmd = "2"
+insta = "1.49.0"
 predicates = "3"

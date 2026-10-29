@@ -2,6 +2,9 @@ use crate::config::SidebarConfig;
 use crate::feed::ops::{self, Authority, Zone};
 use crate::feed::write::save_atomic;
 use crate::feed::{AgentRef, Document, Item, Node, State};
+use crate::tui::clipboard::{ClipboardSink, SystemClipboard};
+use crate::tui::clock::{Clock, SystemClock};
+use crate::tui::dock::{HerdrCli, Runner};
 use crate::tui::modal::{EditModal, Modal, ModalStep};
 use crate::tui::socket::{AgentInfo, AgentStatus, Herdr};
 use anyhow::Result;
@@ -162,14 +165,17 @@ pub struct App {
     /// guess), so a pane driven to herdr's minimum over several iterations
     /// still returns to its original width.
     collapse_resize_steps: usize,
-    /// System-clipboard write for the edit modal's Ctrl+C/Ctrl+X
+    /// System-clipboard sink for the edit modal's Ctrl+C/Ctrl+X
     /// (`handle_modal_event` drains `EditModal::pending_clipboard` through
-    /// this after every `modal::step`). Injectable in tests — mirrors
-    /// `editor_cmd`'s "avoid a real process/env dependency in tests"
-    /// pattern, here avoiding spawning a real `pbcopy`/`xclip`/`wl-copy` (and
-    /// touching the developer's actual clipboard) on every `cargo test` run.
-    /// Defaults to `clipboard::copy`.
-    pub clipboard_copy: fn(&str) -> anyhow::Result<()>,
+    /// this after every `modal::step`). Injected so tests record writes
+    /// instead of spawning a real `pbcopy`/`xclip`/`wl-copy`. Defaults to
+    /// `clipboard::SystemClipboard`.
+    pub clipboard: Box<dyn ClipboardSink>,
+    /// Wall and monotonic time; injected so tests can drive time by hand.
+    pub clock: Box<dyn Clock>,
+    /// `herdr` CLI runner for the collapse/expand pane resize. Injected so
+    /// tests record the calls instead of spawning the real binary.
+    pub herdr_cli: Box<dyn Runner>,
 }
 
 impl App {
@@ -193,7 +199,9 @@ impl App {
                 .ok()
                 .filter(|p| !p.is_empty()),
             collapse_resize_steps: 0,
-            clipboard_copy: crate::tui::clipboard::copy,
+            clipboard: Box::new(SystemClipboard),
+            clock: Box::new(SystemClock),
+            herdr_cli: Box::new(HerdrCli::from_env()),
         }
     }
 
@@ -277,13 +285,15 @@ impl App {
                 // Best-effort real pane resize; outside herdr there is no
                 // pane id and the rendered rail alone carries the collapse.
                 if let Some(pane) = self.herdr_pane_id.clone() {
-                    let mut runner = crate::tui::dock::HerdrCli::from_env();
                     if self.collapsed {
-                        self.collapse_resize_steps =
-                            crate::tui::dock::collapse_pane(&mut runner, &self.cfg, &pane);
+                        self.collapse_resize_steps = crate::tui::dock::collapse_pane(
+                            self.herdr_cli.as_mut(),
+                            &self.cfg,
+                            &pane,
+                        );
                     } else {
                         crate::tui::dock::expand_pane(
-                            &mut runner,
+                            self.herdr_cli.as_mut(),
                             &self.cfg,
                             &pane,
                             self.collapse_resize_steps,
@@ -299,7 +309,7 @@ impl App {
             }
             Action::Advance(key) => self.advance(key),
             Action::Sweep => {
-                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let today = self.clock.today().format("%Y-%m-%d").to_string();
                 self.with_feed(|doc| {
                     let n = ops::sweep(doc, &today);
                     if n == 0 {
@@ -385,6 +395,8 @@ impl App {
             .unwrap_or(self.doc.nodes.len());
         crate::feed::write::render(&Document {
             nodes: self.doc.nodes[start..end].to_vec(),
+            // On-screen text, not a write: canonical LF regardless of the file.
+            style: Default::default(),
         })
     }
 
@@ -428,12 +440,12 @@ impl App {
         // Ctrl+C/Ctrl+X only records the yanked text in
         // `EditModal::pending_clipboard`. Drain it here (one-shot, mirroring
         // `editor_request`/`take_editor_request`) and do the actual spawn,
-        // via the injectable `clipboard_copy` so tests never touch a real
+        // via the injected `clipboard` sink so tests never touch a real
         // clipboard tool. Best-effort: a failure becomes a status message,
         // never a crash or a dropped edit.
         if let Modal::Edit(m) = &mut self.modal {
             if let Some(text) = m.pending_clipboard.take() {
-                if let Err(e) = (self.clipboard_copy)(&text) {
+                if let Err(e) = self.clipboard.copy(&text) {
                     self.status_msg = Some(format!("clipboard: {e}"));
                 }
             }
@@ -1115,21 +1127,24 @@ mod tests {
     // `edit_step` (modal.rs) stays pure — it only records the yanked text in
     // `EditModal::pending_clipboard` on Ctrl+C/Ctrl+X. These tests cover the
     // drain wiring in `handle_modal_event` (pending_clipboard -> the
-    // injectable `clipboard_copy` -> status_msg on failure), NOT the real
+    // injected `clipboard` sink -> status_msg on failure), NOT the real
     // `clipboard::copy` spawn (that would shell out to a real `pbcopy` and
     // touch the developer's actual clipboard on every `cargo test` run —
     // `clipboard::choose_command`'s own unit tests in clipboard.rs cover the
     // platform-tool choice instead). The injected sink below deliberately
     // fails, embedding the received text in the error, so asserting on
     // `status_msg` proves both that the drain fired AND what text it passed.
-    fn fake_clipboard_sink(text: &str) -> anyhow::Result<()> {
-        anyhow::bail!("test-sink:{text}")
+    struct FailingSink;
+    impl ClipboardSink for FailingSink {
+        fn copy(&mut self, text: &str) -> anyhow::Result<()> {
+            anyhow::bail!("test-sink:{text}")
+        }
     }
 
     #[test]
     fn copy_step_drains_pending_clipboard_through_the_injected_sink() {
         let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n");
-        app.clipboard_copy = fake_clipboard_sink;
+        app.clipboard = Box::new(FailingSink);
         app.apply(Action::OpenCreate);
         press(&mut app, KeyCode::Tab); // Category -> Title
         press(&mut app, KeyCode::Tab); // Title -> Body
@@ -1156,7 +1171,7 @@ mod tests {
     #[test]
     fn copy_step_leaves_status_untouched_when_the_sink_succeeds() {
         let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n");
-        app.clipboard_copy = |_| Ok(());
+        app.clipboard = Box::new(crate::tui::clipboard::FakeClipboard::default());
         app.apply(Action::OpenCreate);
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
@@ -1170,7 +1185,7 @@ mod tests {
     #[test]
     fn no_selection_ctrl_c_never_touches_the_sink() {
         let (mut app, _fake, _dir) = app_on_disk("# Feed\n\n- [ ] A\n");
-        app.clipboard_copy = fake_clipboard_sink;
+        app.clipboard = Box::new(FailingSink);
         app.apply(Action::OpenCreate);
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);

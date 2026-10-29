@@ -176,6 +176,7 @@ pub struct App {
     /// `herdr` CLI runner for the collapse/expand pane resize. Injected so
     /// tests record the calls instead of spawning the real binary.
     pub herdr_cli: Box<dyn Runner>,
+    auto_close: crate::tui::auto_close::AutoClose,
 }
 
 impl App {
@@ -202,6 +203,7 @@ impl App {
             clipboard: Box::new(SystemClipboard),
             clock: Box::new(SystemClock),
             herdr_cli: Box::new(HerdrCli::from_env()),
+            auto_close: Default::default(),
         }
     }
 
@@ -618,6 +620,29 @@ impl App {
         })
     }
 
+    /// Time-driven work, once per loop step: the auto-close re-check.
+    pub fn tick(&mut self) {
+        use crate::tui::auto_close::Verdict;
+        let Some(own) = self.herdr_pane_id.as_deref() else {
+            return;
+        };
+        if !self.cfg.auto_close {
+            return;
+        }
+        let now = self.clock.now();
+        let quit = self.cfg.quit_herdr_when_last;
+        match self.auto_close.tick(own, now, quit, self.herdr.as_mut()) {
+            Verdict::Stay => {}
+            Verdict::Exit => self.should_quit = true,
+            Verdict::StopServerThenExit => {
+                // A failed stop still exits: herdr then just opens a fresh
+                // default workspace, as it did before auto-close.
+                let _ = self.herdr.stop_server();
+                self.should_quit = true;
+            }
+        }
+    }
+
     pub fn on_event(&mut self, ev: crate::tui::AppEvent) {
         match ev {
             crate::tui::AppEvent::FeedChanged => self.reload(),
@@ -633,7 +658,13 @@ impl App {
                     a.status = status;
                 }
             }
-            crate::tui::AppEvent::Layout { .. } => {}
+            crate::tui::AppEvent::Layout { pane_ids, .. } => {
+                if let (true, Some(own)) = (self.cfg.auto_close, self.herdr_pane_id.as_deref()) {
+                    let now = self.clock.now();
+                    self.auto_close
+                        .on_layout(own, &pane_ids, now, self.herdr.as_mut());
+                }
+            }
             crate::tui::AppEvent::SocketDown => self.statuses.clear(),
         }
     }
@@ -761,6 +792,8 @@ mod tests {
             width: 0.18,
             max_width: 46,
             auto_dock: false,
+            auto_close: true,
+            quit_herdr_when_last: true,
         }
     }
 

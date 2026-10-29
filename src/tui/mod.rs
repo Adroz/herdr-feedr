@@ -1,4 +1,5 @@
 pub mod app;
+pub mod auto_close;
 pub mod clipboard;
 pub mod clock;
 pub mod dock;
@@ -39,7 +40,7 @@ pub enum AppEvent {
         status: socket::AgentStatus,
     },
     /// A tab's layout changed (`layout.updated`): the panes now in it.
-    /// Feeds sidebar auto-close; unused by the app until then.
+    /// Drives sidebar auto-close (`auto_close.rs`).
     Layout {
         tab_id: String,
         pane_ids: Vec<String>,
@@ -204,6 +205,7 @@ where
     if drain_events(app, rx) {
         app.reload();
     }
+    app.tick();
     if let Some(path) = app.take_editor_request() {
         let editor = app.editor_cmd.clone().unwrap_or_default();
         if let Err(e) = host.run_editor(terminal, &editor, &path) {
@@ -325,6 +327,8 @@ mod tests {
             width: 0.18,
             max_width: 46,
             auto_dock: false,
+            auto_close: true,
+            quit_herdr_when_last: true,
         };
         let mut app = App::new(path.clone(), cfg, Box::new(socket::FakeHerdr::default()));
         app.reload();

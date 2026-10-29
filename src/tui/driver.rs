@@ -11,7 +11,7 @@ use crate::tui::app::App;
 use crate::tui::clipboard::FakeClipboard;
 use crate::tui::clock::FakeClock;
 use crate::tui::dock::Runner;
-use crate::tui::socket::FakeHerdr;
+use crate::tui::socket::{FakeHerdr, PaneEntry};
 use crate::tui::{step, AppEvent, Flow, Host};
 use anyhow::Result;
 use crossterm::event::{
@@ -28,6 +28,8 @@ use std::time::Duration;
 
 /// The pane id the driven sidebar believes it runs in.
 pub const PANE_ID: &str = "w1:p1";
+/// The tab `PANE_ID` lives in.
+pub const TAB_ID: &str = "w1:t1";
 
 type Log = Rc<RefCell<Vec<String>>>;
 
@@ -67,6 +69,7 @@ pub struct Driver {
     clock: FakeClock,
     clipboard: FakeClipboard,
     herdr_log: Log,
+    panes: Rc<RefCell<Option<Vec<PaneEntry>>>>,
     exited: bool,
     _dir: tempfile::TempDir,
 }
@@ -74,17 +77,26 @@ pub struct Driver {
 impl Driver {
     /// A sidebar of `w`x`h` cells over a temp feed holding `feed`.
     pub fn new(feed: &str, w: u16, h: u16) -> Self {
+        Self::with_config(feed, w, h, |_| {})
+    }
+
+    /// As `new`, with the sidebar config adjusted by `tweak` first.
+    pub fn with_config(feed: &str, w: u16, h: u16, tweak: impl FnOnce(&mut SidebarConfig)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("feed.md");
         std::fs::write(&path, feed).unwrap();
-        let cfg = SidebarConfig {
+        let mut cfg = SidebarConfig {
             side: Side::Left,
             width: 0.18,
             max_width: 46,
             auto_dock: false,
+            auto_close: true,
+            quit_herdr_when_last: true,
         };
+        tweak(&mut cfg);
         let herdr = FakeHerdr::default();
         let herdr_log = herdr.log.clone();
+        let panes = herdr.panes.clone();
         let clock = FakeClock::new(chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap());
         let clipboard = FakeClipboard::default();
         let mut app = App::new(path, cfg, Box::new(herdr));
@@ -105,6 +117,7 @@ impl Driver {
             clock,
             clipboard,
             herdr_log,
+            panes,
             exited: false,
             _dir: dir,
         };
@@ -150,7 +163,7 @@ impl Driver {
         self.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
     }
 
-    // No consumer yet: paste and clock-driven behaviour land later in spec #22.
+    // No consumer yet: bracketed paste lands later in spec #22.
     #[allow(dead_code)]
     pub fn paste(&mut self, text: &str) {
         self.event(Event::Paste(text.into()));
@@ -168,8 +181,36 @@ impl Driver {
         self.step();
     }
 
+    /// herdr pushes a `layout.updated` for `tab`, now holding `pane_ids`.
+    pub fn layout(&mut self, tab: &str, pane_ids: &[&str]) {
+        self.push(AppEvent::Layout {
+            tab_id: tab.into(),
+            pane_ids: pane_ids.iter().map(|p| p.to_string()).collect(),
+        });
+    }
+
+    /// Set what herdr's `pane.list` answers from now on: `(pane, tab,
+    /// title)` triples, all in workspace `w1`.
+    pub fn set_panes(&mut self, panes: &[(&str, &str, &str)]) {
+        *self.panes.borrow_mut() = Some(
+            panes
+                .iter()
+                .map(|(p, t, title)| PaneEntry {
+                    pane_id: p.to_string(),
+                    tab_id: t.to_string(),
+                    workspace_id: "w1".into(),
+                    title: Some(title.to_string()),
+                })
+                .collect(),
+        );
+    }
+
+    /// Make herdr's `pane.list` fail from now on.
+    pub fn fail_pane_list(&mut self) {
+        *self.panes.borrow_mut() = None;
+    }
+
     /// Move the fake clock forward, then let the loop run once.
-    #[allow(dead_code)] // see `paste`
     pub fn advance(&mut self, by: Duration) {
         self.clock.advance(by);
         self.step();

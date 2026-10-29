@@ -4,6 +4,8 @@ pub mod clock;
 pub mod dock;
 #[cfg(test)]
 pub mod driver;
+#[cfg(test)]
+pub mod fake_socket;
 pub mod input;
 pub mod modal;
 pub mod socket;
@@ -16,7 +18,10 @@ pub mod watch;
 use crate::config::SidebarConfig;
 use anyhow::{bail, Result};
 use app::App;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event,
+};
 use crossterm::tty::IsTty;
 use ratatui::backend::Backend;
 use ratatui::Terminal;
@@ -26,9 +31,22 @@ use std::time::Duration;
 
 /// Events pushed by background threads (file watcher: Task 11; socket
 /// subscriber: Task 12).
+#[derive(Debug, PartialEq)]
 pub enum AppEvent {
     FeedChanged,
+    /// Full agent resync (`agent.list`).
     Agents(Vec<socket::AgentInfo>),
+    /// One pane's agent status, pushed by herdr.
+    AgentStatus {
+        pane_id: String,
+        status: socket::AgentStatus,
+    },
+    /// A tab's layout changed (`layout.updated`): the panes now in it.
+    /// Feeds sidebar auto-close; unused by the app until then.
+    Layout {
+        tab_id: String,
+        pane_ids: Vec<String>,
+    },
     SocketDown,
 }
 
@@ -76,21 +94,29 @@ pub fn run(feed_path: PathBuf, cfg: SidebarConfig) -> Result<()> {
     let mut terminal = ratatui::init();
     let _ = reinit_terminal_commands(&mut std::io::stdout());
     let res = event_loop(&mut terminal, &mut app, &rx, &mut CrosstermHost);
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = teardown_terminal_commands(&mut std::io::stdout());
     ratatui::restore();
     res
 }
 
 /// Re-assert terminal output state that an external program (e.g. $EDITOR,
 /// during the resume path in `event_loop`) is free to clobber while it holds
-/// the tty: mouse capture and the dock pane-title marker. Writes to `w` so
-/// the exact command bytes can be asserted in tests without a live terminal.
+/// the tty: mouse capture, bracketed paste and the dock pane-title marker.
+/// Writes to `w` so the exact command bytes can be asserted in tests without
+/// a live terminal.
 /// Both startup (`run`) and every editor-resume go through this one helper,
 /// so the two paths can't drift out of sync again.
 fn reinit_terminal_commands<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
-    crossterm::execute!(w, EnableMouseCapture)?;
+    crossterm::execute!(w, EnableMouseCapture, EnableBracketedPaste)?;
     crossterm::execute!(w, crossterm::terminal::SetTitle(dock::PANE_TITLE_MARKER))?;
     Ok(())
+}
+
+/// Undo `reinit_terminal_commands`' input modes before handing the tty back
+/// (to the shell on exit, or to $EDITOR), so neither inherits mouse capture
+/// or bracketed paste.
+fn teardown_terminal_commands<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
+    crossterm::execute!(w, DisableBracketedPaste, DisableMouseCapture)
 }
 
 /// Run $EDITOR (may carry args, e.g. "code -w") on the feed file.
@@ -153,6 +179,7 @@ impl Host<ratatui::backend::CrosstermBackend<std::io::Stdout>> for CrosstermHost
         editor: &str,
         path: &Path,
     ) -> Result<()> {
+        let _ = teardown_terminal_commands(&mut std::io::stdout());
         ratatui::restore();
         let result = spawn_editor(editor, path);
         *terminal = ratatui::init();
@@ -253,6 +280,25 @@ mod tests {
             out.contains(&want_title),
             "must re-assert the dock pane-title marker, got: {out:?}"
         );
+    }
+
+    /// Bracketed paste makes a terminal paste arrive as one `Event::Paste`
+    /// instead of keystrokes (whose newlines would act as Enter). Setup and
+    /// every editor-resume enable it; teardown (exit and editor-suspend)
+    /// turns it and mouse capture back off so the shell/editor isn't left
+    /// with them.
+    #[test]
+    fn terminal_setup_enables_and_teardown_disables_bracketed_paste() {
+        let mut up: Vec<u8> = Vec::new();
+        reinit_terminal_commands(&mut up).unwrap();
+        let up = String::from_utf8(up).unwrap();
+        assert!(up.contains("\x1B[?2004h"), "setup got: {up:?}");
+
+        let mut down: Vec<u8> = Vec::new();
+        teardown_terminal_commands(&mut down).unwrap();
+        let down = String::from_utf8(down).unwrap();
+        assert!(down.contains("\x1B[?2004l"), "teardown got: {down:?}");
+        assert!(down.contains("\x1B[?1000l"), "teardown got: {down:?}");
     }
 
     #[test]

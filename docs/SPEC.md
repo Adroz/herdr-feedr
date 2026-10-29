@@ -34,15 +34,18 @@ Format — a GitHub-flavored markdown checklist:
 - **Title** = rest of the line minus trailing `@key(value)` tokens. The sidebar shows only this line.
 - **Body** = following lines indented two spaces: freeform markdown (fenced code allowed, keep the indent). Context for whoever works the item; hidden in the sidebar list.
 - **Agent link** = trailing `@agent(<kind>:<session-id>)` token. One per item; the latest claim replaces it.
+- **Today** = trailing `@today` token ([#22](https://github.com/Adroz/herdr-feedr/issues/22)): the human's current focus. At most three uncompleted (`[ ]`/`[~]`/`[?]`) items carry it; the item stays in its home section. Any transition to `[x]` strips it in the same write, so the file keeps no trace of past focus. A hand-edited file with more than three is honoured, never rewritten.
 - **Sections** = `##` headings, optional, in your order. Top-to-bottom is your priority order.
 - **Archive** = a `# Done` region at the bottom of the file, holding swept items under mirrored `##` section names, bodies kept, each stamped `@done(YYYY-MM-DD)` (see §2a).
 - The file is always valid markdown a human can edit directly.
+- feedr never silently changes formatting it didn't need to touch: `[X]` reads as done and is kept as typed unless that item changes; CRLF and a missing trailing newline are preserved; tab-indented bodies are accepted.
 
 ## 2. Provenance and completion authority ([#7](https://github.com/Adroz/herdr-feedr/issues/7))
 
 - **Human-created** items live in your sections. Only you write their `[x]` — even when an agent did the work. An agent finishing one writes `[?]` plus a body evidence note (PR link, test results) via `feedr review --note`; you review and tick.
 - **Agent-created** items live in the reserved `## Agent` section. Agents may close them `[x]` themselves.
 - Provenance = who *initiated*, not who typed: "add X to my list" said to an agent lands in your sections with your authority.
+- **Today** is set and unset by the human only (edit modal or hand edit). Agents read it; no CLI command writes it.
 
 ## 2a. Sweep and archive ([#10](https://github.com/Adroz/herdr-feedr/issues/10))
 
@@ -82,6 +85,15 @@ Interactions:
 - **`toggle-feedr`** plugin action (user-bindable) fully closes/opens the sidebar.
 - Refresh is automatic: file-watch on the feed + socket event subscription. No refresh key. The sidebar never steals focus on open.
 
+Additions ([#22](https://github.com/Adroz/herdr-feedr/issues/22)):
+
+- **Today panel**: a bordered ` Today ` block pinned above the list, no count; each item is a checkbox + title row with its category on an indented muted sub-line. Today items appear only there, in file order. Hidden when empty; outline turns red when over cap (hand edit). The edit modal shows `☆/★ Today` in its top border, toggled by Ctrl+T; a fourth mark is refused with "Today full — unmark one first".
+- **Outside click**: closes read-only modals; closes a clean edit modal like Esc; a dirty edit modal stays open with "unsaved — Esc to discard, Ctrl+S to save"; an open dropdown closes first; ConfirmDelete cancels. The click never falls through to the list.
+- **Copy**: feedr owns copy-on-select in edit fields and the read-only viewers (not the list). Mouse-up after a drag copies; double-click selects a word (herdr's rules) and triple-click a logical line, both copying immediately; Ctrl+C still works. Writes OSC 52, then pbcopy/wl-copy/xclip; status "Copied N chars". Cmd+C is not available (macOS terminals swallow it); herdr copy mode (`prefix+[`) is the fallback.
+- **Paste**: bracketed paste; newlines become spaces in Title/Category, kept in Body.
+- **Auto-close**: when the sidebar is the only pane left in its tab (other feedr sidebars/popups don't count as company), it exits, closing the tab and, if last, the workspace. If it was the last pane anywhere in herdr it calls `server.stop` so herdr quits. Armed only after company is seen; ~400 ms debounce plus a `pane.list` re-check; never closes on a failed query. `[sidebar] auto_close` and `quit_herdr_when_last` (both default true) opt out.
+- Auto-dock restores the user's focus after placing a sidebar.
+
 ## 4. The `feedr` CLI ([#8](https://github.com/Adroz/herdr-feedr/issues/8))
 
 The same binary as the TUI. Subcommands are the machine interface to the feed:
@@ -90,6 +102,7 @@ The same binary as the TUI. Subcommands are the machine interface to the feed:
 
 - `claim` writes `[~]` and stamps `@agent(<kind>:<session-id>)`. The agent ref resolves in order: `--agent <kind>:<id>` > `FEEDR_AGENT` > `herdr pane current` (only when `HERDR_ENV=1`) > `CLAUDE_CODE_SESSION_ID` → `claude:<uuid>` — the last verified identical to herdr's `agent_session.value`, so the common case needs no socket call and identity also resolves outside herdr. When none yields an id, `claim` fails non-zero naming the sources tried; it never claims untagged, because an unlinked claim is a dead link the sidebar can't jump from.
 - `whoami` prints the resolved ref and its source.
+- `list` and `show` flag Today items. Item lookup prefers an exact case-insensitive title match over substring matches.
 - `unclaim` releases a claim: it clears the `@agent` tag and returns the item to `[ ]`, so it reads as takeable again. Only an **in-progress** item can be released — once work has been handed back (`[?]`) or closed (`[x]`), the tag is the record of who did it, not a lock. Authority mirrors §2: an agent releases only its own claim; `--as-human` (what the sidebar uses) releases anyone's.
 - `review` writes `[?]`; `done` writes `[x]` — permitted only per §2 authority. Both take a repeatable `--note <line>` that appends evidence to the item's body in the same write as the state change; `--note` is **required** on `review`, since `[?]` without its reason is what §2 exists to prevent.
 - All writes go through one parser/writer shared with the sidebar (see §6).
@@ -100,6 +113,7 @@ The same binary as the TUI. Subcommands are the machine interface to the feed:
 
 - Agents normally arrive with context (a named task, or a task to create). A context-free invocation lists open items and **asks**; it never auto-grabs.
 - Claim before working; finish per §2 (`review` + evidence on human-created, `done` on agent-created); add follow-up work with `add --agent-owned`.
+- A context-free invocation lists Today items first and suggests them.
 - Body, in order: the golden rule (**never edit the feed file directly** — every read and write goes through the CLI, or §6's atomicity is void); identity via `feedr whoami`, stopping to ask if it fails rather than claiming untagged; claim-or-ask; `add --agent-owned` for follow-up work; finish by §2 authority (`--human` is off-limits to agents); `sweep` and the `# Done` archive are human-only; one worked example.
 - Delivery (herdr has no skill mechanism; plugin `skills/` dirs are inert convention): the **binary owns it**. `skills/herdr-feedr/SKILL.md` is the in-repo source of truth, embedded with `include_str!` so `feedr skill install` works from an installed binary with no checkout.
   - `feedr skill install` writes exactly two paths and no others: `~/.agents/skills/herdr-feedr/` (canonical) and `~/.claude/skills/herdr-feedr/` (symlink into `~/.agents` when absent, copy when symlinking fails, overwrite when a real dir is already there). It prints every path written.
@@ -119,11 +133,12 @@ You and agents edit the same file at the same time; that's the point. How nothin
 
 - Every sidebar action and every CLI command **reads the file fresh, applies its one change, and writes the whole file back atomically** (temp file + rename — the file on disk is never half-written). Interleaved small edits — you ticking a box while an agent claims an item — all land.
 - The sidebar re-reads on every file change, so it always shows current state.
+- Every read-modify-write holds an advisory `flock` on a sibling `feed.md.lock`, so concurrent CLI and sidebar writers never lose an update.
 - The one loseable case: a whole-file `$EDITOR` session held open while something else writes — the editor's save wins over anything written since the buffer opened. Accepted for v1; keep editor sessions short. Everyday edits go through the safe path.
 
 ## 7. Agent status plumbing ([#3](https://github.com/Adroz/herdr-feedr/issues/3))
 
-From the herdr socket API (`~/.config/herdr/herdr.sock`, NDJSON): `pane.list`/`agent.list` for agent kind, status, and `agent_session` UUID; `events.subscribe` for live status changes; `agent.focus` for navigation. Task-plan transcript replay (TaskCreate/TaskUpdate) is **not needed in v1** — agents surface their work by writing to the feed via the CLI; the socket supplies only statuses, the join key, and focus.
+From the herdr socket API (`~/.config/herdr/herdr.sock`, NDJSON): `pane.list`/`agent.list` for agent kind, status, and `agent_session` UUID; `events.subscribe` for live status changes; `agent.focus` for navigation. Pushed frames are `{"event": …, "data": {"type": …}}`; `layout.updated` (tab id + panes) drives auto-close, and `server.stop` quits herdr when the sidebar was the last pane. Task-plan transcript replay (TaskCreate/TaskUpdate) is **not needed in v1** — agents surface their work by writing to the feed via the CLI; the socket supplies only statuses, the join key, and focus.
 
 ## 8. Implementation ([#9](https://github.com/Adroz/herdr-feedr/issues/9))
 

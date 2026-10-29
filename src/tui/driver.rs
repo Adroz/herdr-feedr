@@ -150,8 +150,7 @@ impl Driver {
         self.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
     }
 
-    // No consumer yet: paste and clock-driven behaviour land later in spec #22.
-    #[allow(dead_code)]
+    /// A bracketed terminal paste, delivered as one event.
     pub fn paste(&mut self, text: &str) {
         self.event(Event::Paste(text.into()));
     }
@@ -169,7 +168,8 @@ impl Driver {
     }
 
     /// Move the fake clock forward, then let the loop run once.
-    #[allow(dead_code)] // see `paste`
+    // No consumer yet: clock-driven behaviour lands later in spec #22.
+    #[allow(dead_code)]
     pub fn advance(&mut self, by: Duration) {
         self.clock.advance(by);
         self.step();

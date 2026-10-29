@@ -482,9 +482,9 @@ mod tests {
         assert_eq!(rows[6], "+ add");
         assert_eq!(rows[9], "Done (1)"); // bottom-pinned, h-3
         assert_eq!(rows[10], "clear completed"); // under Done, h-2
-                                          // status line, h-1: "hello" on the left, « pinned bottom-right
-                                          // (round-3 item 2 — native-herdr collapse position). 20-col row:
-                                          // "hello" (5) + 14 blank cells + « (1) = 20.
+                                                 // status line, h-1: "hello" on the left, « pinned bottom-right
+                                                 // (round-3 item 2 — native-herdr collapse position). 20-col row:
+                                                 // "hello" (5) + 14 blank cells + « (1) = 20.
         assert_eq!(rows[11], format!("hello{}«", " ".repeat(14)));
     }
 
@@ -572,8 +572,7 @@ mod tests {
         let mut m = modal::EditModal::edit(key, &item, None, vec![]);
 
         let (w, h) = (60, 24);
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
         term.draw(|f| draw_edit_modal(f, &mut m)).unwrap();
         let buf = term.backend().buffer().clone();
         let layout = modal::edit_layout(Rect::new(0, 0, w, h), true, false, m.dropdown_rows());
@@ -600,9 +599,9 @@ mod tests {
             filled[0]
         );
         assert!(
-            filled.iter().any(|r| r.contains("running")
-                || r.contains("past")
-                || r.contains("edge")),
+            filled
+                .iter()
+                .any(|r| r.contains("running") || r.contains("past") || r.contains("edge")),
             "later text must appear on a following row, not scrolled away: {rows:?}"
         );
     }

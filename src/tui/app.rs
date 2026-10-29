@@ -680,9 +680,8 @@ mod tests {
 
     #[test]
     fn empty_sections_render_no_header() {
-        let doc = parse(
-            "# Feed\n\n## Empty\n\n## Interactives\n\n- [ ] Build event db\n\n## Trailing\n",
-        );
+        let doc =
+            parse("# Feed\n\n## Empty\n\n## Interactives\n\n- [ ] Build event db\n\n## Trailing\n");
         let (rows, _) = build_rows(&doc);
         assert_eq!(
             rows,

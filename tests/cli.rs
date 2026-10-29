@@ -854,3 +854,77 @@ fn no_cli_command_sets_or_unsets_today() {
         "Today is the human's alone:\n{help}"
     );
 }
+
+// --- Write locking (SPEC §6) ------------------------------------------------
+
+#[test]
+fn parallel_adds_all_land() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    const N: usize = 24;
+    let outputs = common::feedr_parallel(dir.path(), N, |i| {
+        vec![
+            "--file".into(),
+            feed.display().to_string(),
+            "add".into(),
+            format!("Parallel item {i}"),
+        ]
+    });
+    for (i, out) in outputs.iter().enumerate() {
+        assert!(
+            out.status.success(),
+            "add {i} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let text = std::fs::read_to_string(&feed).unwrap();
+    let missing: Vec<_> = (0..N)
+        .filter(|i| !text.contains(&format!("- [ ] Parallel item {i}\n")))
+        .collect();
+    assert!(missing.is_empty(), "lost updates {missing:?} in:\n{text}");
+    assert!(text.contains("- [ ] Fix auth redirect loop\n"));
+}
+
+/// Hold `feed.md.lock` beside `feed` as another writer would.
+fn hold_lock(feed: &std::path::Path) -> std::fs::File {
+    let lock = std::fs::File::create(feed.with_file_name("feed.md.lock")).unwrap();
+    lock.lock().unwrap();
+    lock
+}
+
+#[test]
+fn a_write_that_cannot_get_the_lock_fails_naming_the_lock_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    let before = std::fs::read_to_string(&feed).unwrap();
+    let _held = hold_lock(&feed);
+    feedr(&feed)
+        .env("FEEDR_LOCK_TIMEOUT_MS", "200")
+        .args(["add", "Blocked"])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .failure()
+        .stderr(contains("feed.md.lock"))
+        .stderr(contains("timed out"));
+    assert_eq!(std::fs::read_to_string(&feed).unwrap(), before);
+}
+
+#[test]
+fn reads_do_not_wait_for_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = seed(dir.path());
+    let _held = hold_lock(&feed);
+    feedr(&feed)
+        .env("FEEDR_LOCK_TIMEOUT_MS", "60000")
+        .arg("list")
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .success()
+        .stdout(contains("Fix auth redirect loop"));
+    feedr(&feed)
+        .env("FEEDR_LOCK_TIMEOUT_MS", "60000")
+        .args(["show", "auth"])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .success();
+}

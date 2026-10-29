@@ -132,6 +132,7 @@ pub struct FileStyle {
     pub no_trailing_newline: bool,
 }
 
+pub mod lock;
 pub mod ops;
 pub mod parse;
 pub mod write;

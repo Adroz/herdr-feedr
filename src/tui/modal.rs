@@ -731,7 +731,31 @@ fn paste_focused(m: &mut EditModal) {
     }
 }
 
+/// Terminal (bracketed) paste: the whole paste lands in the focused field as
+/// one insert, replacing any selection. Category and Title are single-line,
+/// so each CR, LF or CRLF becomes one space; Body keeps line breaks (a lone
+/// CR is normalised to LF, since `insert_str` only splits on LF/CRLF).
+fn paste_text_focused(m: &mut EditModal, text: &str) {
+    let single_line = matches!(m.focus, EditFocus::Category | EditFocus::Title);
+    let Some(ta) = focused_textarea_mut(m) else {
+        return;
+    };
+    let unified = text.replace("\r\n", "\n").replace('\r', "\n");
+    if single_line {
+        ta.insert_str(unified.replace('\n', " "));
+    } else {
+        ta.insert_str(unified);
+    }
+    if m.focus == EditFocus::Category {
+        m.dropdown = None; // paste refilters the suggestions
+    }
+}
+
 fn edit_step(mut m: EditModal, ev: Event, area: Rect) -> ModalStep {
+    if let Event::Paste(text) = &ev {
+        paste_text_focused(&mut m, text);
+        return ModalStep::Continue(Modal::Edit(m));
+    }
     if let Event::Key(k) = &ev {
         match (k.code, k.modifiers) {
             // Esc layering: an active selection in the focused field cancels
@@ -2193,5 +2217,100 @@ mod tests {
         assert_eq!(m.category.selection_style(), theme::selection());
         assert_eq!(m.title.selection_style(), theme::selection());
         assert_eq!(m.body.selection_style(), theme::selection());
+    }
+}
+
+/// Terminal (bracketed) paste into the edit modal, driven end to end.
+#[cfg(test)]
+mod paste_tests {
+    use crate::tui::driver::Driver;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    /// Open the edit modal on the only item, focused on Title, then paste.
+    fn paste_into_title(text: &str) -> Driver {
+        let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n", 40, 24);
+        d.click(6, 0); // title zone of the first row: edit modal, Category
+        d.key(KeyCode::Tab, KeyModifiers::NONE); // -> Title, cursor at end
+        d.paste(text);
+        d
+    }
+
+    fn save(d: &mut Driver) {
+        d.key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    }
+
+    #[test]
+    fn pasting_lf_lines_into_title_joins_them_with_spaces() {
+        let mut d = paste_into_title(" one\ntwo\nthree");
+        save(&mut d);
+        assert_eq!(d.feed(), "# Feed\n\n- [ ] Alpha one two three\n");
+    }
+
+    #[test]
+    fn pasting_crlf_and_lone_cr_into_title_gives_one_space_per_break() {
+        let mut d = paste_into_title(" one\r\ntwo\rthree");
+        save(&mut d);
+        assert_eq!(d.feed(), "# Feed\n\n- [ ] Alpha one two three\n");
+    }
+
+    #[test]
+    fn a_multi_line_paste_into_title_does_not_act_as_enter() {
+        let mut d = paste_into_title("\n");
+        d.type_str("x");
+        save(&mut d);
+        assert_eq!(
+            d.feed(),
+            "# Feed\n\n- [ ] Alpha x\n",
+            "focus stays on Title; the newline is a space, not Enter-to-Body"
+        );
+    }
+
+    #[test]
+    fn pasting_into_category_flattens_newlines() {
+        let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n", 40, 24);
+        d.click(6, 0); // edit modal opens on Category
+        d.paste("Big\r\nRocks");
+        save(&mut d);
+        assert!(
+            d.feed().contains("## Big Rocks\n\n- [ ] Alpha\n"),
+            "got: {:?}",
+            d.feed()
+        );
+    }
+
+    #[test]
+    fn pasting_into_body_keeps_lf_and_crlf_line_breaks() {
+        let mut d = paste_into_title("");
+        d.key(KeyCode::Tab, KeyModifiers::NONE); // Title -> Body
+        d.paste("first\r\nsecond\nthird");
+        save(&mut d);
+        assert_eq!(
+            d.feed(),
+            "# Feed\n\n- [ ] Alpha\n  first\n  second\n  third\n"
+        );
+    }
+
+    #[test]
+    fn pasted_text_replaces_the_active_selection() {
+        let mut d = paste_into_title("");
+        // Select the whole title "Alpha" (cursor parked at its end).
+        for _ in 0..5 {
+            d.key(KeyCode::Left, KeyModifiers::SHIFT);
+        }
+        d.paste("Beta\nGamma");
+        save(&mut d);
+        assert_eq!(d.feed(), "# Feed\n\n- [ ] Beta Gamma\n");
+    }
+
+    #[test]
+    fn a_paste_in_the_list_view_triggers_no_keybindings() {
+        let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n", 40, 24);
+        d.paste("q\na\ne");
+        assert!(!d.exit_requested(), "a pasted 'q' must not quit");
+        assert!(
+            !d.screen().iter().any(|l| l.contains("item")),
+            "a pasted 'a' must not open the add modal"
+        );
+        assert_eq!(d.feed(), "# Feed\n\n- [ ] Alpha\n");
     }
 }

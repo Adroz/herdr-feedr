@@ -24,20 +24,20 @@ command = ["/bin/sh", "scripts/build.sh"]
 
 # The sidebar pane. herdr performs the split placement on launch; the [[actions]] below
 # summon it (open/focus/close) and do the left-edge dock (swap-walk + resize) that herdr's
-# plugin pane system has no native support for — see scripts/open-feedr.sh.
+# plugin pane system has no native support for — see src/tui/dock.rs (`feedr sidebar --dock`).
 [[panes]]
 id = "feedr-sidebar"
 title = "feedr"
 placement = "split"
 command = ["./target/release/feedr", "sidebar"]
 
-# Open (or focus, if already open) the sidebar, docked to the left edge. Bind this to a
+# Open (or focus, if already open) the sidebar, docked per `[sidebar]` side/width. Bind this to a
 # keybinding in ~/.config/herdr/config.toml (see README's "Install as a herdr plugin").
 [[actions]]
 id = "open-feedr"
 platforms = ["linux", "macos"]
 title = "Open feedr"
-description = "Open or focus the feedr sidebar, docked to the left edge of the current tab."
+description = "Open or focus the feedr sidebar, docked to the configured edge of the current tab."
 command = ["bash", "scripts/open-feedr.sh"]
 
 # Close the sidebar if it's open; otherwise open it (same dock behavior as open-feedr).

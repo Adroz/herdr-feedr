@@ -133,7 +133,7 @@ You and agents edit the same file at the same time; that's the point. How nothin
 
 - Every sidebar action and every CLI command **reads the file fresh, applies its one change, and writes the whole file back atomically** (temp file + rename — the file on disk is never half-written). Interleaved small edits — you ticking a box while an agent claims an item — all land.
 - The sidebar re-reads on every file change, so it always shows current state.
-- Every read-modify-write holds an advisory `flock` on a sibling `feed.md.lock`, so concurrent CLI and sidebar writers never lose an update.
+- Every read-modify-write holds an advisory `flock` on a sibling `feed.md.lock`, so concurrent CLI and sidebar writers never lose an update. Reads (`list`, `show`, the sidebar's redraw) don't lock. A writer that can't get the lock within 5 s (`FEEDR_LOCK_TIMEOUT_MS` overrides) fails with an error naming the lock file — the CLI exits non-zero, the sidebar drops the action and says so — rather than hanging.
 - The one loseable case: a whole-file `$EDITOR` session held open while something else writes — the editor's save wins over anything written since the buffer opened. Accepted for v1; keep editor sessions short. Everyday edits go through the safe path.
 
 ## 7. Agent status plumbing ([#3](https://github.com/Adroz/herdr-feedr/issues/3))

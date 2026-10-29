@@ -94,6 +94,8 @@ impl Driver {
         app.clock = Box::new(clock.clone());
         app.clipboard = Box::new(clipboard.clone());
         app.herdr_cli = Box::new(RecordingCli(herdr_log.clone()));
+        // Short, and never from the env: a held lock fails fast in tests.
+        app.lock_timeout = Duration::from_millis(50);
         app.reload();
         let (tx, rx) = mpsc::channel();
         let mut d = Driver {
@@ -150,8 +152,7 @@ impl Driver {
         self.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
     }
 
-    // No consumer yet: paste and clock-driven behaviour land later in spec #22.
-    #[allow(dead_code)]
+    /// A bracketed terminal paste, delivered as one event.
     pub fn paste(&mut self, text: &str) {
         self.event(Event::Paste(text.into()));
     }
@@ -169,7 +170,8 @@ impl Driver {
     }
 
     /// Move the fake clock forward, then let the loop run once.
-    #[allow(dead_code)] // see `paste`
+    // No consumer yet: clock-driven behaviour lands later in spec #22.
+    #[allow(dead_code)]
     pub fn advance(&mut self, by: Duration) {
         self.clock.advance(by);
         self.step();
@@ -250,6 +252,50 @@ mod tests {
     }
 
     #[test]
+    fn a_save_after_an_agent_claims_the_item_keeps_the_edit_and_the_claim() {
+        let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n", 40, 24);
+        d.click(6, 0);
+        d.key(KeyCode::Tab, KeyModifiers::NONE); // Category -> Title
+        d.type_str(" fixed");
+        d.key(KeyCode::Tab, KeyModifiers::NONE); // Title -> Body
+        d.type_str("notes");
+
+        // An agent claims the item while the modal is open.
+        std::fs::write(d.feed_path(), "# Feed\n\n- [~] Alpha @agent(claude:abc)\n").unwrap();
+        d.push(AppEvent::FeedChanged);
+        d.key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            d.feed(),
+            "# Feed\n\n- [~] Alpha fixed @agent(claude:abc)\n  notes\n"
+        );
+        assert!(!d.screen().iter().any(|l| l.contains("Edit item")));
+    }
+
+    #[test]
+    fn a_save_after_the_item_was_deleted_on_disk_says_so_and_keeps_the_modal() {
+        let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n- [ ] Beta\n", 40, 24);
+        d.click(6, 0);
+        d.key(KeyCode::Tab, KeyModifiers::NONE);
+        d.type_str(" fixed");
+
+        std::fs::write(d.feed_path(), "# Feed\n\n- [ ] Beta\n").unwrap();
+        d.push(AppEvent::FeedChanged);
+        d.key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        assert_eq!(d.feed(), "# Feed\n\n- [ ] Beta\n", "nothing written");
+        let screen = d.screen();
+        assert!(
+            screen.last().unwrap().contains("deleted on disk"),
+            "status row reports the miss: {screen:#?}"
+        );
+        assert!(
+            screen.iter().any(|l| l.contains("Alpha fixed")),
+            "the typed edit stays in the open modal"
+        );
+    }
+
+    #[test]
     fn a_pushed_feed_change_redraws_from_disk() {
         let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n", 40, 12);
         std::fs::write(d.feed_path(), "# Feed\n\n- [ ] Beta\n").unwrap();
@@ -272,6 +318,26 @@ mod tests {
     fn sweep_stamps_the_injected_clock_date() {
         let mut d = Driver::new("# Feed\n\n- [x] Alpha\n", 40, 12);
         d.click(2, 10); // "clear completed" on the toolbar (row h-2)
+        assert!(d.feed().contains("@done(2026-01-15)"), "got: {}", d.feed());
+    }
+
+    #[test]
+    fn a_sidebar_write_waits_on_the_shared_feed_lock() {
+        let mut d = Driver::new("# Feed\n\n- [x] Alpha\n", 100, 12);
+        let before = d.feed();
+        let held = std::fs::File::create(d.feed_path().with_file_name("feed.md.lock")).unwrap();
+        held.lock().unwrap();
+
+        d.click(2, 10); // "clear completed" while another writer holds the lock
+        assert_eq!(d.feed(), before, "no write without the lock");
+        assert!(
+            d.screen().iter().any(|l| l.contains("feed.md.lock")),
+            "the status line names the lock: {:#?}",
+            d.screen()
+        );
+
+        drop(held);
+        d.click(2, 10);
         assert!(d.feed().contains("@done(2026-01-15)"), "got: {}", d.feed());
     }
 

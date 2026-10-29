@@ -1,4 +1,5 @@
 use crate::config;
+use crate::feed::lock;
 use crate::feed::ops::{self, Authority, Zone};
 use crate::feed::parse::parse;
 use crate::feed::write;
@@ -269,6 +270,12 @@ pub fn run() -> Result<()> {
         println!("{} (from {})", id.agent, id.source.label());
         return Ok(());
     }
+    // Writers hold the feed lock from before the read until after the
+    // atomic save (SPEC §6); readers don't lock.
+    let _lock = match cli.command {
+        Cmd::List | Cmd::Show { .. } => None,
+        _ => Some(lock::acquire(&path, lock::timeout_from_env())?),
+    };
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),

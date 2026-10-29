@@ -9,7 +9,7 @@ use crate::tui::dock::{HerdrCli, Runner};
 use crate::tui::modal::{EditModal, Modal, ModalStep};
 use crate::tui::socket::{AgentInfo, AgentStatus, Herdr};
 use anyhow::Result;
-use crossterm::event::Event;
+use crossterm::event::{Event, MouseButton, MouseEventKind};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -234,6 +234,10 @@ pub struct App {
     /// tests record the calls instead of spawning the real binary.
     pub herdr_cli: Box<dyn Runner>,
     auto_close: crate::tui::auto_close::AutoClose,
+    /// Counts left presses inside a modal into double/triple clicks. Only
+    /// modal presses feed it, so the list click that opens a modal never
+    /// pairs with a first click inside it.
+    clicks: crate::tui::selection::ClickTracker,
     /// How long a write waits for the feed lock held by another writer.
     pub lock_timeout: std::time::Duration,
 }
@@ -265,6 +269,7 @@ impl App {
             clock: Box::new(SystemClock),
             herdr_cli: Box::new(HerdrCli::from_env()),
             auto_close: Default::default(),
+            clicks: Default::default(),
             lock_timeout: lock::timeout_from_env(),
         }
     }
@@ -503,7 +508,13 @@ impl App {
     pub fn handle_modal_event(&mut self, ev: Event, size: (u16, u16)) {
         let modal = std::mem::replace(&mut self.modal, Modal::None);
         let area = ratatui::layout::Rect::new(0, 0, size.0, size.1);
-        self.modal = match crate::tui::modal::step(modal, ev, area) {
+        let clicks = match &ev {
+            Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => self
+                .clicks
+                .press(self.clock.now(), m.column, m.row, m.modifiers.is_empty()),
+            _ => 1,
+        };
+        self.modal = match crate::tui::modal::step_with_clicks(modal, ev, area, clicks) {
             ModalStep::Continue(m) => m,
             ModalStep::Save(m) => self.save_modal(m),
             ModalStep::Delete(key) => {

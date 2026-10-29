@@ -499,6 +499,8 @@ mod tests {
         let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  hello world\n");
 
         d.click(BODY_X + 2, BODY_Y);
+        // Past the multi-click window, or the press would make a double.
+        d.advance(Duration::from_secs(1));
         d.drag(&[(BODY_X + 3, BODY_Y), (BODY_X + 3, BODY_Y)]);
 
         assert!(d.clipboard_writes().is_empty());
@@ -555,6 +557,100 @@ mod tests {
         d.drag(&[(6, 0), (12, 0)]);
 
         assert!(d.clipboard_writes().is_empty());
+    }
+
+    // --- Double- and triple-click (#34) -------------------------------------
+
+    const TITLE_Y: u16 = 8;
+
+    #[test]
+    fn a_double_click_selects_and_copies_the_word_under_the_pointer() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  see https://ex.com/a, ok\n");
+
+        d.click(BODY_X + 8, BODY_Y); // inside the URL
+        d.click(BODY_X + 9, BODY_Y); // one cell over, no time passed
+
+        assert_eq!(d.clipboard_writes(), ["https://ex.com/a"]);
+        assert_eq!(d.highlighted(), "https://ex.com/a");
+        assert!(status(&d).contains("Copied 16 chars"), "{:#?}", d.screen());
+    }
+
+    #[test]
+    fn a_double_click_on_a_quoted_path_keeps_its_spaces() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  cat \"/tmp/my dir/x\" now\n");
+
+        d.click(BODY_X + 10, BODY_Y); // the 'd' of "dir"
+        d.click(BODY_X + 10, BODY_Y);
+
+        assert_eq!(d.clipboard_writes(), ["/tmp/my dir/x"]);
+    }
+
+    #[test]
+    fn a_double_click_after_wide_characters_selects_the_word_drawn_there() {
+        // 日本 takes cells 0..=3, so "word" starts at cell 5.
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  日本 word\n");
+
+        d.click(BODY_X + 6, BODY_Y);
+        d.click(BODY_X + 6, BODY_Y);
+        assert_eq!(d.clipboard_writes(), ["word"]);
+
+        d.advance(Duration::from_secs(1));
+        d.click(BODY_X + 3, BODY_Y); // right half of 本
+        d.click(BODY_X + 3, BODY_Y);
+        assert_eq!(d.clipboard_writes(), ["word", "日本"]);
+    }
+
+    #[test]
+    fn two_clicks_351ms_apart_are_two_single_clicks() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  hello world\n");
+
+        d.click(BODY_X + 2, BODY_Y);
+        d.advance(Duration::from_millis(351));
+        d.click(BODY_X + 2, BODY_Y);
+
+        assert!(d.clipboard_writes().is_empty());
+        assert_eq!(d.highlighted(), "");
+    }
+
+    #[test]
+    fn a_double_click_on_a_space_copies_nothing() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha\n  hello world\n");
+
+        d.click(BODY_X + 5, BODY_Y);
+        d.click(BODY_X + 5, BODY_Y);
+
+        assert!(d.clipboard_writes().is_empty());
+    }
+
+    #[test]
+    fn a_triple_click_in_the_body_copies_the_whole_logical_line() {
+        // The first line soft-wraps; the triple-click lands on its second
+        // drawn row and still takes the whole line, and only that line.
+        let mut d =
+            open_first_item("# Feed\n\n- [ ] Alpha\n  one two three four five six seven\n  next\n");
+
+        for _ in 0..3 {
+            d.click(BODY_X + 2, BODY_Y + 1);
+        }
+
+        assert_eq!(
+            d.clipboard_writes(),
+            ["seven", "one two three four five six seven"],
+            "the double copies the word, then the triple the line"
+        );
+        assert!(status(&d).contains("Copied 33 chars"), "{:#?}", d.screen());
+    }
+
+    #[test]
+    fn a_triple_click_in_the_title_copies_the_whole_field() {
+        let mut d = open_first_item("# Feed\n\n- [ ] Alpha beta gamma\n");
+
+        for _ in 0..3 {
+            d.click(BODY_X + 7, TITLE_Y);
+        }
+
+        assert_eq!(d.clipboard_writes().last().unwrap(), "Alpha beta gamma");
+        assert_eq!(d.highlighted(), "Alpha beta gamma");
     }
 
     #[test]

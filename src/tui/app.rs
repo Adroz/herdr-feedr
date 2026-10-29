@@ -57,6 +57,24 @@ pub fn relocate(doc: &Document, key: &ItemKey) -> Option<usize> {
     }
 }
 
+/// Relocate the item an open edit modal was opened on. Its checkbox state
+/// may have moved on since (an agent claimed it, a human ticked it), and
+/// the typed edit must still land — so after an exact title+state miss,
+/// fall back to a unique active item with the same title, whatever its
+/// state. Still never guesses between two same-titled items.
+pub fn relocate_for_edit(doc: &Document, key: &ItemKey) -> Option<usize> {
+    relocate(doc, key).or_else(|| {
+        let mut hits = doc.nodes.iter().enumerate().filter(|(i, n)| {
+            matches!(n, Node::Item(it) if it.title == key.title)
+                && ops::zone_of(doc, *i) != Zone::Archive
+        });
+        match (hits.next(), hits.next()) {
+            (Some((i, _)), None) => Some(i),
+            _ => None,
+        }
+    })
+}
+
 /// One display row of the sidebar list.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
@@ -481,7 +499,8 @@ impl App {
                     (None, None) => false,
                     _ => true,
                 };
-                self.with_feed(move |doc| match relocate(doc, &key) {
+                let mut found = true;
+                self.with_feed(|doc| match relocate_for_edit(doc, &key) {
                     Some(i) => {
                         ops::edit(doc, i, &title, &body);
                         if moved {
@@ -489,10 +508,18 @@ impl App {
                         }
                         Ok(Outcome::Changed(None))
                     }
-                    None => Ok(Outcome::Unchanged(Some(
-                        "item changed on disk — edit dropped".into(),
-                    ))),
+                    None => {
+                        found = false;
+                        Ok(Outcome::Unchanged(Some(
+                            "item deleted on disk — Esc to discard edit".into(),
+                        )))
+                    }
                 });
+                // Keep the modal (and the typed text) up rather than
+                // silently throwing the edit away with the item.
+                if !found {
+                    return Modal::Edit(m);
+                }
             }
             None => {
                 // Sidebar-created items are always the human's. An empty
@@ -749,6 +776,20 @@ mod tests {
             state: State::Open,
         };
         assert_eq!(relocate(&doc, &key), None);
+    }
+
+    #[test]
+    fn relocate_for_edit_prefers_the_exact_state_and_never_guesses_by_title() {
+        let key = ItemKey {
+            title: "Ship it".into(),
+            state: State::Open,
+        };
+        // Exact title+state wins over a same-titled item in another state.
+        let doc = parse("# Feed\n\n- [x] Ship it\n- [ ] Ship it\n");
+        assert_eq!(relocate_for_edit(&doc, &key), Some(3));
+        // Neither matches the opened state: two title hits is ambiguous.
+        let doc = parse("# Feed\n\n- [x] Ship it\n- [~] Ship it\n");
+        assert_eq!(relocate_for_edit(&doc, &key), None);
     }
 
     use crate::config::{Side, SidebarConfig};

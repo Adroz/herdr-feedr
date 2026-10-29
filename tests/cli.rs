@@ -49,6 +49,28 @@ fn show_prints_title_and_body() {
 }
 
 #[test]
+fn an_exact_title_is_addressable_when_it_is_a_substring_of_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = dir.path().join("feed.md");
+    std::fs::write(
+        &feed,
+        "# Feed\n\n- [ ] Fix auth redirect\n  Other one.\n- [ ] Fix auth\n  The short one.\n",
+    )
+    .unwrap();
+    feedr(&feed)
+        .args(["show", "fix auth"])
+        .assert()
+        .success()
+        .stdout(contains("The short one."))
+        .stdout(contains("Other one.").not());
+    feedr(&feed)
+        .args(["show", "fix"])
+        .assert()
+        .failure()
+        .stderr(contains("ambiguous"));
+}
+
+#[test]
 fn claim_then_review_then_human_done() {
     let dir = tempfile::tempdir().unwrap();
     let feed = seed(dir.path());

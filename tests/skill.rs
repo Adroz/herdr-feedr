@@ -6,7 +6,7 @@
 //! directions: nothing documented may fail to parse, and nothing parseable may
 //! go undocumented.
 
-use assert_cmd::Command;
+mod common;
 
 const SKILL: &str = include_str!("../skills/herdr-feedr/SKILL.md");
 
@@ -69,14 +69,12 @@ fn every_command_the_skill_documents_parses() {
     std::fs::write(&feed, "# Feed\n\n- [ ] Fix auth redirect loop\n").unwrap();
 
     for args in invocations {
-        let out = Command::cargo_bin("feedr")
-            .unwrap()
+        // The command may legitimately fail (no identity to resolve, say);
+        // only a *parse* failure means the skill and the CLI disagree.
+        let out = common::feedr_in(dir.path())
             .arg("--file")
             .arg(&feed)
             .args(&args)
-            // The command may legitimately fail (no identity to resolve, say);
-            // only a *parse* failure means the skill and the CLI disagree.
-            .env("HOME", dir.path())
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -92,8 +90,8 @@ fn every_command_the_skill_documents_parses() {
 
 #[test]
 fn every_subcommand_is_documented_in_the_skill() {
-    let help = Command::cargo_bin("feedr")
-        .unwrap()
+    let home = tempfile::tempdir().unwrap();
+    let help = common::feedr_in(home.path())
         .arg("--help")
         .output()
         .unwrap();

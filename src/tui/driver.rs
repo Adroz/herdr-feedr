@@ -904,6 +904,108 @@ mod tests {
         }
     }
 
+    // --- Render snapshots (#41) -------------------------------------------
+    //
+    // Text-only frames, reviewed with `cargo insta review` (see README).
+    // Colour is invisible here: the over-cap red border is asserted by
+    // `the_today_panel_outline_turns_red_when_a_hand_edit_overfills_it`.
+
+    /// Four @today items: one over the cap, which only a hand edit can do.
+    const OVER_CAP_FEED: &str = "\
+# Feed
+
+## Work
+
+- [ ] Fix the auth redirect loop on expired sessions @today
+- [~] Migrate CI to GitHub Actions @agent(claude:abc) @today
+- [ ] Write the release notes for 0.4 @today
+- [ ] Bump Node
+
+## Agent
+
+- [?] Add retry to flaky deploy test @agent(claude:def) @today
+";
+
+    #[test]
+    fn the_today_panel_over_the_cap_grows_to_hold_every_item() {
+        for w in [20, 46] {
+            let d = Driver::new(OVER_CAP_FEED, w, 22);
+            insta::assert_snapshot!(format!("today_panel_over_cap_{w}"), d.screen().join("\n"));
+        }
+    }
+
+    #[test]
+    fn with_nothing_in_today_the_panel_is_not_drawn() {
+        let feed = "# Feed\n\n## Work\n\n- [ ] Fix the auth redirect loop on expired sessions\n- [ ] Bump Node\n";
+        for w in [20, 46] {
+            let d = Driver::new(feed, w, 12);
+            insta::assert_snapshot!(format!("today_panel_empty_{w}"), d.screen().join("\n"));
+        }
+    }
+
+    #[test]
+    fn the_list_with_sections_bodies_and_agent_sub_lines() {
+        let feed = "\
+# Feed
+
+- [ ] Uncategorised chore
+
+## Work
+
+- [ ] Fix the auth redirect loop on expired sessions
+  Repro: log in, wait 30 minutes, reload.
+- [~] Migrate CI to GitHub Actions @agent(claude:abc)
+- [?] Pick a retry budget @agent(codex:xyz)
+
+## Home
+
+- [x] Book the plumber
+
+# Done
+
+- [x] Old thing @done(2026-01-10)
+";
+        let d = Driver::new(feed, 40, 20);
+        insta::assert_snapshot!("list_sections_and_agents", d.screen().join("\n"));
+    }
+
+    #[test]
+    fn the_edit_modal_for_a_today_item_shows_the_filled_star() {
+        let mut d = Driver::new("# Feed\n\n## Work\n\n- [ ] Alpha @today\n", 40, 24);
+        d.click(6, 1); // the item's row inside the Today panel
+        assert!(d.screen().iter().any(|l| l.contains("Edit item")));
+        insta::assert_snapshot!("edit_modal_today_on", d.screen().join("\n"));
+    }
+
+    #[test]
+    fn the_done_archive_viewer() {
+        let feed = "\
+# Feed
+
+- [ ] Alpha
+
+# Done
+
+## 2026-01-14
+
+- [x] Ship the sidebar @done(2026-01-14)
+- [x] Write the glossary @done(2026-01-14)
+";
+        let mut d = Driver::new(feed, 40, 16);
+        d.click(0, 13); // "Done (n)" row, h-3
+        assert!(d.screen().iter().any(|l| l.contains("Done archive")));
+        insta::assert_snapshot!("done_archive", d.screen().join("\n"));
+    }
+
+    #[test]
+    fn the_feed_file_viewer() {
+        let feed = "# Feed\n\n## Work\n\n- [ ] Alpha @today\n- [ ] Beta\n";
+        let mut d = Driver::new(feed, 40, 16);
+        d.key(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert!(d.screen().iter().any(|l| l.contains("feed file")));
+        insta::assert_snapshot!("file_view", d.screen().join("\n"));
+    }
+
     #[test]
     fn a_pushed_feed_change_redraws_from_disk() {
         let mut d = Driver::new("# Feed\n\n- [ ] Alpha\n", 40, 12);

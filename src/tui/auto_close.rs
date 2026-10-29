@@ -3,6 +3,8 @@
 //! else is left anywhere.
 //!
 //! ```text
+//! start   --(first successful pane.list shows company in our tab)--> Armed
+//!    tried on the first tick, then on each layout until one succeeds
 //! Unarmed --(layout for our tab shows company)--> Armed
 //! Armed   --(layout for our tab shows only feedr panes)--> debounce
 //! debounce expires --> pane.list re-check, filtered to our live tab
@@ -15,8 +17,10 @@
 //! ```
 //!
 //! Company is any pane that isn't a feedr sidebar: other plugins' panes,
-//! overlays and zoomed panes all count. Arming only on a transition means a
-//! sidebar opened alone never closes itself straight away.
+//! overlays and zoomed panes all count. Arming only once company is seen
+//! means a sidebar opened alone never closes itself straight away. The
+//! layout that opening the sidebar produces fires before we subscribe, so a
+//! startup `pane.list` is what sees the shell we were opened beside.
 
 use crate::tui::socket::{own_tab, Herdr, PaneEntry};
 use std::collections::HashMap;
@@ -38,6 +42,11 @@ pub enum Verdict {
 #[derive(Default)]
 pub struct AutoClose {
     armed: bool,
+    /// A startup `pane.list` has succeeded. Until then the first tick and
+    /// every layout try one; a failure never arms.
+    listed: bool,
+    /// The first tick has run (and made its startup `pane.list` attempt).
+    ticked: bool,
     /// Set while armed and a layout showed us alone; cleared by company.
     alone_since: Option<Instant>,
     /// pane id -> is a feedr sidebar, from the last successful `pane.list`.
@@ -54,6 +63,7 @@ impl AutoClose {
         now: Instant,
         herdr: &mut dyn Herdr,
     ) {
+        self.list_at_start(own, herdr);
         if !pane_ids.iter().any(|p| p == own) {
             return;
         }
@@ -89,6 +99,10 @@ impl AutoClose {
         quit_when_last: bool,
         herdr: &mut dyn Herdr,
     ) -> Verdict {
+        if !self.ticked {
+            self.ticked = true;
+            self.list_at_start(own, herdr);
+        }
         match self.alone_since {
             Some(t) if now.duration_since(t) >= DEBOUNCE => {}
             _ => return Verdict::Stay,
@@ -101,18 +115,29 @@ impl AutoClose {
         let Some(tab) = own_tab(&panes, own) else {
             return Verdict::Stay;
         };
-        let company = |p: &&PaneEntry| p.pane_id != own && !p.is_feedr();
-        if panes
-            .iter()
-            .filter(|p| p.tab_id == tab)
-            .any(|p| company(&p))
-        {
+        if panes.iter().any(|p| p.tab_id == tab && is_company(p, own)) {
             return Verdict::Stay;
         }
-        if panes.iter().any(|p| company(&p)) || !quit_when_last {
+        if panes.iter().any(|p| is_company(p, own)) || !quit_when_last {
             Verdict::Exit
         } else {
             Verdict::StopServerThenExit
+        }
+    }
+
+    /// Until a `pane.list` has succeeded, try one and arm if it shows
+    /// company in our tab. A failed query doesn't arm.
+    fn list_at_start(&mut self, own: &str, herdr: &mut dyn Herdr) {
+        if self.listed {
+            return;
+        }
+        let Ok(panes) = herdr.list_panes() else {
+            return;
+        };
+        self.listed = true;
+        self.remember(&panes);
+        if let Some(tab) = own_tab(&panes, own) {
+            self.armed |= panes.iter().any(|p| p.tab_id == tab && is_company(p, own));
         }
     }
 
@@ -122,6 +147,11 @@ impl AutoClose {
             .map(|p| (p.pane_id.clone(), p.is_feedr()))
             .collect();
     }
+}
+
+/// Any pane but ourselves and other feedr sidebars.
+fn is_company(p: &PaneEntry, own: &str) -> bool {
+    p.pane_id != own && !p.is_feedr()
 }
 
 #[cfg(test)]
@@ -184,6 +214,60 @@ mod tests {
         d.layout(TAB_ID, &[PANE_ID]);
         d.advance(Duration::from_secs(2));
         assert!(!d.exit_requested());
+    }
+
+    #[test]
+    fn a_sidebar_opened_beside_a_shell_arms_without_seeing_a_layout() {
+        // Opening the sidebar fires its layout.updated before we subscribe,
+        // so the first thing we hear is the shell closing (#46).
+        let mut d = Driver::starting_with(
+            FEED,
+            40,
+            12,
+            &[
+                (PANE_ID, TAB_ID, SIDEBAR),
+                (SHELL, TAB_ID, "zsh"),
+                ELSEWHERE,
+            ],
+        );
+        d.set_panes(&[(PANE_ID, TAB_ID, SIDEBAR), ELSEWHERE]);
+        d.layout(TAB_ID, &[PANE_ID]);
+        d.advance(Duration::from_millis(100));
+        assert!(!d.exit_requested(), "must wait out the debounce");
+        d.advance(Duration::from_millis(400));
+        assert!(d.exit_requested());
+    }
+
+    #[test]
+    fn a_sidebar_started_alone_in_its_tab_does_not_arm() {
+        let mut d = Driver::starting_with(FEED, 40, 12, &[(PANE_ID, TAB_ID, SIDEBAR), ELSEWHERE]);
+        d.layout(TAB_ID, &[PANE_ID]);
+        d.advance(Duration::from_secs(2));
+        assert!(!d.exit_requested());
+    }
+
+    #[test]
+    fn a_failed_initial_pane_list_does_not_arm() {
+        let mut d = sidebar(); // pane.list fails until set_panes
+        d.set_panes(&[(PANE_ID, TAB_ID, SIDEBAR), ELSEWHERE]);
+        d.layout(TAB_ID, &[PANE_ID]);
+        d.advance(Duration::from_secs(2));
+        assert!(!d.exit_requested());
+    }
+
+    #[test]
+    fn a_failed_startup_list_is_retried_on_the_next_layout() {
+        let mut d = sidebar(); // the startup pane.list fails
+        d.set_panes(&[
+            (PANE_ID, TAB_ID, SIDEBAR),
+            (SHELL, TAB_ID, "zsh"),
+            ELSEWHERE,
+        ]);
+        d.layout("w1:t2", &[ELSEWHERE.0]); // any layout: try again, see the shell
+        d.set_panes(&[(PANE_ID, TAB_ID, SIDEBAR), ELSEWHERE]);
+        d.layout(TAB_ID, &[PANE_ID]);
+        d.advance(Duration::from_secs(1));
+        assert!(d.exit_requested());
     }
 
     #[test]

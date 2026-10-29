@@ -60,6 +60,17 @@ impl Runner for RecordingCli {
     }
 }
 
+fn pane_entries(panes: &[(&str, &str, &str)]) -> Vec<PaneEntry> {
+    panes
+        .iter()
+        .map(|(p, t, title)| PaneEntry {
+            pane_id: p.to_string(),
+            tab_id: t.to_string(),
+            title: Some(title.to_string()),
+        })
+        .collect()
+}
+
 pub struct Driver {
     terminal: Terminal<TestBackend>,
     app: App,
@@ -82,6 +93,22 @@ impl Driver {
 
     /// As `new`, with the sidebar config adjusted by `tweak` first.
     pub fn with_config(feed: &str, w: u16, h: u16, tweak: impl FnOnce(&mut SidebarConfig)) -> Self {
+        Self::build(feed, w, h, tweak, None)
+    }
+
+    /// As `new`, with herdr's `pane.list` already answering `panes` (see
+    /// `set_panes`) when the sidebar starts, before any event arrives.
+    pub fn starting_with(feed: &str, w: u16, h: u16, panes: &[(&str, &str, &str)]) -> Self {
+        Self::build(feed, w, h, |_| {}, Some(panes))
+    }
+
+    fn build(
+        feed: &str,
+        w: u16,
+        h: u16,
+        tweak: impl FnOnce(&mut SidebarConfig),
+        panes: Option<&[(&str, &str, &str)]>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("feed.md");
         std::fs::write(&path, feed).unwrap();
@@ -96,7 +123,8 @@ impl Driver {
         tweak(&mut cfg);
         let herdr = FakeHerdr::default();
         let herdr_log = herdr.log.clone();
-        let panes = herdr.panes.clone();
+        let pane_list = herdr.panes.clone();
+        *pane_list.borrow_mut() = panes.map(pane_entries);
         let clock = FakeClock::new(chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap());
         let clipboard = FakeClipboard::default();
         let mut app = App::new(path, cfg, Box::new(herdr));
@@ -119,11 +147,14 @@ impl Driver {
             clock,
             clipboard,
             herdr_log,
-            panes,
+            panes: pane_list,
             exited: false,
             _dir: dir,
         };
         d.step();
+        // Startup's own herdr calls (auto-close's first pane.list) aren't
+        // what tests assert on: they start from a clean log.
+        d.herdr_log.borrow_mut().clear();
         d
     }
 
@@ -210,16 +241,7 @@ impl Driver {
     /// Set what herdr's `pane.list` answers from now on: `(pane, tab,
     /// title)` triples.
     pub fn set_panes(&mut self, panes: &[(&str, &str, &str)]) {
-        *self.panes.borrow_mut() = Some(
-            panes
-                .iter()
-                .map(|(p, t, title)| PaneEntry {
-                    pane_id: p.to_string(),
-                    tab_id: t.to_string(),
-                    title: Some(title.to_string()),
-                })
-                .collect(),
-        );
+        *self.panes.borrow_mut() = Some(pane_entries(panes));
     }
 
     /// Make herdr's `pane.list` fail from now on.
@@ -286,7 +308,8 @@ impl Driver {
         self.clipboard.writes.borrow().clone()
     }
 
-    /// Every herdr call made, socket and CLI alike, in order.
+    /// Every herdr call made after construction, socket and CLI alike, in
+    /// order. Startup's calls (auto-close's first `pane.list`) are dropped.
     pub fn herdr_calls(&self) -> Vec<String> {
         self.herdr_log.borrow().clone()
     }

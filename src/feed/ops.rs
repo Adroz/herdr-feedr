@@ -108,7 +108,9 @@ pub fn claim(doc: &mut Document, index: usize, agent: AgentRef) {
     }
 }
 
-pub fn add(doc: &mut Document, title: &str, body: &[String], zone: Zone) {
+/// Add an open item and return its node index (valid until the next
+/// structural edit), so a caller can go on to mark it — e.g. into Today.
+pub fn add(doc: &mut Document, title: &str, body: &[String], zone: Zone) -> usize {
     let item = Node::Item(Item {
         state: State::Open,
         title: title.to_string(),
@@ -142,6 +144,7 @@ pub fn add(doc: &mut Document, title: &str, body: &[String], zone: Zone) {
         },
     };
     doc.nodes.insert(insert_at, item);
+    insert_at
 }
 
 /// Trims leading/trailing empty lines from a provided body while keeping
@@ -367,13 +370,14 @@ pub fn remove(doc: &mut Document, index: usize) -> Option<Item> {
 
 /// Add an open item at the end of the named `##` section, creating the
 /// section at the end of the human zone when it doesn't exist (archive
-/// sections never match). Reserved names error.
+/// sections never match). Reserved names error. Returns the new item's node
+/// index, like [`add`].
 pub fn add_in_section(
     doc: &mut Document,
     title: &str,
     body: &[String],
     section: &str,
-) -> Result<(), OpError> {
+) -> Result<usize, OpError> {
     let end = ensure_section(doc, section)?;
     doc.nodes.insert(
         end,
@@ -387,7 +391,7 @@ pub fn add_in_section(
             body: trim_blank_edges(body),
         }),
     );
-    Ok(())
+    Ok(end)
 }
 
 /// Move an item (state, body, and tokens intact) to the end of the named

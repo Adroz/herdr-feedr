@@ -45,7 +45,7 @@ Format — a GitHub-flavored markdown checklist:
 - **Human-created** items live in your sections. Only you write their `[x]` — even when an agent did the work. An agent finishing one writes `[?]` plus a body evidence note (PR link, test results) via `feedr review --note`; you review and tick.
 - **Agent-created** items live in the reserved `## Agent` section. Agents may close them `[x]` themselves.
 - Provenance = who *initiated*, not who typed: "add X to my list" said to an agent lands in your sections with your authority.
-- **Today** is set and unset by the human only (edit modal or hand edit). Agents read it; no CLI command writes it.
+- **Today** is set and unset by the human only (edit/create modal or hand edit). Agents read it; no CLI command writes it.
 
 ## 2a. Sweep and archive ([#10](https://github.com/Adroz/herdr-feedr/issues/10))
 
@@ -87,7 +87,7 @@ Interactions:
 
 Additions ([#22](https://github.com/Adroz/herdr-feedr/issues/22)):
 
-- **Today panel**: a bordered ` Today ` block fixed above the list, no count; each item is a checkbox + title row with its category on an indented muted sub-line. Today items appear only there, in file order. Hidden when empty; outline turns red when over cap (hand edit). The edit modal shows `☆/★ Today` in its top border, toggled by Ctrl+T; a fourth mark is refused with "Today full — unmark one first".
+- **Today panel**: a bordered ` Today ` block fixed above the list, no count; each item is a checkbox + title row with its category on an indented muted sub-line. Today items appear only there, in file order. Hidden when empty; outline turns red when over cap (hand edit). The edit and create modals show `☆/★ Today` in their top border, toggled by Ctrl+T or a click on the label and applied on save; a new item is added and marked in one write. A fourth mark is refused with "Today full — unmark one first", at the toggle and again on save if Today filled meanwhile (nothing is written; the modal stays open with the toggle reset).
 - **Outside click**: closes read-only modals; closes a clean edit modal like Esc; a dirty edit modal stays open with "unsaved — Esc to discard, Ctrl+S to save"; an open dropdown closes first; ConfirmDelete cancels. The click never falls through to the list.
 - **Copy**: feedr owns copy-on-select in edit fields and the read-only viewers (not the list). Mouse-up after a drag copies; double-click selects a word (herdr's rules) and triple-click a logical line, both copying immediately; Ctrl+C still works. Writes OSC 52, then pbcopy/wl-copy/xclip; status "Copied N chars". Cmd+C is not available (macOS terminals swallow it); herdr copy mode (`prefix+[`) is the fallback.
 - **Paste**: bracketed paste; newlines become spaces in Title/Category, kept in Body.

@@ -345,9 +345,13 @@ fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
     let outer = Block::bordered()
         .style(theme::modal_panel_style())
         .border_style(theme::modal_border())
-        .title(edit_modal_title(m, is_edit))
+        .title(edit_modal_title(is_edit))
         .padding(Padding::uniform(1));
     f.render_widget(outer, layout.outer);
+    f.render_widget(
+        Paragraph::new(modal::today_label(m.today)).style(theme::today_toggle(m.today)),
+        layout.today,
+    );
 
     f.render_widget(&m.category, layout.category);
     f.render_widget(&m.title, layout.title);
@@ -380,7 +384,7 @@ fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
     let hint = if is_edit {
         "Tab field · ^T today · ^S save · ^D delete · Esc cancel"
     } else {
-        "Tab field · ^S save · Esc cancel"
+        "Tab field · ^T today · ^S save · Esc cancel"
     };
     f.render_widget(Paragraph::new(hint).style(theme::muted_row()), layout.hints);
 
@@ -408,17 +412,18 @@ fn draw_edit_modal(f: &mut Frame, m: &mut modal::EditModal) {
     }
 }
 
-/// "Edit item ── ☆ Today": the Today toggle sits in the top border, right
-/// of the title (edit mode only — a new item can't be marked yet).
-fn edit_modal_title(m: &modal::EditModal, is_edit: bool) -> Line<'static> {
-    if !is_edit {
-        return Line::styled("New item", theme::modal_title());
-    }
-    let toggle = if m.today { "★ Today" } else { "☆ Today" };
+/// "Edit item ── " / "New item ── ": the heading and its separator. The
+/// Today toggle after them is painted separately at `EditLayout::today`, the
+/// same cells `modal::edit_click` hit-tests.
+fn edit_modal_title(is_edit: bool) -> Line<'static> {
+    let heading = if is_edit {
+        modal::EDIT_HEADING
+    } else {
+        modal::CREATE_HEADING
+    };
     Line::from(vec![
-        Span::styled("Edit item", theme::modal_title()),
-        Span::styled(" ── ", theme::modal_border()),
-        Span::styled(toggle, theme::today_toggle(m.today)),
+        Span::styled(heading, theme::modal_title()),
+        Span::styled(modal::HEADING_SEP, theme::modal_border()),
     ])
 }
 

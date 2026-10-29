@@ -18,6 +18,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Padding};
 use tui_textarea::{CursorMove, TextArea, WrapMode};
+use unicode_width::UnicodeWidthStr;
 
 pub enum Modal {
     None,
@@ -52,6 +53,21 @@ pub enum EditFocus {
     Release,
     /// Edit mode only — create mode has no item to delete.
     Delete,
+}
+
+/// The modal's top-border heading, left of the Today toggle.
+pub const EDIT_HEADING: &str = "Edit item";
+pub const CREATE_HEADING: &str = "New item";
+/// Between the heading and the Today toggle in the top border.
+pub const HEADING_SEP: &str = " ── ";
+
+/// The Today toggle's label as drawn in the top border.
+pub fn today_label(on: bool) -> &'static str {
+    if on {
+        "★ Today"
+    } else {
+        "☆ Today"
+    }
 }
 
 pub const SAVE_LABEL: &str = "[ Save ]";
@@ -95,14 +111,15 @@ pub struct EditModal {
     /// Category, title and body lines as the modal opened — the baseline
     /// `is_dirty` compares against.
     loaded: [Vec<String>; 3],
-    /// The pending Today toggle (`☆`/`★ Today` in the top border, Ctrl+T),
-    /// applied on save. Edit mode only.
+    /// The pending Today toggle (`☆`/`★ Today` in the top border, Ctrl+T or
+    /// a click on it), applied on save — in create mode too.
     pub today: bool,
     /// Whether the item was in Today when the modal opened — save touches
     /// `@today` only when `today` differs, and it counts toward dirty.
     pub loaded_today: bool,
-    /// Today was already full of OTHER items when the modal opened, so
-    /// Ctrl+T refuses to mark this one. Save re-checks against the disk.
+    /// Today was already full of OTHER items when the modal opened (any
+    /// items, for a new one), so the toggle refuses to mark this one. Save
+    /// re-checks against the disk.
     pub today_full: bool,
 }
 
@@ -452,6 +469,9 @@ pub struct EditLayout {
     pub delete: Option<Rect>,
     /// Present only while the modal's item is claimed.
     pub release: Option<Rect>,
+    /// The `☆`/`★ Today` label's cells in the top border — where
+    /// `view::draw_edit_modal` paints it and what `edit_click` hit-tests.
+    pub today: Rect,
 }
 
 /// Percentage-centered rect within `area` (shared by the edit modal, the
@@ -555,6 +575,7 @@ pub fn edit_layout(
         .then(|| Rect::new(x, buttons.y, DELETE_LABEL.len() as u16, 1).intersection(term_area));
 
     EditLayout {
+        today: today_label_rect(outer, is_edit).intersection(term_area),
         outer,
         category,
         dropdown,
@@ -567,6 +588,27 @@ pub fn edit_layout(
         delete,
         release,
     }
+}
+
+/// The Today label's cells: right of the heading and separator on the top
+/// border, which a block title starts one cell in from the corner. Clipped
+/// so it never covers the corners.
+fn today_label_rect(outer: Rect, is_edit: bool) -> Rect {
+    let heading = if is_edit {
+        EDIT_HEADING
+    } else {
+        CREATE_HEADING
+    };
+    let offset = 1 + heading.width() + HEADING_SEP.width();
+    let x = outer.x.saturating_add(offset as u16);
+    let label = Rect::new(x, outer.y, today_label(false).width() as u16, 1);
+    let border = Rect::new(
+        outer.x.saturating_add(1),
+        outer.y,
+        outer.width.saturating_sub(2),
+        1,
+    );
+    label.intersection(border)
 }
 
 /// The suggestion dropdown's row-bearing area, inside its own border — the
@@ -582,6 +624,8 @@ pub(crate) fn dropdown_inner_of(outer: Rect) -> Rect {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditClickTarget {
+    /// The `☆`/`★ Today` label in the top border.
+    Today,
     Category,
     Suggestion(u16),
     Title,
@@ -610,6 +654,9 @@ pub fn edit_click(layout: &EditLayout, is_edit: bool, x: u16, y: u16) -> Option<
             return Some(EditClickTarget::Suggestion(y - layout.dropdown_inner.y));
         }
         return None;
+    }
+    if rect_contains(layout.today, x, y) {
+        return Some(EditClickTarget::Today);
     }
     if rect_contains(layout.category, x, y) {
         return Some(EditClickTarget::Category);
@@ -659,7 +706,7 @@ pub enum ModalStep {
     /// An outside click on a dirty edit modal: it stays open, and only `App`
     /// can put the "how to leave" hint on the status line.
     Unsaved(EditModal),
-    /// Ctrl+T on an item while Today is full of others: the toggle stays
+    /// Ctrl+T or a label click while Today is full of others: the toggle stays
     /// unset, and only `App` can say so on the status line.
     TodayFull(EditModal),
 }
@@ -842,6 +889,16 @@ fn paste_text_focused(m: &mut EditModal, text: &str) {
     }
 }
 
+/// Ctrl+T and a click on the label: flip the pending Today toggle, refusing
+/// to mark while Today is already full of other items.
+fn toggle_today(mut m: EditModal) -> ModalStep {
+    if !m.today && m.today_full {
+        return ModalStep::TodayFull(m);
+    }
+    m.today = !m.today;
+    ModalStep::Continue(Modal::Edit(m))
+}
+
 fn edit_step(mut m: EditModal, ev: Event, area: Rect, clicks: u8) -> ModalStep {
     if let Event::Paste(text) = &ev {
         paste_text_focused(&mut m, text);
@@ -885,15 +942,8 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect, clicks: u8) -> ModalStep {
             (KeyCode::Char('s'), mods) if mods.contains(KeyModifiers::CONTROL) => {
                 return ModalStep::Save(m);
             }
-            // Today toggle; a new item has no slot to claim yet.
-            (KeyCode::Char('t'), mods)
-                if mods.contains(KeyModifiers::CONTROL) && m.original.is_some() =>
-            {
-                if !m.today && m.today_full {
-                    return ModalStep::TodayFull(m);
-                }
-                m.today = !m.today;
-                return ModalStep::Continue(Modal::Edit(m));
+            (KeyCode::Char('t'), mods) if mods.contains(KeyModifiers::CONTROL) => {
+                return toggle_today(m);
             }
             (KeyCode::Char('d'), mods)
                 if mods.contains(KeyModifiers::CONTROL) && m.original.is_some() =>
@@ -989,14 +1039,21 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect, clicks: u8) -> ModalStep {
     }
     if let Event::Mouse(mev) = &ev {
         if mev.kind == MouseEventKind::Down(MouseButton::Left) {
-            // Any click drops every field's highlight, including one left
-            // standing by a copy in a field the click moves focus away from.
+            let is_edit = m.original.is_some();
+            let layout = edit_layout(area, is_edit, m.claimed, m.dropdown_rows());
+            let target = edit_click(&layout, is_edit, mev.column, mev.row);
+            // The toggle is a button on the border: fields, cursors and
+            // selections stay exactly as they were.
+            if target == Some(EditClickTarget::Today) {
+                return toggle_today(m);
+            }
+            // Any other click drops every field's highlight, including one
+            // left standing by a copy in a field the click moves focus away
+            // from.
             for ta in [&mut m.category, &mut m.title, &mut m.body] {
                 ta.cancel_selection();
             }
-            let is_edit = m.original.is_some();
-            let layout = edit_layout(area, is_edit, m.claimed, m.dropdown_rows());
-            return match edit_click(&layout, is_edit, mev.column, mev.row) {
+            return match target {
                 Some(EditClickTarget::Suggestion(row)) => {
                     m.accept_suggestion(row as usize);
                     ModalStep::Continue(Modal::Edit(m))
@@ -1050,7 +1107,8 @@ fn edit_step(mut m: EditModal, ev: Event, area: Rect, clicks: u8) -> ModalStep {
                     Some(key) => ModalStep::Release(key),
                     None => ModalStep::Continue(Modal::Edit(m)),
                 },
-                None => ModalStep::Continue(Modal::Edit(m)),
+                // Today was handled above, before the selections dropped.
+                Some(EditClickTarget::Today) | None => ModalStep::Continue(Modal::Edit(m)),
             };
         }
         // Mouse drag selection: only the FOCUSED field's own drag extends a

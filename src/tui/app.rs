@@ -430,16 +430,23 @@ impl App {
             }
             Action::OpenCreate => {
                 let suggestions = ops::section_names(&self.doc);
-                self.set_modal(Modal::Edit(EditModal::create(suggestions)))
+                self.open_create(EditModal::create(suggestions));
             }
             Action::OpenCreateIn(section) => {
                 let suggestions = ops::section_names(&self.doc);
-                self.set_modal(Modal::Edit(EditModal::create_in(suggestions, &section)))
+                self.open_create(EditModal::create_in(suggestions, &section));
             }
             Action::OpenDoneView => self.set_modal(Modal::DoneView(Viewer::default())),
             Action::OpenFileView => self.set_modal(Modal::FileView(Viewer::default())),
             Action::OpenEditor => self.request_editor(),
         }
+    }
+
+    /// Open a create modal, arming its Today-full guard: a new item holds no
+    /// slot yet, so every Today item counts against it.
+    fn open_create(&mut self, mut m: EditModal) {
+        m.today_full = ops::today_count(&self.doc) >= ops::TODAY_CAP;
+        self.set_modal(Modal::Edit(m));
     }
 
     /// Set the active modal, zooming the sidebar's herdr pane to fill the
@@ -663,15 +670,32 @@ impl App {
                 // Sidebar-created items are always the human's. An empty
                 // Category keeps the pre-category behavior (end of the first
                 // human section); a named one targets that section, creating
-                // it if needed (spec 2026-09-16 §2).
-                self.with_feed(move |doc| {
-                    if category.is_empty() {
-                        ops::add(doc, &title, &body, Zone::Human);
+                // it if needed (spec 2026-09-16 §2). A Today mark goes in the
+                // same locked write, re-checked against the disk.
+                let today = m.today;
+                let mut today_full = false;
+                self.with_feed(|doc| {
+                    let i = if category.is_empty() {
+                        ops::add(doc, &title, &body, Zone::Human)
                     } else {
-                        ops::add_in_section(doc, &title, &body, &category)?;
+                        ops::add_in_section(doc, &title, &body, &category)?
+                    };
+                    if today {
+                        if let Err(e) = ops::set_today(doc, i) {
+                            today_full = matches!(e, ops::OpError::TodayFull);
+                            return Err(e.into());
+                        }
                     }
                     Ok(Outcome::Changed(None))
                 });
+                // Today filled on disk since the modal opened: nothing was
+                // written; the toggle drops back so a re-save adds the item.
+                if today_full {
+                    let mut m = m;
+                    m.today = false;
+                    m.today_full = true;
+                    return Modal::Edit(m);
+                }
             }
         }
         Modal::None

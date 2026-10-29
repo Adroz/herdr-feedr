@@ -1044,6 +1044,168 @@ mod tests {
         );
     }
 
+    /// The screen cell (column, row) of the modal's Today star, read off
+    /// the rendered frame.
+    fn today_star(d: &Driver) -> (u16, u16) {
+        let screen = d.screen();
+        for (y, line) in screen.iter().enumerate() {
+            if let Some(x) = line.chars().position(|c| c == '☆' || c == '★') {
+                return (x as u16, y as u16);
+            }
+        }
+        panic!("no Today toggle drawn: {screen:#?}");
+    }
+
+    #[test]
+    fn clicking_the_today_label_toggles_it_like_ctrl_t() {
+        let mut d = Driver::new(TODAY_FEED, 40, 24);
+        d.click(6, 6); // "[ ] Bump Node"
+        let (x, y) = today_star(&d);
+        let title_before = d.screen()[y as usize + 6].clone(); // Title field row
+
+        d.click(x, y); // the star
+        assert!(modal_top(&d).contains("★ Today"), "{}", modal_top(&d));
+        assert_eq!(d.screen()[y as usize + 6], title_before, "no field moved");
+        d.click(x + 6, y); // the "y" of "Today"
+        assert!(modal_top(&d).contains("☆ Today"), "{}", modal_top(&d));
+        d.click(x + 7, y); // the border just past the label: not the toggle
+        assert!(modal_top(&d).contains("☆ Today"), "{}", modal_top(&d));
+
+        d.click(x, y);
+        save(&mut d);
+        assert!(
+            d.feed().contains("- [ ] Bump Node @today\n"),
+            "got: {}",
+            d.feed()
+        );
+    }
+
+    #[test]
+    fn clicking_the_today_label_on_a_full_today_is_refused() {
+        let mut d = Driver::new(FULL_TODAY, 40, 24);
+        d.click(6, 9); // "[ ] D"
+        let (x, y) = today_star(&d);
+        d.click(x, y);
+        assert!(modal_top(&d).contains("☆ Today"), "the toggle stays unset");
+        assert!(
+            d.screen()
+                .last()
+                .unwrap()
+                .contains("Today full — unmark one first"),
+            "{:#?}",
+            d.screen()
+        );
+    }
+
+    /// The create modal, opened with `a`, with Category skipped and `title`
+    /// typed into Title.
+    fn create_with_title(feed: &str, title: &str) -> Driver {
+        let mut d = Driver::new(feed, 40, 24);
+        d.key(KeyCode::Char('a'), KeyModifiers::NONE);
+        d.key(KeyCode::Tab, KeyModifiers::NONE);
+        d.type_str(title);
+        d
+    }
+
+    fn create_top(d: &Driver) -> String {
+        d.screen()
+            .into_iter()
+            .find(|l| l.contains("New item"))
+            .expect("the create modal is open")
+    }
+
+    #[test]
+    fn the_create_modal_offers_the_today_toggle() {
+        let d = create_with_title("# Feed\n\n- [ ] Alpha\n", "Beta");
+        assert!(
+            create_top(&d).contains("New item ── ☆ Today"),
+            "{}",
+            create_top(&d)
+        );
+        assert!(
+            d.screen().iter().any(|l| l.contains("^T today")),
+            "{:#?}",
+            d.screen()
+        );
+    }
+
+    #[test]
+    fn ctrl_t_in_the_create_modal_writes_the_new_item_into_today() {
+        let mut d = create_with_title("# Feed\n\n- [ ] Alpha\n", "Beta");
+        ctrl(&mut d, 't');
+        assert!(create_top(&d).contains("★ Today"), "{}", create_top(&d));
+        save(&mut d);
+        assert_eq!(d.feed(), "# Feed\n\n- [ ] Alpha\n- [ ] Beta @today\n");
+    }
+
+    #[test]
+    fn clicking_the_today_label_in_the_create_modal_writes_the_item_into_today() {
+        let mut d = Driver::new("# Feed\n\n## Work\n\n- [ ] Alpha\n", 40, 24);
+        d.key(KeyCode::Char('a'), KeyModifiers::NONE);
+        d.type_str("Home");
+        d.key(KeyCode::Tab, KeyModifiers::NONE);
+        d.type_str("Beta");
+        let (x, y) = today_star(&d);
+        d.click(x, y);
+        assert!(create_top(&d).contains("★ Today"), "{}", create_top(&d));
+        d.type_str("!"); // focus and cursor stayed in Title
+        save(&mut d);
+        assert_eq!(
+            d.feed(),
+            "# Feed\n\n## Work\n\n- [ ] Alpha\n\n## Home\n\n- [ ] Beta! @today\n"
+        );
+    }
+
+    #[test]
+    fn a_create_on_a_full_today_is_refused_at_the_toggle() {
+        let mut d = create_with_title(FULL_TODAY, "E");
+        ctrl(&mut d, 't');
+        assert!(create_top(&d).contains("☆ Today"), "the toggle stays unset");
+        assert!(
+            d.screen()
+                .last()
+                .unwrap()
+                .contains("Today full — unmark one first"),
+            "{:#?}",
+            d.screen()
+        );
+        let (x, y) = today_star(&d);
+        d.click(x, y);
+        assert!(
+            create_top(&d).contains("☆ Today"),
+            "the click is refused too"
+        );
+    }
+
+    #[test]
+    fn a_create_whose_today_filled_meanwhile_keeps_the_modal_and_writes_nothing() {
+        let feed = "# Feed\n\n- [ ] A @today\n- [ ] B @today\n- [ ] D\n";
+        let mut d = create_with_title(feed, "E");
+        ctrl(&mut d, 't');
+
+        // Meanwhile a hand edit fills Today.
+        let filled = feed.replace("- [ ] D", "- [ ] D @today");
+        std::fs::write(d.feed_path(), &filled).unwrap();
+        d.push(AppEvent::FeedChanged);
+        save(&mut d);
+
+        assert_eq!(d.feed(), filled, "nothing written");
+        assert!(create_top(&d).contains("☆ Today"), "{}", create_top(&d));
+        assert!(d
+            .screen()
+            .last()
+            .unwrap()
+            .contains("Today full — unmark one first"));
+
+        ctrl(&mut d, 't');
+        assert!(
+            create_top(&d).contains("☆ Today"),
+            "re-armed: still refused"
+        );
+        save(&mut d); // the rest of the item still saves
+        assert_eq!(d.feed(), format!("{filled}- [ ] E\n"));
+    }
+
     /// The panel at the narrowest and widest sidebar widths, with a claimed
     /// item and a long title.
     #[test]
@@ -1138,6 +1300,14 @@ mod tests {
         d.click(6, 1); // the item's row inside the Today panel
         assert!(d.screen().iter().any(|l| l.contains("Edit item")));
         insta::assert_snapshot!("edit_modal_today_on", d.screen().join("\n"));
+    }
+
+    #[test]
+    fn the_create_modal_with_the_today_toggle_off() {
+        let mut d = Driver::new("# Feed\n\n## Work\n\n- [ ] Alpha\n", 40, 24);
+        d.key(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(d.screen().iter().any(|l| l.contains("New item")));
+        insta::assert_snapshot!("create_modal", d.screen().join("\n"));
     }
 
     #[test]

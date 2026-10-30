@@ -855,6 +855,12 @@ impl App {
                         .on_layout(own, &pane_ids, now, self.herdr.as_mut());
                 }
             }
+            crate::tui::AppEvent::Subscribed => {
+                if let (true, Some(own)) = (self.cfg.auto_close, self.herdr_pane_id.as_deref()) {
+                    let now = self.clock.now();
+                    self.auto_close.on_subscribed(own, now, self.herdr.as_mut());
+                }
+            }
             crate::tui::AppEvent::SocketDown => self.statuses.clear(),
         }
     }

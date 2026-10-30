@@ -12,6 +12,9 @@
 //!    alone, a non-feedr pane elsewhere --> exit
 //!    alone, nothing else anywhere      --> server.stop (if enabled), exit
 //! layout showing company during the debounce --> cancel it
+//! (re)subscribed --> pane.list, then judged as a layout of our live tab
+//!    (a replaced stream's unread layout.updated is lost; query failed:
+//!    no decision)
 //! layout with a pane pane.list can't identify (query failed)
 //!    --> no decision: never arms; an armed debounce is cancelled
 //! ```
@@ -89,6 +92,26 @@ impl AutoClose {
         } else if self.armed && self.alone_since.is_none() {
             self.alone_since = Some(now);
         }
+    }
+
+    /// The event stream was (re)subscribed. herdr drops the stream the
+    /// subscriber replaces, unread `layout.updated` and all, so judge our
+    /// live tab from `pane.list` as if its layout had just arrived.
+    pub fn on_subscribed(&mut self, own: &str, now: Instant, herdr: &mut dyn Herdr) {
+        let Ok(panes) = herdr.list_panes() else {
+            return; // no decision
+        };
+        self.listed = true;
+        self.remember(&panes);
+        let Some(tab) = own_tab(&panes, own) else {
+            return;
+        };
+        let pane_ids: Vec<String> = panes
+            .iter()
+            .filter(|p| p.tab_id == tab)
+            .map(|p| p.pane_id.clone())
+            .collect();
+        self.on_layout(own, &pane_ids, now, herdr);
     }
 
     /// Run the re-check once the debounce has elapsed.
@@ -268,6 +291,44 @@ mod tests {
         d.layout(TAB_ID, &[PANE_ID]);
         d.advance(Duration::from_secs(1));
         assert!(d.exit_requested());
+    }
+
+    #[test]
+    fn a_layout_lost_to_a_resubscribe_is_recovered_from_pane_list() {
+        let mut d = sidebar();
+        d.set_panes(&[
+            (PANE_ID, TAB_ID, SIDEBAR),
+            (SHELL, TAB_ID, "zsh"),
+            ELSEWHERE,
+        ]);
+        d.layout(TAB_ID, &[PANE_ID, SHELL]); // armed
+                                             // The agent shell exits. Its layout.updated sat unread on the
+                                             // stream the subscriber replaced, so only the resubscribe arrives.
+        d.set_panes(&[(PANE_ID, TAB_ID, SIDEBAR), ELSEWHERE]);
+        d.subscribed();
+        d.advance(Duration::from_millis(100));
+        assert!(!d.exit_requested(), "must wait out the debounce");
+        d.advance(Duration::from_millis(400));
+        assert!(d.exit_requested());
+    }
+
+    #[test]
+    fn a_resubscribe_never_arms_a_sidebar_that_is_alone() {
+        let mut d = Driver::starting_with(FEED, 40, 12, &[(PANE_ID, TAB_ID, SIDEBAR), ELSEWHERE]);
+        d.subscribed();
+        d.advance(Duration::from_secs(2));
+        assert!(!d.exit_requested());
+    }
+
+    #[test]
+    fn a_resubscribe_whose_pane_list_fails_keeps_the_sidebar() {
+        let mut d = sidebar();
+        d.set_panes(&[(PANE_ID, TAB_ID, SIDEBAR), (SHELL, TAB_ID, "zsh")]);
+        d.layout(TAB_ID, &[PANE_ID, SHELL]); // armed
+        d.fail_pane_list();
+        d.subscribed();
+        d.advance(Duration::from_secs(2));
+        assert!(!d.exit_requested());
     }
 
     #[test]

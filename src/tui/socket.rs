@@ -524,6 +524,9 @@ fn stream_events(
     let mut stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(read_timeout))?;
     stream.write_all(format!("{}\n", subscribe_request(panes)).as_bytes())?;
+    // Whatever was pushed before this stream (a replaced stream's unread
+    // frames, a reconnect gap) is gone; let the app re-check what it missed.
+    send(tx, crate::tui::AppEvent::Subscribed)?;
     let mut reader = BufReader::new(stream);
     let resync_and_check = || -> Result<Option<Vec<String>>> {
         let now = resync(path, tx)?;
@@ -1070,6 +1073,26 @@ mod tests {
                 status: AgentStatus::Blocked
             }
         );
+    }
+
+    #[test]
+    fn every_new_subscription_tells_the_app_pushes_may_have_been_lost() {
+        let fake = FakeHerdrSocket::start();
+        fake.reply(
+            "agent.list",
+            json!({"agents": [agent_entry("w1:p7", "idle", "a")]}),
+        );
+        let rx = run_subscriber(&fake);
+        fake.wait_for_subscriptions(1);
+        recv_until(&rx, |e| *e == AppEvent::Subscribed);
+
+        // The agent's pane exits: herdr pushes the agent change and the
+        // layout together, and the replaced stream drops the layout unread.
+        fake.reply("agent.list", json!({"agents": []}));
+        fake.push(json!({"event": "pane_agent_detected", "data": {
+            "type": "pane_agent_detected", "pane_id": "w1:p7", "workspace_id": "w1"}}));
+        fake.wait_for_subscriptions(2);
+        recv_until(&rx, |e| *e == AppEvent::Subscribed);
     }
 
     #[test]

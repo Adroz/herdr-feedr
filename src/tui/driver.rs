@@ -238,6 +238,11 @@ impl Driver {
         });
     }
 
+    /// The herdr subscriber (re)subscribed, as after replacing its stream.
+    pub fn subscribed(&mut self) {
+        self.push(AppEvent::Subscribed);
+    }
+
     /// Set what herdr's `pane.list` answers from now on: `(pane, tab,
     /// title)` triples.
     pub fn set_panes(&mut self, panes: &[(&str, &str, &str)]) {

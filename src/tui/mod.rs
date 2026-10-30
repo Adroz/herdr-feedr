@@ -54,6 +54,9 @@ pub enum AppEvent {
         tab_id: String,
         pane_ids: Vec<String>,
     },
+    /// A new `events.subscribe` stream is up. Pushes from before it (a
+    /// replaced stream's unread frames, a reconnect gap) may be lost.
+    Subscribed,
     SocketDown,
 }
 

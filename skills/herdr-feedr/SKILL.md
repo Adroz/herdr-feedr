@@ -5,7 +5,7 @@ description: Use when working items from the herdr-feedr feed — the shared mar
 
 # herdr-feedr
 
-> Skill version 0.3.0 — requires feedr CLI >= 0.2.0. Run `feedr skill status` if commands here don't match the binary.
+> Skill version 0.3.1 — requires feedr CLI >= 0.2.0. Run `feedr skill status` if commands here don't match the binary.
 
 The feed is one markdown file shared by a human and their agents. It's rendered live in a
 sidebar pane; you reach it through the `feedr` CLI.

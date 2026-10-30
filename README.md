@@ -41,6 +41,13 @@ Rebuild loop while iterating:
 
 `herdr plugin list` shows whether herdr-feedr loaded, with its pane and both actions.
 
+### Live end-to-end tests
+
+Two test suites touch real systems, so they're opt-in and pass trivially otherwise (CI):
+
+- `FEEDR_E2E_HERDR=1 cargo test --test herdr_e2e` — sidebar auto-close against a throwaway herdr server (needs `herdr` on PATH, or `FEEDR_E2E_HERDR_BIN`). Each test starts its own server under temp `HOME`/XDG dirs and socket, so your running herdr, session and plugin registry are never touched.
+- `FEEDR_E2E_CLIPBOARD=1 cargo test clipboard_e2e` (macOS) — a real clipboard round-trip through `pbcopy`/`pbpaste`; your clipboard's text is put back afterwards.
+
 ### Render snapshots
 
 Sidebar layouts (Today panel, list, edit modal, Done archive, file view) are pinned as [`insta`](https://insta.rs) text snapshots in `src/tui/snapshots/`, so a layout change shows up as a reviewable diff. When `cargo test` fails on a snapshot:

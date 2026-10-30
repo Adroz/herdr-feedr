@@ -273,6 +273,8 @@ Notes on the sketch:
 
 ## Side finding: a plainly opened sidebar never arms
 
+**Fixed** in #48 (issue #46): the sidebar now arms from its startup `pane.list`. `tests/herdr_e2e.rs` covers it without the arming workaround in §5.
+
 Probe 1 opened the sidebar with `plugin pane open` beside a shell and then closed the shell. The sidebar **stayed**.
 
 - herdr emits the open's `layout.updated` inside the `plugin.pane.open` request (`panes.rs:313-315`). That is before the new feedr process has connected and sent `events.subscribe`.

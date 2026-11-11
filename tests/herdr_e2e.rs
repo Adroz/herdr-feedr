@@ -71,7 +71,8 @@ impl Herdr {
                 "id = \"feedr-e2e\"\nname = \"feedr-e2e\"\nversion = \"0.0.0\"\n\
                  min_herdr_version = \"0.9.0\"\nplatforms = [\"linux\", \"macos\"]\n\n\
                  [[panes]]\nid = \"sidebar\"\ntitle = \"feedr\"\nplacement = \"split\"\n\
-                 command = [{:?}, \"sidebar\"]\n",
+                 command = [{0:?}, \"sidebar\"]\n\n\
+                 [[startup]]\ncommand = [{0:?}, \"revive-sidebars\", \"--wait\", \"20\"]\n",
                 env!("CARGO_BIN_EXE_feedr")
             ),
         )
@@ -83,21 +84,33 @@ impl Herdr {
             bin: herdr_bin(),
             child: None,
         };
-        let child = h
+        h.spawn_server();
+        let plugin = h.root.path().join("plugin");
+        h.run(&["plugin", "link", plugin.to_str().unwrap()]);
+        h
+    }
+
+    fn spawn_server(&mut self) {
+        let child = self
             .cmd()
             .arg("server")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn herdr server");
-        h.child = Some(child);
-        let sock = h.sock();
+        self.child = Some(child);
+        let sock = self.sock();
         wait_until("herdr's socket", Duration::from_secs(10), || {
             UnixStream::connect(&sock).is_ok()
         });
-        let plugin = h.root.path().join("plugin");
-        h.run(&["plugin", "link", plugin.to_str().unwrap()]);
-        h
+    }
+
+    /// Stop the server (it saves its session on the way out) and start a
+    /// new one on the same dirs, which restores that session.
+    fn restart(&mut self) {
+        self.run(&["server", "stop"]);
+        self.child.take().unwrap().wait().unwrap();
+        self.spawn_server();
     }
 
     fn sock(&self) -> PathBuf {
@@ -367,5 +380,24 @@ fn auto_close_off_keeps_the_sidebar() {
         h.close_pane(&shell);
         std::thread::sleep(Duration::from_secs(2)); // well past the debounce
         assert!(h.has_pane(&sidebar));
+    });
+}
+
+/// herdr's session file keeps a plugin pane's cwd and label but not its
+/// command, so a restart brings the sidebar back as a bare shell; the
+/// `[[startup]]` hook must put the sidebar back in that same pane.
+#[test]
+fn a_restored_sidebar_pane_is_relaunched_after_a_herdr_restart() {
+    with_herdr("", |h| {
+        let shell = h.new_workspace();
+        h.sidebar_beside(&shell);
+        h.restart();
+        wait_until("the restored sidebar", Duration::from_secs(30), || {
+            let panes = h.panes();
+            panes.len() == 2
+                && panes
+                    .iter()
+                    .any(|p| p["label"] == "feedr" && p["terminal_title_stripped"] == SIDEBAR_TITLE)
+        });
     });
 }

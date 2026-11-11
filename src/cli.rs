@@ -111,6 +111,21 @@ enum Cmd {
         #[arg(long)]
         pane: String,
     },
+    /// Internal: relaunch the sidebar in panes a herdr restart restored as
+    /// bare shells. Run by scripts/on-startup.sh (herdr-plugin.toml's
+    /// `[[startup]]` hook); safe to run by hand.
+    #[command(hide = true)]
+    ReviveSidebars {
+        /// Also size each revived sidebar to its configured width. Leave off
+        /// when no client may be attached: the tab width is then herdr's
+        /// headless default, not the real window's.
+        #[arg(long)]
+        fit: bool,
+        /// Keep polling this many seconds for restored shells that are still
+        /// starting up.
+        #[arg(long, default_value_t = 0)]
+        wait: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -261,6 +276,41 @@ pub fn run() -> Result<()> {
         crate::tui::dock::fit_width(&mut runner, &mut client, &cfg, pane)?;
         return Ok(());
     }
+    if let Cmd::ReviveSidebars { fit, wait } = &cli.command {
+        let cfg = config::load_sidebar_config(&config::default_config_dir());
+        let exe = std::env::current_exe()?;
+        // The binary lives at <plugin root>/target/release/feedr.
+        let plugin_root = std::env::var_os("HERDR_PLUGIN_ROOT")
+            .map(std::path::PathBuf::from)
+            .or_else(|| exe.ancestors().nth(3).map(std::path::Path::to_path_buf))
+            .ok_or_else(|| anyhow::anyhow!("revive-sidebars: cannot locate the plugin root"))?;
+        let mut runner = crate::tui::dock::HerdrCli::from_env();
+        let mut client = crate::tui::socket::UnixSocketClient::from_env();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(*wait);
+        let mut sent = std::collections::HashSet::new();
+        loop {
+            let (revived, not_ready) = crate::tui::dock::revive_sidebars(
+                &mut runner,
+                &mut client,
+                &cfg,
+                &plugin_root,
+                &exe,
+                *fit,
+                &mut sent,
+            )?;
+            for pane_id in &revived {
+                println!("revived sidebar pane {pane_id}");
+            }
+            if not_ready.is_empty() || std::time::Instant::now() >= deadline {
+                for pane_id in &not_ready {
+                    println!("left pane {pane_id} alone: not an idle shell");
+                }
+                println!("revive-sidebars: {} revived", sent.len());
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
     if let Cmd::Skill { command } = &cli.command {
         return run_skill(command);
     }
@@ -380,6 +430,7 @@ pub fn run() -> Result<()> {
         Cmd::Sidebar { .. }
         | Cmd::AutoDockHook { .. }
         | Cmd::FitSidebar { .. }
+        | Cmd::ReviveSidebars { .. }
         | Cmd::Whoami
         | Cmd::Skill { .. } => {
             unreachable!()

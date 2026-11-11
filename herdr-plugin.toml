@@ -59,3 +59,11 @@ command = ["bash", "scripts/toggle-feedr.sh"]
 on = "tab.created"
 platforms = ["linux", "macos"]
 command = ["bash", "scripts/on-tab-created.sh"]
+
+# herdr restores a plugin pane as a bare shell (its session file keeps the pane's cwd and
+# label, not its command), so after a server restart every sidebar would come back as a
+# plain terminal. This runs once the session is restored and relaunches the sidebar in
+# each of those panes, in place.
+[[startup]]
+platforms = ["linux", "macos"]
+command = ["bash", "scripts/on-startup.sh"]

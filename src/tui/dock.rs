@@ -117,6 +117,102 @@ pub fn auto_dock_for_tab(
     ))
 }
 
+/// The label herdr gives a plugin pane: herdr-plugin.toml's `[[panes]] title`.
+/// herdr's session file keeps it (with the pane's cwd) across a restart.
+const PANE_LABEL: &str = "feedr";
+
+/// Shells a restored pane may be sitting in (argv0 may carry a login `-`).
+const SHELLS: &[&str] = &["zsh", "bash", "fish", "sh", "dash", "ksh", "nu"];
+
+/// Relaunch the sidebar in every pane a herdr restart left as a bare shell.
+///
+/// herdr's session file records a plugin pane as only `{cwd, label}` — not
+/// its command — so after a server restart each sidebar pane comes back as
+/// a shell in the plugin root, still labelled `feedr` (docs/herdr-api.md).
+/// Such a pane is recognised by exactly that: the label, the plugin-root
+/// cwd, no sidebar title, and nothing but an idle shell in the foreground
+/// (so we never type into an editor or a running command). The sidebar is
+/// exec'd into the shell, keeping the pane's id and its slot in the layout;
+/// nothing is focused or moved.
+///
+/// `sent` holds panes already relaunched by an earlier call: a shell still
+/// reading its rc files looks idle until it gets to our `exec`, and sending
+/// it twice would type the second line into the running sidebar.
+///
+/// Returns `(revived, not_ready)` pane ids; `not_ready` are candidates whose
+/// foreground isn't an idle shell (yet).
+pub fn revive_sidebars(
+    runner: &mut dyn Runner,
+    herdr: &mut dyn Herdr,
+    cfg: &SidebarConfig,
+    plugin_root: &std::path::Path,
+    exe: &std::path::Path,
+    fit: bool,
+    sent: &mut std::collections::HashSet<String>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let list = runner.run(&["pane", "list"])?;
+    let v: Value = serde_json::from_str(&list).unwrap_or(Value::Null);
+    let result = v.get("result").unwrap_or(&v);
+    let candidates: Vec<String> = result_entries(result)
+        .into_iter()
+        .filter(|e| e.get("label").and_then(Value::as_str) == Some(PANE_LABEL))
+        .filter(|e| sidebar_pane_id(e).is_none())
+        .filter(|e| {
+            e.get("cwd")
+                .and_then(Value::as_str)
+                .is_some_and(|cwd| same_dir(std::path::Path::new(cwd), plugin_root))
+        })
+        .filter_map(|e| Some(e.get("pane_id")?.as_str()?.to_string()))
+        .filter(|id| !sent.contains(id))
+        .collect();
+
+    // Leading space keeps the line out of shell history where the shell is
+    // set up for that; single quotes survive a path with spaces.
+    let exec_cmd = format!(" exec '{}' sidebar", exe.display());
+    let (mut revived, mut not_ready) = (Vec::new(), Vec::new());
+    for pane_id in candidates {
+        let idle = runner
+            .run(&["pane", "process-info", "--pane", &pane_id])
+            .is_ok_and(|out| is_idle_shell(&out));
+        if !idle {
+            not_ready.push(pane_id);
+            continue;
+        }
+        runner.run(&["pane", "run", &pane_id, &exec_cmd])?;
+        sent.insert(pane_id.clone());
+        if fit {
+            // Best-effort, like every other sizing path.
+            let _ = fit_width(runner, herdr, cfg, &pane_id);
+        }
+        revived.push(pane_id);
+    }
+    Ok((revived, not_ready))
+}
+
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
+}
+
+/// True when `pane process-info` shows the pane's own shell, and only it, in
+/// the foreground.
+fn is_idle_shell(process_info_stdout: &str) -> bool {
+    let v: Value = serde_json::from_str(process_info_stdout).unwrap_or(Value::Null);
+    let Some(info) = v.pointer("/result/process_info") else {
+        return false;
+    };
+    let Some([only]) = info
+        .get("foreground_processes")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+    else {
+        return false;
+    };
+    let is_pane_shell = only.get("pid").is_some() && only.get("pid") == info.get("shell_pid");
+    let name = only.get("name").and_then(Value::as_str).unwrap_or("");
+    is_pane_shell && SHELLS.contains(&name.trim_start_matches('-'))
+}
+
 /// herdr-feedr's own plugin id / pane entrypoint (herdr-plugin.toml) — the
 /// preferred dock path runs the sidebar this way rather than by execing a
 /// bare `feedr` (Task: `feedr` is not on PATH, so the old `pane split` +
@@ -702,6 +798,85 @@ mod tests {
             self.calls.push(args.join(" "));
             self.responses.pop_front().unwrap_or(Ok(String::new()))
         }
+    }
+
+    fn restored_list() -> &'static str {
+        r#"{"id":"cli:pane:list","result":{"panes":[
+            {"pane_id":"w1:p1","label":"feedr","cwd":"/plug","terminal_title_stripped":"me@host:/plug"},
+            {"pane_id":"w1:p2","label":"feedr","cwd":"/plug","terminal_title_stripped":"feedr-sidebar"},
+            {"pane_id":"w1:p3","cwd":"/plug","terminal_title_stripped":"me@host:/plug"},
+            {"pane_id":"w1:p4","label":"feedr","cwd":"/elsewhere","terminal_title_stripped":"zsh"},
+            {"pane_id":"w1:p5","label":"feedr","cwd":"/plug","terminal_title_stripped":"vim"}]}}"#
+    }
+
+    fn proc_info(name: &str, pid: u64, shell_pid: u64) -> String {
+        format!(
+            r#"{{"result":{{"process_info":{{"foreground_processes":[{{"name":"{name}","pid":{pid}}}],"shell_pid":{shell_pid}}}}}}}"#
+        )
+    }
+
+    fn revive(
+        runner: &mut FakeRunner,
+        sent: &mut std::collections::HashSet<String>,
+    ) -> (Vec<String>, Vec<String>) {
+        revive_sidebars(
+            runner,
+            &mut FakeHerdr::default(),
+            &cfg(Side::Left),
+            std::path::Path::new("/plug"),
+            std::path::Path::new("/plug/target/release/feedr"),
+            false,
+            sent,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn revive_execs_sidebar_only_into_restored_idle_shell_panes() {
+        // p1: restored shell -> revived. p2: live sidebar, p3: unlabelled,
+        // p4: other cwd -> never probed. p5: vim in the foreground -> left alone.
+        let mut runner = FakeRunner::new(vec![
+            Ok(restored_list().into()),
+            Ok(proc_info("-zsh", 7, 7)),
+            Ok(String::new()), // pane run p1
+            Ok(proc_info("vim", 9, 8)),
+        ]);
+        let mut sent = Default::default();
+        let (revived, not_ready) = revive(&mut runner, &mut sent);
+        assert_eq!(revived, ["w1:p1"]);
+        assert_eq!(not_ready, ["w1:p5"]);
+        assert_eq!(
+            runner.calls,
+            [
+                "pane list",
+                "pane process-info --pane w1:p1",
+                "pane run w1:p1  exec '/plug/target/release/feedr' sidebar",
+                "pane process-info --pane w1:p5",
+            ]
+        );
+    }
+
+    #[test]
+    fn revive_never_sends_twice_to_a_pane_still_starting_its_shell() {
+        // Second pass: p1 still looks like an idle shell (rc files running,
+        // our exec not reached yet) but was already sent to.
+        let mut sent = std::collections::HashSet::from(["w1:p1".to_string()]);
+        let mut runner =
+            FakeRunner::new(vec![Ok(restored_list().into()), Ok(proc_info("vim", 9, 8))]);
+        let (revived, _) = revive(&mut runner, &mut sent);
+        assert!(revived.is_empty());
+        assert!(!runner.calls.iter().any(|c| c.starts_with("pane run")));
+    }
+
+    #[test]
+    fn idle_shell_requires_the_panes_own_shell_alone_in_the_foreground() {
+        assert!(is_idle_shell(&proc_info("zsh", 5, 5)));
+        assert!(is_idle_shell(&proc_info("-bash", 5, 5)));
+        assert!(!is_idle_shell(&proc_info("feedr", 5, 5))); // exec'd sidebar
+        assert!(!is_idle_shell(&proc_info("zsh", 6, 5))); // a subshell, not the pane's
+        assert!(!is_idle_shell("not json"));
+        let two = r#"{"result":{"process_info":{"foreground_processes":[{"name":"zsh","pid":5},{"name":"git","pid":6}],"shell_pid":5}}}"#;
+        assert!(!is_idle_shell(two));
     }
 
     #[test]

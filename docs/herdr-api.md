@@ -12,6 +12,9 @@ Behaviour of herdr's CLI and socket that feedr depends on, verified live against
 - The CLI can't focus an ordinary pane by id; use the socket's `pane.focus`.
 - `pane.list` marks exactly one pane `focused: true` across all workspaces.
 - `pane.list`'s `PaneInfo` has **no plugin identity and no zoom/overlay flag**. Zoomed and overlay panes are listed like any other; popups are never listed. feedr recognises its sidebar by the terminal title it sets on itself, `feedr-sidebar` (`terminal_title_stripped`, falling back to `terminal_title`).
+- **Session restore drops a plugin pane's command.** `session.json` records each pane as `{cwd, label}` (plus an agent session), so after a server restart a plugin pane comes back as a bare shell in the plugin root, still labelled with the manifest's `[[panes]] title`. feedr's `[[startup]]` hook (`scripts/on-startup.sh` → `feedr revive-sidebars`) execs the sidebar back into those shells.
+- `[[startup]]` hooks run once per enabled plugin after the session is restored and the socket is ready, and again on a live handoff. They don't run on client attach, config reload, or `plugin link`/`enable`. No client may be attached yet, so `pane layout` can report the headless size (120 columns by default).
+- `pane run <pane_id> <command>` types a command and Enter into a pane without focusing it or activating its tab.
 - `server.stop {}` shuts herdr down. herdr otherwise opens a fresh default workspace when the last pane closes.
 
 ## Event subscriptions
